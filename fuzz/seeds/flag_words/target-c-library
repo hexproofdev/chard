@@ -1,0 +1,10 @@
+-O2
+-mglibc
+-muclibc
+-mmusl
+-mbionic
+-mandroid
+-tno-android-cc
+-tno-android-ld
+--no-sysroot-suffix
+-D_FORTIFY_SOURCE=3

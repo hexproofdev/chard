@@ -1,0 +1,11 @@
+SPDX-License-Identifier: BSD-3-Clause
+
+array-attestation.json and array-installed-disk.json: an attestation written as a JSON
+array, and an attestation object whose installed_disk is an array. serde's derive reads a
+struct from a sequence, positionally, and deny_unknown_fields does not reach that path, so a
+reader on the derive alone accepts both, and the target's shape oracle fails with "accepted an
+array where an object is published" and "accepted an installed_disk that is an array".
+Hand-written on 2026-09-30, Darwin arm64: mutation from the object seeds does not produce an
+array in practice (two minutes of it produced none). env::Attestation::from_json refuses
+both as "invalid type: sequence, expected a JSON object", and the regression test
+env::tests::an_attestation_or_installed_disk_written_as_an_array_is_refused holds it.

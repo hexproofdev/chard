@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Observed: toolchain gcc-13.3.0-glibc2.39-ubuntu24.04, libc glibc, profile bare-optimized,
+# 2026-09-26, measured in a docker.io/library/ubuntu:24.04 container on a Fedora 44 x86_64
+# host. The CI runner is the same image; a difference there is a finding.
+#
+# Empty on purpose. This cell withholds nothing: all 55 checks are attempted and every one is
+# published or carries an earned limitation. A withheld verdict appearing here fails the lane,
+# which is the point of an empty expectation.

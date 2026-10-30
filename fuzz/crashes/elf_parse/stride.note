@@ -1,0 +1,10 @@
+SPDX-License-Identifier: BSD-3-Clause
+
+stride-symtab-entsize.elf: a relocatable x86_64 object, the four-function builder object
+mutated by elf_parse, whose .symtab declares sh_entsize 0x81000018 over 24-byte Elf64_Sym
+records (readelf: "invalid sh_entsize", read at the expected size). Not a crash of the
+shipped reader: it is the input on which the target's stride clause fails with
+"a declared sh_entsize chose what was read" when record_stride is planted to return
+declared.max(record) (2026-10-20, Fedora 44 x86_64). Kept so that make fuzz-replay runs that
+clause on an input where it can fail: the seeds in tests/fixtures/elf all declare the record
+size, where the rewrite moves nothing.

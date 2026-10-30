@@ -1,0 +1,1 @@
+cc: error: unrecognized command-line option '-fdiagnostics-format=sarif-stderr'

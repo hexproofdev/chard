@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# libFuzzer targets for chard, dev-only. This crate is not a member of chard's workspace:
+# it declares its own below, so `cargo build`, `cargo test`, `cargo tree` and `cargo deny`
+# on chard never see `libfuzzer-sys`, and chard's four direct dependencies and its
+# Cargo.lock are what they were. chard's `Cargo.toml` excludes `/fuzz` from the published
+# package for the same reason. Built with `cargo +nightly fuzz`; see README.md and the
+# `fuzz`, `fuzz-seed` and `fuzz-replay` targets in the Makefile.
+[package]
+name = "chard-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "BSD-3-Clause"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+chard = { path = ".." }
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detect_evidence"
+path = "fuzz_targets/detect_evidence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "predicate"
+path = "fuzz_targets/predicate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report_render"
+path = "fuzz_targets/report_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_macros"
+path = "fuzz_targets/parse_macros.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attestation"
+path = "fuzz_targets/attestation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flag_words"
+path = "fuzz_targets/flag_words.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "structured_diag"
+path = "fuzz_targets/structured_diag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report_digest"
+path = "fuzz_targets/report_digest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "driver_text"
+path = "fuzz_targets/driver_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "env_reads"
+path = "fuzz_targets/env_reads.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed"
+path = "seed.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace, so cargo-fuzz does not walk up into chard's.
+[workspace]
+members = ["."]

@@ -1,0 +1,15 @@
+-O2
+-B/opt/ld
+-L
+/usr/lib
+-I=/inc
+-isystem
+$SYSROOT/inc
+--sysroot=/sr
+-fuse-ld=lld
+-specs=nosys.specs
+@/tmp/args
+-Wl,-z,relro,-L/lib
+--config-user-dir=/c
+-fstack-protector-strong
+-D_FORTIFY_SOURCE=3

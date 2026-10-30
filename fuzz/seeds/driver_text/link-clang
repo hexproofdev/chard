@@ -1,0 +1,2 @@
+ "/usr/bin/clang-22" "-cc1" "-triple" "aarch64"
+ "/usr/bin/ld.lld" "-pie" "-o" "m"

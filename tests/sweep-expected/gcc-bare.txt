@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Observed: toolchain gcc-13.3.0-glibc2.39-ubuntu24.04, libc glibc, profile bare, 2026-09-26,
+# measured in a docker.io/library/ubuntu:24.04 container on a Fedora 44 x86_64 host. The CI
+# runner is the same image; a difference there is a finding, not a licence to edit this file.
+# One line per withheld verdict: <check> <verdict> <reason>.
+#
+# All three are the same fact about this cell rather than three separate ones: `bare` passes
+# no -O, and each of these mechanisms is emitted by the optimizer. `bare-optimized` measures
+# the same three and withholds none of them, which is what makes this an expectation rather
+# than a defect.
+strict-flex-arrays indeterminate __builtin_object_size answers -1 at every level without optimization, so the probe has no witness that the compiler can bound the member at all, and a flag that narrows a bound cannot be read from a build where no bound is known
+no-delete-null-pointer-checks indeterminate the probe dies on SIGSEGV because gcc keeps the null check in an unoptimized build whether or not the flag asked it to, so the death is the optimization level's doing and not the flag's
+no-strict-aliasing indeterminate the store is observed whether or not the flag was passed at -O0, so the two control arms cannot be separated and no verdict is licensed
+# strict-flex-arrays-enforced, measured in the same image at the commit that added the
+# check: without -O glibc installs no fortified wrapper, so the probe's ctrl copy is not
+# caught and the trailing rows cannot show the flag; both control arms carry -O2 and
+# discriminate, and bare-optimized publishes the reading.
+strict-flex-arrays-enforced indeterminate the ctrl copy is not caught in an unoptimized build, where glibc installs no fortified wrapper, so the trailing-array rows cannot show the flag

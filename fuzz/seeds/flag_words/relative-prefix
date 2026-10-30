@@ -1,0 +1,13 @@
+--prefix=p1
+-O2
+--prefix
+p2
+-ccc-install-dir
+bin
+--prefix=/abs
+--prefix
+/abs2
+-ccc-install-dir
+/abs3/bin
+--prefixes=x
+--prefix==/sr

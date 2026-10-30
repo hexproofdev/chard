@@ -1,0 +1,7 @@
+-target
+i686-linux-gnu
+-O2
+--target=x86_64-linux-gnu
+-arch
+x86_64
+-m64

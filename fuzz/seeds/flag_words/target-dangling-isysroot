@@ -1,0 +1,4 @@
+-O2
+-isystem
+/srv/i
+-isysroot

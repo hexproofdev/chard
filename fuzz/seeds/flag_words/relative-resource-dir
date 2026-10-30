@@ -1,0 +1,8 @@
+-resource-dir
+rd
+-O2
+-resource-dir=rd2
+-resource-dir
+/abs
+-resource-dir=/abs2
+--gcc-triple=x86_64-other-linux-gnu

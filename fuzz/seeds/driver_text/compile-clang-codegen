@@ -1,0 +1,1 @@
+ "/usr/bin/clang-22" "-cc1" "-triple" "x86_64-redhat-linux-gnu" "-mrelocation-model" "pic" "-pic-level" "2" "-pic-is-pie" "-flto=thin" "-fsanitize=address" "-exception-model=sjlj" "-nostdsysteminc"

@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+[workspace]
+resolver = "3"
+
+[package]
+name = "chard"
+version = "0.1.0"
+edition = "2024"
+# chard is built as a static musl binary and dropped into guest images, so the
+# MSRV floor is about what we can reasonably expect from a build host, not from
+# a guest. There is deliberately no rust-toolchain.toml: pinning a toolchain
+# would override a packager's own, and this floor is the only constraint.
+#
+# Bisected on 2026-08-03, not guessed. `make msrv` builds and tests at the floor so it
+# stays a measurement rather than a claim.
+#
+# 1.88 is where two independent constraints land, and 1.87 fails on the first of them:
+#
+#   let-chains in edition 2024   stabilized 1.88   src/measure.rs and two others
+#   slice::as_chunks::<N>()      stabilized 1.88   src/digest.rs, 4 uses
+#
+# Raising this is a breaking change for every downstream resolver, so it belongs in a
+# minor bump, never a patch.
+rust-version = "1.88"
+license = "BSD-3-Clause"
+readme = "README.md"
+description = "chard: empirical measurement of which C/C++ hardening flags a toolchain actually applies. Measures artifacts and behavior, not packaging specs."
+repository = "https://github.com/hexproofdev/chard"
+keywords = ["hardening", "compiler", "elf", "security", "toolchain"]
+categories = ["command-line-utilities", "development-tools"]
+# The published crate is the tree: the sources, the probes, the schemas, the documents, the
+# tests and their fixtures, so `cargo test` in an unpacked crate runs the suite the repository
+# runs. The fixture corpus is most of the tree's size (16 MiB of JSON, which compresses to a
+# fraction of that), and the library's own unit tests include fixture files at compile time,
+# so a crate without the fixtures does not build its tests at all; a test that went quiet when
+# its evidence was missing would be a clean-looking zero, which this project accepts nowhere.
+# The tests that read the tree through git read the unpacked archive's files where there is
+# no repository (tests/public_tree.rs) or refuse and say so (tests/leak_gate.rs,
+# tests/build_revision.rs); a refusal is a failure unless `CHARD_ALLOW_TEST_SKIP=1` turns it
+# into a counted skip (tests/common/mod.rs).
+#
+# `/fuzz` is the libFuzzer crate, dev-only and outside this workspace (fuzz/Cargo.toml). The
+# crash notes under fuzz/crashes/ that source comments cite are in the repository, not here.
+exclude = ["/fuzz"]
+
+[[bin]]
+name = "chard"
+path = "src/main.rs"
+
+[dependencies]
+# JSON is the entire output contract (schema/chard-report.schema.json), so
+# serde derive rather than hand-rolled writing: field order follows struct
+# declaration order, which makes output byte-deterministic across runs without
+# depending on a hash-map iteration order.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# CLI surface. No `env`, because chard must never pick up configuration
+# implicitly: a stray CFLAGS-like variable silently changing what we measure is
+# exactly the failure this tool exists to detect. No `color` either, for the same
+# reason. It reads `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `TERM`, `COLORTERM` and
+# `CI` to decide whether help and refusals carry escapes. chard writes no escape of
+# its own: `table::scrub` replaces them in report text, and `refuse_usage` in clap's.
+# The other default features stay: `help`, `usage`, `error-context` (what a refusal
+# names) and `suggestions` (its "a similar argument exists" tip).
+# `tests/error_classes.rs` holds that no colour variable and no argument puts an
+# escape on either stream, and that the lockfile names none of the crates through
+# which `color` read them.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+# Error propagation up to the single exit point in main, which converts to the
+# typed JSON envelope in error.rs.
+anyhow = "1"
+
+# Deliberately empty. The four-dependency floor applies to the test suite too: a helper
+# crate here is a dependency a consumer cannot see but a reviewer still has to audit.
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+# `cfg(kani)` is set by the model checker, not by cargo, so it is not a known cfg and
+# trips this lint under `-D warnings` in an ordinary build. Declaring it keeps the
+# proofs in `proofs/` invisible to normal builds without silencing the lint for
+# genuine typos elsewhere.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+# The gate denies every clippy warning, `pedantic` below included, under one pinned clippy
+# (`make clippy-gate`, `CLIPPY_TOOLCHAIN` in the Makefile, in `check` and `merge-gate`), so a
+# change that adds a warning fails its merge, while a new clippy's new lint does not fail the
+# gate until the commit that moves the pin. On your default toolchain, `make clippy` and any
+# build still fail a deny-level lint (`clippy::all`, rustc's `unused`), which a newer
+# toolchain can widen; the warn-level `pedantic` lints are only shown there. rustc's own
+# `unused` family is denied here, so `dead_code`, `unused_imports` and `unused_variables`
+# fail every build, not only the gate's clippy run.
+unused = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Pedantic lints turned off deliberately, with the reason recorded so the choice
+# is auditable rather than inherited.
+#
+# `must_use_candidate` fires on ~30 pure accessors (`succeeded()`, `aborted()`,
+# `needs_build()`). Every one is already used in expression position at its only
+# call sites; annotating them adds noise without excluding a class of bug.
+must_use_candidate = "allow"
+# `struct_field_names` objects to the `sh_`/`p_`/`e_` prefixes in elf.rs. Those
+# names are the ELF specification's own, and matching the spec verbatim is what
+# makes the parser reviewable against it.
+struct_field_names = "allow"
+# `struct_excessive_bools` fires on the CLI args struct, where the bools are
+# independent user-facing flags rather than a state machine that wants an enum.
+struct_excessive_bools = "allow"
+# `similar_names` objects to `e_phoff`/`e_shoff` and `args`/`argv`. The first pair
+# are the ELF specification's own field names, the second is the conventional
+# distinction between a flag list and a full command line; renaming either to
+# please the lint would make both harder to check against their references.
+similar_names = "allow"
+
+# The suite optimized. Its two exhaustive walks (src/elf.rs's corruptions of a real object
+# and tests/predicates.rs's elf-static mutation space) are arithmetic over megabytes and
+# millions of points, and unoptimized they were most of the merge gate: about 450 of 588 s
+# of tests on a quiet 16-thread host. Level 1 keeps what a debug build checks:
+# overflow checks and debug assertions follow the profile's own settings, not the level.
+[profile.test]
+opt-level = 1
+
+[profile.release]
+# Stripped of debug info and the symbol table. A panic still prints the file, line and column
+# it was raised at, which rustc compiles into the binary as data and no strip removes; what is
+# lost is the backtrace's function names and lines. Line tables were kept here before
+# (`debug = "line-tables-only"`), and with them the standard library's whole debug info: 34.3
+# MB against 8.5 MB stripped, and 10.0 MB with only the debug info stripped, for one x86_64
+# Linux glibc build under rustc 1.99.0-nightly. A build for a symbolicated backtrace sets
+# `debug = "line-tables-only"` and `strip = "none"` on the command line (`--config`).
+strip = "symbols"
+# The binary carries the builder's `~/.cargo/registry` paths, so two builds of one
+# commit differ. `trim-paths = "all"` is the fix and is still unstable as of 1.99;
+# enabling it needs `cargo-features`, which forces nightly and breaks the MSRV. Left
+# undone deliberately -- chard ships source, so no binary of ours carries them.

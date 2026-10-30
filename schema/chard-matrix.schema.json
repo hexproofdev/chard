@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hexproofdev/chard/schema/chard-matrix.schema.json",
+  "title": "chard cross-configuration matrix",
+  "description": "A view over many reports, keyed on the full configuration tuple rather than on the distribution. The distribution is one variable among several and frequently not the one that explains a result: whether an undeclared call is an error is decided by the compiler version, whether fortify exists at all by the libc, whether it is instantiated by the optimization level, and where hardening comes from by the profile. A table with one column per distribution cannot express any of those, and silently attributes them to the distribution instead. Reports remain the atomic facts; this is derived from them.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "chard_schema",
+    "axes",
+    "invariant_axes",
+    "varying_axes",
+    "cells",
+    "variance",
+    "inputs"
+  ],
+  "properties": {
+    "chard_schema": {
+      "description": "The major version of this document's shape. When it moves is the CLI contract's rule (`chard --help`; DESIGN.md, \"The command-line contract\"): a key chard adds is not a change, which is why every object here admits one. The key was `chard_matrix_schema` before the first publication.",
+      "type": "string",
+      "const": "1"
+    },
+    "inputs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Reports supplied. Cells are fewer only under `--replace-repeated`, where a later report of a configuration replaced an earlier one's cell and `warnings` names each replacement; without it, two reports of one configuration are refused."
+    },
+    "axes": {
+      "type": "object",
+      "description": "Every axis and the distinct values observed for it.",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "invariant_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Axes with at most one value across the input set. Stated explicitly because they bound what the table supports: a matrix where `arch` is invariant says nothing about other architectures, and a reader should not have to infer that from absence."
+    },
+    "varying_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "cells": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "key",
+          "label",
+          "kernel_ownership",
+          "flags",
+          "polarity"
+        ],
+        "properties": {
+          "key": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "distro",
+              "release",
+              "compiler",
+              "compiler_version",
+              "libc",
+              "arch",
+              "profile",
+              "execution"
+            ],
+            "properties": {
+              "distro": {
+                "type": "string"
+              },
+              "release": {
+                "type": "string"
+              },
+              "compiler": {
+                "type": "string"
+              },
+              "compiler_version": {
+                "type": "string"
+              },
+              "libc": {
+                "type": "string"
+              },
+              "arch": {
+                "type": "string"
+              },
+              "profile": {
+                "type": "string"
+              },
+              "execution": {
+                "type": "string"
+              },
+              "execution_basis": {
+                "type": "string",
+                "description": "The report's `environment.execution.mode_evidence.basis`, what established `execution`: `measured`, `asserted-and-corroborated`, `asserted-but-unobservable` or `assumed-host`, and `unpublished` for a report that carries none, a word outside that field's enumeration. A report on the default (`host` on `assumed-host`) withholds the checks that declare `needs_vm` where an asserted `host` measures them, so the two are separate cells; keyed on the mode alone they would be one, the later report's verdicts written over the earlier's."
+              },
+              "image": {
+                "type": "string",
+                "description": "The image the measurement ran in \u2014 the axis of last resort, distinguishing two specimens that agree on every other axis. Without it two portage profiles collided into one cell and their disagreement rendered as `varies: false`."
+              }
+            }
+          },
+          "label": {
+            "type": "string",
+            "description": "Built from the varying axes only, so invariant ones are not repeated in every row."
+          },
+          "kernel_ownership": {
+            "enum": [
+              "own",
+              "borrowed",
+              "unsettled",
+              "unpublished"
+            ],
+            "description": "The report's `environment.kernel.ownership`: whose kernel the cell's run had. `own` on the operator's word, `--execution host` or `vm`, which nothing chard reads corroborates; the checks that declare needs_vm are not withheld on this field. `borrowed` in a container, where they are withheld under `needs-vm`; `unsettled` on the default basis `assumed-host`, where they are withheld under `execution-mode-assumed`. `unpublished` where no report of the cell carries the field. Not an axis: it is a function of `key.execution` and `key.execution_basis`, which each report that carries it is held to on read, so every report of a cell that publishes it publishes the same word."
+          },
+          "flags": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "flag -> verdict, with the level appended where a graded mechanism has one."
+          },
+          "polarity": {
+            "type": "object",
+            "additionalProperties": {
+              "enum": [
+                "harden",
+                "weaken"
+              ]
+            },
+            "description": "flag -> the report's `observations[].polarity`, for each flag in `flags` whose observation carries one. For a `weaken` flag `off` is the protected state, the flag's effect being absent, so a verdict in `flags` is read with its polarity."
+          }
+        }
+      }
+    },
+    "variance": {
+      "type": "object",
+      "description": "Per flag: whether it varied, and which axis accounts for it.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "varies",
+          "verdicts",
+          "explained_by",
+          "strength",
+          "note",
+          "observed_in",
+          "of_configurations"
+        ],
+        "properties": {
+          "varies": {
+            "type": "boolean"
+          },
+          "observed_in": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many configurations carried this flag. `varies` alone cannot distinguish measured-everywhere-and-identical from measured-once or measured-nowhere, and the note asserted the first for all three."
+          },
+          "of_configurations": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configurations in the input set, so observed_in has a denominator beside it."
+          },
+          "verdicts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "Each distinct verdict and the configurations that produced it."
+          },
+          "explained_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Axes under which every group of observations agrees. Empty when no single axis fits, which is the common case once several axes vary \u2014 hardening posture is multi-causal and saying so is more useful than forcing an attribution."
+          },
+          "strength": {
+            "enum": [
+              "grouped",
+              "controlled",
+              "none"
+            ],
+            "description": "`grouped`: some axis value covers two or more agreeing observations, so the axis explains rather than merely identifies. `controlled`: the axis was the only thing that changed but no group has more than one member \u2014 a controlled comparison, weaker. `none`: nothing fits. The distinction matters because an axis taking a unique value per observation satisfies consistency vacuously; one report per distribution would otherwise let the distribution 'explain' a compiler-version boundary."
+          },
+          "confounded_with": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "Maps an explaining axis to the axes these inputs cannot separate it from, because fewer than two of its values were observed under more than one value of the other. Two are required for the same reason `strength` requires a group of two: one cross-link is an anecdote. Contingent on the input set, not permanent \u2014 the named axes are exactly what one more configuration would separate. Structural refinements (compiler_version within compiler, release within distro) are omitted as true but useless."
+          },
+          "explained_by_combination": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "A pair of axes holding more agreeing observations in one group than any single axis manages, and therefore the better-evidenced explanation. Present because a fine-grained axis partitions the data cheaply: compiler_version took a near-unique value per configuration and so 'explained' flags that are really a distribution patching one compiler, which reads as upstream compiler behaviour. Absent when no pair beats the best single axis. Cannot express an ordered threshold such as 'compiler version >= 14', so flags that flip at a version boundary may attribute to any axis correlated with recency."
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "description": "Sentences a reader needs beside the cells, absent when there are none; among them a mixed dataset's conflicts (under `--allow-mixed`), the dataset's cautions, a set of one configuration, and under `--replace-repeated` one per replaced cell, naming both reports and what the replacement moved.",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

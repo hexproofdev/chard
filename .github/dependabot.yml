@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Both ecosystems, because pinning without updating is how a pin rots.
+#
+# The `github-actions` entry covers one action, `actions/checkout`, pinned to a commit with
+# the tag in a trailing comment (`.github/workflows/ci.yml` says why a moving tag is
+# refused). Dependabot moves the pin and the comment together. Pinning and updating are
+# the two halves of one arrangement: a SHA nothing updates is frozen at whatever was
+# current the day it was written, and a tag nothing pins can be rewritten by whoever
+# controls the action.
+#
+# `cargo` covers a four-package direct graph (30 with transitives). `cargo deny check bans
+# licenses sources` runs in the per-commit gate against the committed lockfile, and
+# `cargo audit` runs weekly in `audit.yml`, so an update arriving here is checked by both
+# before it can merge. It does not cover cargo-deny or cargo-audit themselves: those are
+# built by `cargo install --locked` from their own lockfiles and appear in no manifest here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"

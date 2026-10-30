@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# The gate again, at the point where refusing still prevents rather than reports. A bad
+# commit is recoverable with `reset` and `gc`; a push is not, and CI's copy runs after
+# the objects have already been transferred.
+
+set -euo pipefail
+
+scripts/leak-gate.sh || {
+    echo "push refused: this tree would publish something it should not" >&2
+    exit 1
+}

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Observed: toolchain gcc-13.3.0-glibc2.39-ubuntu24.04, libc glibc, profile openssf-tldr,
+# 2026-09-26, measured in a docker.io/library/ubuntu:24.04 container on a Fedora 44 x86_64
+# host. The CI runner is the same image; a difference there is a finding.
+#
+# Empty on purpose, as for bare-optimized. The six earned limitations this cell reports are
+# `unsupported` rather than withheld: four are arch-gated, and `hardened-downgrade-warned`
+# and `zero-init-padding-bits` are gated by gcc 13 not knowing the flag. An earned limitation
+# is settled and belongs in no expectation file.

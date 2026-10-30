@@ -1,0 +1,9 @@
+-O2
+-DAT=@
+-Wl,--defsym,a@b=0
+-fuse-ld=lld
+-I/opt/x@y
+-Wl,-z,now
+-Xclang=-DX=@
+-mllvm=-x=@y
+--for-assembler=--noexecstack

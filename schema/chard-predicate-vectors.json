@@ -1,0 +1,3265 @@
+{
+  "language": "chard-predicate/1",
+  "description": "Conformance vectors for the predicate language named by `language`. Each vector evaluates `predicate` over the Published view of `facts` (`macros` and `elf` null for a source the reading says was unavailable, `macros_filter` the list a trimmed macro map was cut to, `symbols_filter` the watch list the publication's reader looked for symbols from, absent when the publication carries none) and expects either the clause, outcome, level and, where given, the observed sentence, or `incomplete:<key>`. A publication carries `elf.truncations` explicitly, `[]` included, since its absence is `incomplete:elf.truncations`. A vector with `\"refused_by_validate\": true` holds a predicate `validate` refuses, and its expected result is what the evaluator does with it regardless. tests/predicate_language.rs runs every vector and pins this file's sha256 per language version, so an expected result changes only with a new version once a publication has carried one; before the first publication the pin moves under the same name, and that test's note says what changed.",
+  "vectors": [
+    {
+      "name": "ssp-first-match-wins",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "all",
+            "when": {
+              "defined": {
+                "macro": "__SSP_ALL__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "all"
+              }
+            },
+            "because": "-fstack-protector-all defines __SSP_ALL__"
+          },
+          {
+            "id": "strong",
+            "when": {
+              "defined": {
+                "macro": "__SSP_STRONG__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "strong"
+              }
+            },
+            "because": "-fstack-protector-strong defines __SSP_STRONG__"
+          },
+          {
+            "id": "basic",
+            "when": {
+              "defined": {
+                "macro": "__SSP__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "basic"
+              }
+            },
+            "because": "-fstack-protector defines __SSP__"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__SSP_STRONG__": "1",
+          "__SSP__": "1"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "strong",
+        "outcome": "present",
+        "level": "strong",
+        "observed": "__SSP_ALL__ undefined __SSP_STRONG__=1 (-fstack-protector-strong defines __SSP_STRONG__)"
+      }
+    },
+    {
+      "name": "ssp-otherwise",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "all",
+            "when": {
+              "defined": {
+                "macro": "__SSP_ALL__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "all"
+              }
+            },
+            "because": "-fstack-protector-all defines __SSP_ALL__"
+          },
+          {
+            "id": "strong",
+            "when": {
+              "defined": {
+                "macro": "__SSP_STRONG__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "strong"
+              }
+            },
+            "because": "-fstack-protector-strong defines __SSP_STRONG__"
+          },
+          {
+            "id": "basic",
+            "when": {
+              "defined": {
+                "macro": "__SSP__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "basic"
+              }
+            },
+            "because": "-fstack-protector defines __SSP__"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {},
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "absent",
+        "level": null,
+        "observed": "__SSP_ALL__ undefined __SSP_STRONG__ undefined __SSP__ undefined"
+      }
+    },
+    {
+      "name": "ssp-defined-empty-renders-name-and-equals",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "all",
+            "when": {
+              "defined": {
+                "macro": "__SSP_ALL__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "all"
+              }
+            },
+            "because": "-fstack-protector-all defines __SSP_ALL__"
+          },
+          {
+            "id": "strong",
+            "when": {
+              "defined": {
+                "macro": "__SSP_STRONG__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "strong"
+              }
+            },
+            "because": "-fstack-protector-strong defines __SSP_STRONG__"
+          },
+          {
+            "id": "basic",
+            "when": {
+              "defined": {
+                "macro": "__SSP__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "basic"
+              }
+            },
+            "because": "-fstack-protector defines __SSP__"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__SSP_ALL__": ""
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "all",
+        "outcome": "present",
+        "level": "all",
+        "observed": "__SSP_ALL__= (-fstack-protector-all defines __SSP_ALL__)"
+      }
+    },
+    {
+      "name": "no-source-macros",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "all",
+            "when": {
+              "defined": {
+                "macro": "__SSP_ALL__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "all"
+              }
+            },
+            "because": "-fstack-protector-all defines __SSP_ALL__"
+          },
+          {
+            "id": "strong",
+            "when": {
+              "defined": {
+                "macro": "__SSP_STRONG__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "strong"
+              }
+            },
+            "because": "-fstack-protector-strong defines __SSP_STRONG__"
+          },
+          {
+            "id": "basic",
+            "when": {
+              "defined": {
+                "macro": "__SSP__"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "basic"
+              }
+            },
+            "because": "-fstack-protector defines __SSP__"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "clause": "@no-source:macros",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "(no macro source was available to read)"
+      }
+    },
+    {
+      "name": "no-source-elf",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unclassified",
+            "when": {
+              "missing": {
+                "elf": "pie"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the loader cannot run this object"
+          },
+          {
+            "id": "pie",
+            "when": {
+              "truth": {
+                "elf": "pie"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "pie"
+              }
+            },
+            "because": "ET_DYN with an executable marker"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {},
+        "elf": null
+      },
+      "expect": {
+        "clause": "@no-source:elf",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "(no ELF facts were available to read)"
+      }
+    },
+    {
+      "name": "truncated-table-withholds",
+      "predicate": {
+        "tables": [
+          "symbols"
+        ],
+        "clauses": [
+          {
+            "id": "referenced",
+            "when": {
+              "any": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "a stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail",
+          "__stack_chk_fail_local"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": [
+            {
+              "table": "symbols",
+              "kind": "unread",
+              "detail": "symbol table cut at entry 3"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "clause": "@truncated",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "unread_tables=[\"symbols\"] (a table this reading depends on was left unread)"
+      }
+    },
+    {
+      "name": "ignored-truncation-does-not-withhold",
+      "predicate": {
+        "tables": [
+          "symbols"
+        ],
+        "clauses": [
+          {
+            "id": "referenced",
+            "when": {
+              "any": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "a stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail",
+          "__stack_chk_fail_local"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": [
+            {
+              "table": "symbols",
+              "kind": "ignored",
+              "detail": "a disagreeing view was dropped"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "clause": "referenced",
+        "outcome": "present",
+        "level": null,
+        "observed": "unread_tables=[] __stack_chk_fail=present(defined=false) (a stack-protector failure handler is referenced)"
+      }
+    },
+    {
+      "name": "truncation-of-another-table-does-not-withhold",
+      "predicate": {
+        "tables": [
+          "symbols"
+        ],
+        "clauses": [
+          {
+            "id": "referenced",
+            "when": {
+              "any": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "a stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail",
+          "__stack_chk_fail_local"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {},
+          "truncations": [
+            {
+              "table": "notes",
+              "kind": "unread",
+              "detail": "note cut"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "absent",
+        "level": null,
+        "observed": "unread_tables=[\"notes\"] __stack_chk_fail=absent __stack_chk_fail_local=absent"
+      }
+    },
+    {
+      "name": "absent-truncations-is-incomplete",
+      "predicate": {
+        "tables": [
+          "symbols"
+        ],
+        "clauses": [
+          {
+            "id": "referenced",
+            "when": {
+              "any": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "a stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail",
+          "__stack_chk_fail_local"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          }
+        }
+      },
+      "expect": "incomplete:elf.truncations"
+    },
+    {
+      "name": "unwatched-symbol-is-incomplete",
+      "refused_by_validate": true,
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreferenced",
+            "when": {
+              "missing": {
+                "symbol": "__stack_chk_fal"
+              }
+            },
+            "then": "absent",
+            "because": "no stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": {
+          "present": "none"
+        }
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail",
+          "__stack_chk_fail_local"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "watched_symbols": {},
+          "truncations": []
+        }
+      },
+      "expect": "incomplete:elf.watched_symbols.__stack_chk_fal"
+    },
+    {
+      "name": "filtered-macro-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "positive",
+            "when": {
+              "int": [
+                {
+                  "macro": "__PIE__"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "__PIE__"
+                }
+              }
+            },
+            "because": "__PIE__ above zero"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__PIC__": "2"
+        },
+        "elf": null,
+        "macros_filter": [
+          "__PIC__"
+        ]
+      },
+      "expect": "incomplete:macros.__PIE__"
+    },
+    {
+      "name": "filtered-macro-inside-the-filter-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "positive",
+            "when": {
+              "int": [
+                {
+                  "macro": "__PIE__"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "__PIE__"
+                }
+              }
+            },
+            "because": "__PIE__ above zero"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__PIC__": "2"
+        },
+        "elf": null,
+        "macros_filter": [
+          "__PIC__",
+          "__PIE__"
+        ]
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "absent",
+        "level": null,
+        "observed": "__PIE__ undefined"
+      }
+    },
+    {
+      "name": "value-level-renders-the-integer-reading",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "positive",
+            "when": {
+              "int": [
+                {
+                  "macro": "__PIE__"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "__PIE__"
+                }
+              }
+            },
+            "because": "__PIE__ above zero"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__PIE__": " 2"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "positive",
+        "outcome": "present",
+        "level": "2",
+        "observed": "__PIE__= 2 (__PIE__ above zero)"
+      }
+    },
+    {
+      "name": "int-on-unparsable-text-is-false",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "positive",
+            "when": {
+              "int": [
+                {
+                  "macro": "__PIE__"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "__PIE__"
+                }
+              }
+            },
+            "because": "__PIE__ above zero"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__PIE__": "yes"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "absent",
+        "level": null,
+        "observed": "__PIE__=yes"
+      }
+    },
+    {
+      "name": "c-int-shift-through-indirection",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "not-libcxx",
+            "when": {
+              "none-of": [
+                {
+                  "eq": [
+                    "cxx-stdlib",
+                    "libc++"
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the library is not libc++"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": "absent",
+            "because": "mode none is (1 << 1)"
+          },
+          {
+            "id": "fast",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "fast"
+              }
+            },
+            "because": "mode fast is (1 << 2)"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "_LIBCPP_VERSION": "220100",
+          "_LIBCPP_HARDENING_MODE": "_LIBCPP_HARDENING_MODE_FAST",
+          "_LIBCPP_HARDENING_MODE_FAST": "(1 << 2)"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "fast",
+        "outcome": "present",
+        "level": "fast",
+        "observed": "_CXX_STDLIB undefined _LIBCPP_VERSION=220100 _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST _LIBCPP_HARDENING_MODE_FAST=(1 << 2) (mode fast is (1 << 2))"
+      }
+    },
+    {
+      "name": "c-int-indirection-outside-the-filter-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "not-libcxx",
+            "when": {
+              "none-of": [
+                {
+                  "eq": [
+                    "cxx-stdlib",
+                    "libc++"
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the library is not libc++"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": "absent",
+            "because": "mode none is (1 << 1)"
+          },
+          {
+            "id": "fast",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "fast"
+              }
+            },
+            "because": "mode fast is (1 << 2)"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "_CXX_STDLIB": "libc++",
+          "_LIBCPP_HARDENING_MODE": "_LIBCPP_HARDENING_MODE_FAST"
+        },
+        "elf": null,
+        "macros_filter": [
+          "_CXX_STDLIB",
+          "_LIBCPP_HARDENING_MODE"
+        ]
+      },
+      "expect": "incomplete:macros._LIBCPP_HARDENING_MODE_FAST"
+    },
+    {
+      "name": "c-int-self-reference-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "not-libcxx",
+            "when": {
+              "none-of": [
+                {
+                  "eq": [
+                    "cxx-stdlib",
+                    "libc++"
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the library is not libc++"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": "absent",
+            "because": "mode none is (1 << 1)"
+          },
+          {
+            "id": "fast",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "fast"
+              }
+            },
+            "because": "mode fast is (1 << 2)"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "_CXX_STDLIB": "libc++",
+          "_LIBCPP_HARDENING_MODE": "X",
+          "X": "X"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_CXX_STDLIB=libc++ _LIBCPP_HARDENING_MODE=X X=X"
+      }
+    },
+    {
+      "name": "cxx-stdlib-ladder-stops-at-the-first-rung",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "not-libcxx",
+            "when": {
+              "none-of": [
+                {
+                  "eq": [
+                    "cxx-stdlib",
+                    "libc++"
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the library is not libc++"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": "absent",
+            "because": "mode none is (1 << 1)"
+          },
+          {
+            "id": "fast",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "fast"
+              }
+            },
+            "because": "mode fast is (1 << 2)"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "_CXX_STDLIB": "libstdc++"
+        },
+        "elf": null,
+        "macros_filter": [
+          "_CXX_STDLIB"
+        ]
+      },
+      "expect": {
+        "clause": "not-libcxx",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_CXX_STDLIB=libstdc++ (the library is not libc++)"
+      }
+    },
+    {
+      "name": "elf-null-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unclassified",
+            "when": {
+              "missing": {
+                "elf": "pie"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the loader cannot run this object"
+          },
+          {
+            "id": "pie",
+            "when": {
+              "truth": {
+                "elf": "pie"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "pie"
+              }
+            },
+            "because": "ET_DYN with an executable marker"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": null,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "clause": "unclassified",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "pie=null (the loader cannot run this object)"
+      }
+    },
+    {
+      "name": "elf-absent-key-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unclassified",
+            "when": {
+              "missing": {
+                "elf": "pie"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the loader cannot run this object"
+          },
+          {
+            "id": "pie",
+            "when": {
+              "truth": {
+                "elf": "pie"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "pie"
+              }
+            },
+            "because": "ET_DYN with an executable marker"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN"
+        }
+      },
+      "expect": "incomplete:elf.pie"
+    },
+    {
+      "name": "elf-wrong-shape-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unclassified",
+            "when": {
+              "missing": {
+                "elf": "pie"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the loader cannot run this object"
+          },
+          {
+            "id": "pie",
+            "when": {
+              "truth": {
+                "elf": "pie"
+              }
+            },
+            "then": {
+              "present": {
+                "word": "pie"
+              }
+            },
+            "because": "ET_DYN with an executable marker"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": "yes",
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          }
+        }
+      },
+      "expect": "incomplete:elf.pie"
+    },
+    {
+      "name": "elf-value-level",
+      "predicate": {
+        "tables": [
+          "dynamic"
+        ],
+        "clauses": [
+          {
+            "id": "unclassified",
+            "when": {
+              "missing": {
+                "elf": "gnu_relro"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the loader cannot run this object"
+          },
+          {
+            "id": "relro",
+            "when": {
+              "truth": {
+                "elf": "gnu_relro"
+              }
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "elf": "relro"
+                }
+              }
+            },
+            "because": "PT_GNU_RELRO is present"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": []
+        }
+      },
+      "expect": {
+        "clause": "relro",
+        "outcome": "present",
+        "level": "full",
+        "observed": "unread_tables=[] gnu_relro=true relro=full (PT_GNU_RELRO is present)"
+      }
+    },
+    {
+      "name": "elf-value-level-null-is-indeterminate",
+      "predicate": {
+        "tables": [
+          "dynamic"
+        ],
+        "clauses": [
+          {
+            "id": "unclassified",
+            "when": {
+              "missing": {
+                "elf": "gnu_relro"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the loader cannot run this object"
+          },
+          {
+            "id": "relro",
+            "when": {
+              "truth": {
+                "elf": "gnu_relro"
+              }
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "elf": "relro"
+                }
+              }
+            },
+            "because": "PT_GNU_RELRO is present"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": null,
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": []
+        }
+      },
+      "expect": {
+        "clause": "relro",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "unread_tables=[] gnu_relro=true relro=null (PT_GNU_RELRO is present; the level elf relro has no rendering, so the reading is indeterminate)"
+      }
+    },
+    {
+      "name": "any-starts-with",
+      "predicate": {
+        "tables": [
+          "dynamic",
+          "dynstr"
+        ],
+        "clauses": [
+          {
+            "id": "recorded",
+            "when": {
+              "any-starts-with": [
+                {
+                  "elf": "needed"
+                },
+                "libm."
+              ]
+            },
+            "then": "absent",
+            "because": "the unused library was recorded"
+          }
+        ],
+        "otherwise": {
+          "present": "none"
+        }
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libm.so.6",
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": []
+        }
+      },
+      "expect": {
+        "clause": "recorded",
+        "outcome": "absent",
+        "level": null,
+        "observed": "unread_tables=[] needed=[\"libm.so.6\",\"libc.so.6\"] (the unused library was recorded)"
+      }
+    },
+    {
+      "name": "otherwise-present",
+      "predicate": {
+        "tables": [
+          "dynamic",
+          "dynstr"
+        ],
+        "clauses": [
+          {
+            "id": "recorded",
+            "when": {
+              "any-starts-with": [
+                {
+                  "elf": "needed"
+                },
+                "libm."
+              ]
+            },
+            "then": "absent",
+            "because": "the unused library was recorded"
+          }
+        ],
+        "otherwise": {
+          "present": "none"
+        }
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": []
+        }
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "present",
+        "level": null,
+        "observed": "unread_tables=[] needed=[\"libc.so.6\"]"
+      }
+    },
+    {
+      "name": "symbol-names-any-contains",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "debug",
+            "when": {
+              "any-contains": [
+                "symbol-names",
+                "_Error_formatter"
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "the debug-mode formatter is present"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "symbols_filter": [
+          "_ZNK11__gnu_debug16_Error_formatter8_M_errorEv"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "_ZNK11__gnu_debug16_Error_formatter8_M_errorEv": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "clause": "debug",
+        "outcome": "present",
+        "level": null,
+        "observed": "watched_symbols=[\"_ZNK11__gnu_debug16_Error_formatter8_M_errorEv\"] (the debug-mode formatter is present)"
+      }
+    },
+    {
+      "name": "symbol-map-absent-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "debug",
+            "when": {
+              "any-contains": [
+                "symbol-names",
+                "_Error_formatter"
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "the debug-mode formatter is present"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "symbols_filter": [
+          "_ZNK11__gnu_debug16_Error_formatter8_M_errorEv"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN"
+        }
+      },
+      "expect": "incomplete:elf.watched_symbols"
+    },
+    {
+      "name": "empty-all-holds",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "all-of-nothing",
+            "when": {
+              "all": []
+            },
+            "then": {
+              "present": {
+                "word": "vacuous"
+              }
+            },
+            "because": "an empty all holds"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": null
+      },
+      "expect": {
+        "clause": "all-of-nothing",
+        "outcome": "present",
+        "level": "vacuous",
+        "observed": "(an empty all holds)"
+      }
+    },
+    {
+      "name": "empty-any-fails-zero-text-is-false-and-bool-renders",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "any-of-nothing",
+            "when": {
+              "any": []
+            },
+            "then": "absent",
+            "because": "an empty any never holds"
+          },
+          {
+            "id": "zero-text",
+            "when": {
+              "truth": {
+                "macro": "Z"
+              }
+            },
+            "then": "absent",
+            "because": "text 0 is false"
+          },
+          {
+            "id": "eq-bool",
+            "when": {
+              "eq": [
+                {
+                  "elf": "x86_ibt"
+                },
+                "true"
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "ibt"
+              }
+            },
+            "because": "a boolean renders as true or false"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "Z": "0"
+        },
+        "elf": {
+          "elf_type": "ET_DYN",
+          "pie": true,
+          "gnu_relro": true,
+          "relro": "full",
+          "needed": [
+            "libc.so.6"
+          ],
+          "x86_ibt": true,
+          "watched_symbols": {
+            "__stack_chk_fail": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "clause": "eq-bool",
+        "outcome": "present",
+        "level": "ibt",
+        "observed": "Z=0 x86_ibt=true (a boolean renders as true or false)"
+      }
+    },
+    {
+      "name": "list-renders-as-compact-json",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "listed",
+            "when": {
+              "non-empty": {
+                "elf": "needed"
+              }
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "a library is recorded"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "needed": [
+            "a\"b",
+            "c\\d",
+            "été",
+            "x\ny",
+            "\u0001",
+            "plain"
+          ]
+        }
+      },
+      "expect": {
+        "clause": "listed",
+        "outcome": "present",
+        "level": null,
+        "observed": "needed=[\"a\\\"b\",\"c\\\\d\",\"été\",\"x\\ny\",\"\\u0001\",\"plain\"] (a library is recorded)"
+      }
+    },
+    {
+      "name": "otherwise-value-level-unrendered-is-indeterminate",
+      "predicate": {
+        "tables": [],
+        "clauses": [],
+        "otherwise": {
+          "present": {
+            "value": {
+              "macro": "X"
+            }
+          }
+        }
+      },
+      "facts": {
+        "macros": {},
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "X undefined (the level macro X has no rendering, so the reading is indeterminate)"
+      }
+    },
+    {
+      "name": "elf-float-number-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "wide",
+            "when": {
+              "int": [
+                {
+                  "elf": "elf_class"
+                },
+                "eq",
+                64
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "a 64-bit object"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_class": 64.0
+        }
+      },
+      "expect": "incomplete:elf.elf_class"
+    },
+    {
+      "name": "elf-integer-above-i64-max-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "uncounted",
+            "when": {
+              "missing": {
+                "elf": "symbol_count"
+              }
+            },
+            "then": "indeterminate",
+            "because": "the symbol count has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "symbol_count": 18446744073709551615
+        }
+      },
+      "expect": {
+        "clause": "uncounted",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "symbol_count=null (the symbol count has no integer reading)"
+      }
+    },
+    {
+      "name": "symbol-inside-the-published-watch-list-and-absent-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreferenced",
+            "when": {
+              "none-of": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": "absent",
+            "because": "no stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": {
+          "present": "none"
+        }
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail",
+          "__stack_chk_fail_local"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "watched_symbols": {},
+          "truncations": []
+        }
+      },
+      "expect": {
+        "clause": "unreferenced",
+        "outcome": "absent",
+        "level": null,
+        "observed": "__stack_chk_fail=absent __stack_chk_fail_local=absent (no stack-protector failure handler is referenced)"
+      }
+    },
+    {
+      "name": "symbol-outside-the-published-watch-list-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreferenced",
+            "when": {
+              "none-of": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": "absent",
+            "because": "no stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": {
+          "present": "none"
+        }
+      },
+      "facts": {
+        "symbols_filter": [
+          "__stack_chk_fail"
+        ],
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "watched_symbols": {},
+          "truncations": []
+        }
+      },
+      "expect": "incomplete:elf.watched_symbols.__stack_chk_fail_local"
+    },
+    {
+      "name": "symbol-with-no-published-watch-list-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreferenced",
+            "when": {
+              "none-of": [
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail"
+                  }
+                },
+                {
+                  "defined": {
+                    "symbol": "__stack_chk_fail_local"
+                  }
+                }
+              ]
+            },
+            "then": "absent",
+            "because": "no stack-protector failure handler is referenced"
+          }
+        ],
+        "otherwise": {
+          "present": "none"
+        }
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "watched_symbols": {},
+          "truncations": []
+        }
+      },
+      "expect": "incomplete:symbols_filter"
+    },
+    {
+      "name": "symbol-names-with-no-published-watch-list-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "debug",
+            "when": {
+              "any-contains": [
+                "symbol-names",
+                "_Error_formatter"
+              ]
+            },
+            "then": {
+              "present": "none"
+            },
+            "because": "the debug-mode formatter is present"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": null,
+        "elf": {
+          "elf_type": "ET_DYN",
+          "watched_symbols": {
+            "_ZNK11__gnu_debug16_Error_formatter8_M_errorEv": {
+              "defined": false,
+              "tables": [
+                ".dynsym"
+              ]
+            }
+          },
+          "truncations": []
+        }
+      },
+      "expect": "incomplete:symbols_filter"
+    },
+    {
+      "name": "c-int-shift-past-bit-31-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "bit-31",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                2147483648
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "1 << 31 is bit 31 alone, within 32 bits"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "(3 << 31)"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "M=(3 << 31)"
+      }
+    },
+    {
+      "name": "c-int-shift-to-bit-31-stays",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "bit-31",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                2147483648
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "1 << 31 is bit 31 alone, within 32 bits"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "(1 << 31)"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "bit-31",
+        "outcome": "present",
+        "level": "2147483648",
+        "observed": "M=(1 << 31) (1 << 31 is bit 31 alone, within 32 bits)"
+      }
+    },
+    {
+      "name": "integer-reading-accepts-a-leading-plus",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "two",
+            "when": {
+              "int": [
+                {
+                  "macro": "__PIE__"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "__PIE__"
+                }
+              }
+            },
+            "because": "+2 reads as 2"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__PIE__": "+2"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "two",
+        "outcome": "present",
+        "level": "2",
+        "observed": "__PIE__=+2 (+2 reads as 2)"
+      }
+    },
+    {
+      "name": "unreadable-holds-of-parenthesised-text",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": "(3)",
+          "__USE_FORTIFY_LEVEL": "3"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE=(3) (the text has no integer reading, so the level requested cannot be read from it)"
+      }
+    },
+    {
+      "name": "unreadable-holds-of-a-suffixed-integer",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": "3L"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE=3L (the text has no integer reading, so the level requested cannot be read from it)"
+      }
+    },
+    {
+      "name": "unreadable-holds-of-an-unsigned-suffix",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": "2UL"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE=2UL (the text has no integer reading, so the level requested cannot be read from it)"
+      }
+    },
+    {
+      "name": "unreadable-holds-of-empty-text",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": ""
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE= (the text has no integer reading, so the level requested cannot be read from it)"
+      }
+    },
+    {
+      "name": "unreadable-fails-of-an-undefined-macro",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {},
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "absent",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE undefined"
+      }
+    },
+    {
+      "name": "unreadable-fails-of-a-negative-integer",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": "-1"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "@otherwise",
+        "outcome": "absent",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE=-1"
+      }
+    },
+    {
+      "name": "unreadable-fails-of-a-padded-integer",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": " +3 "
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "requested",
+        "outcome": "present",
+        "level": "3",
+        "observed": "_FORTIFY_SOURCE= +3  (a level above zero is a request at that level)"
+      }
+    },
+    {
+      "name": "unreadable-request-is-not-no-request",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "requested-unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so whether a level was requested cannot be read from it"
+          },
+          {
+            "id": "not-requested",
+            "when": {
+              "none-of": [
+                {
+                  "int": [
+                    {
+                      "macro": "_FORTIFY_SOURCE"
+                    },
+                    "ne",
+                    0
+                  ]
+                }
+              ]
+            },
+            "then": "absent",
+            "because": "no _FORTIFY_SOURCE, so nothing instantiates"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": "(3)",
+          "__OPTIMIZE__": "2"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "requested-unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE=(3) (the text has no integer reading, so whether a level was requested cannot be read from it)"
+      }
+    },
+    {
+      "name": "cet-mask-outside-the-three-is-unrecognised",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "full",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                3
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "full"
+              }
+            },
+            "because": "3 is both bits"
+          },
+          {
+            "id": "return",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "return"
+              }
+            },
+            "because": "2 is the shadow stack alone"
+          },
+          {
+            "id": "branch",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                1
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "branch"
+              }
+            },
+            "because": "1 is branch tracking alone"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": "absent",
+            "because": "0 is neither bit"
+          },
+          {
+            "id": "unrecognised",
+            "when": {
+              "defined": {
+                "macro": "__CET__"
+              }
+            },
+            "then": "indeterminate",
+            "because": "defined with a value that is not 1, 2 or 3, so the mask is not absent and no level can be claimed"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__CET__": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unrecognised",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "__CET__=4 (defined with a value that is not 1, 2 or 3, so the mask is not absent and no level can be claimed)"
+      }
+    },
+    {
+      "name": "cet-mask-of-zero-is-absent",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "full",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                3
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "full"
+              }
+            },
+            "because": "3 is both bits"
+          },
+          {
+            "id": "return",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "return"
+              }
+            },
+            "because": "2 is the shadow stack alone"
+          },
+          {
+            "id": "branch",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                1
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "branch"
+              }
+            },
+            "because": "1 is branch tracking alone"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "macro": "__CET__"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": "absent",
+            "because": "0 is neither bit"
+          },
+          {
+            "id": "unrecognised",
+            "when": {
+              "defined": {
+                "macro": "__CET__"
+              }
+            },
+            "then": "indeterminate",
+            "because": "defined with a value that is not 1, 2 or 3, so the mask is not absent and no level can be claimed"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__CET__": "0"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "none",
+        "outcome": "absent",
+        "level": null,
+        "observed": "__CET__=0 (0 is neither bit)"
+      }
+    },
+    {
+      "name": "one-unreadable-bit-withholds-the-pair",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "any": [
+                {
+                  "all": [
+                    {
+                      "defined": {
+                        "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                      }
+                    },
+                    {
+                      "none-of": [
+                        {
+                          "int": [
+                            {
+                              "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                            },
+                            "gt",
+                            -9223372036854775808
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "all": [
+                    {
+                      "defined": {
+                        "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                      }
+                    },
+                    {
+                      "none-of": [
+                        {
+                          "int": [
+                            {
+                              "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                            },
+                            "gt",
+                            -9223372036854775808
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "one of the pair is defined with text that has no integer reading, so which is on cannot be read"
+          },
+          {
+            "id": "full",
+            "when": {
+              "all": [
+                {
+                  "int": [
+                    {
+                      "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                    },
+                    "gt",
+                    0
+                  ]
+                },
+                {
+                  "int": [
+                    {
+                      "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                    },
+                    "gt",
+                    0
+                  ]
+                }
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "full"
+              }
+            },
+            "because": "both are on"
+          },
+          {
+            "id": "branch",
+            "when": {
+              "int": [
+                {
+                  "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "branch"
+              }
+            },
+            "because": "BTI is on and PAC is not"
+          },
+          {
+            "id": "return",
+            "when": {
+              "int": [
+                {
+                  "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "return"
+              }
+            },
+            "because": "PAC is on and BTI is not"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__ARM_FEATURE_BTI_DEFAULT": "(1)",
+          "__ARM_FEATURE_PAC_DEFAULT": "1"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "__ARM_FEATURE_BTI_DEFAULT=(1) (one of the pair is defined with text that has no integer reading, so which is on cannot be read)"
+      }
+    },
+    {
+      "name": "the-second-bit-unreadable-withholds-the-pair-too",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "any": [
+                {
+                  "all": [
+                    {
+                      "defined": {
+                        "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                      }
+                    },
+                    {
+                      "none-of": [
+                        {
+                          "int": [
+                            {
+                              "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                            },
+                            "gt",
+                            -9223372036854775808
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "all": [
+                    {
+                      "defined": {
+                        "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                      }
+                    },
+                    {
+                      "none-of": [
+                        {
+                          "int": [
+                            {
+                              "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                            },
+                            "gt",
+                            -9223372036854775808
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "one of the pair is defined with text that has no integer reading, so which is on cannot be read"
+          },
+          {
+            "id": "full",
+            "when": {
+              "all": [
+                {
+                  "int": [
+                    {
+                      "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                    },
+                    "gt",
+                    0
+                  ]
+                },
+                {
+                  "int": [
+                    {
+                      "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                    },
+                    "gt",
+                    0
+                  ]
+                }
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "full"
+              }
+            },
+            "because": "both are on"
+          },
+          {
+            "id": "branch",
+            "when": {
+              "int": [
+                {
+                  "macro": "__ARM_FEATURE_BTI_DEFAULT"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "branch"
+              }
+            },
+            "because": "BTI is on and PAC is not"
+          },
+          {
+            "id": "return",
+            "when": {
+              "int": [
+                {
+                  "macro": "__ARM_FEATURE_PAC_DEFAULT"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "return"
+              }
+            },
+            "because": "PAC is on and BTI is not"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "__ARM_FEATURE_BTI_DEFAULT": "1",
+          "__ARM_FEATURE_PAC_DEFAULT": "1U"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "__ARM_FEATURE_BTI_DEFAULT=1 __ARM_FEATURE_PAC_DEFAULT=1U (one of the pair is defined with text that has no integer reading, so which is on cannot be read)"
+      }
+    },
+    {
+      "name": "c-int-shift-that-loses-a-bit-is-not-a-mode",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "not-libcxx",
+            "when": {
+              "none-of": [
+                {
+                  "eq": [
+                    "cxx-stdlib",
+                    "libc++"
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the library is not libc++"
+          },
+          {
+            "id": "none",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                2
+              ]
+            },
+            "then": "absent",
+            "because": "mode none is (1 << 1)"
+          },
+          {
+            "id": "fast",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "fast"
+              }
+            },
+            "because": "mode fast is (1 << 2)"
+          },
+          {
+            "id": "debug",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "debug"
+              }
+            },
+            "because": "mode debug is (1 << 3)"
+          },
+          {
+            "id": "extensive",
+            "when": {
+              "int": [
+                {
+                  "c-int": "_LIBCPP_HARDENING_MODE"
+                },
+                "eq",
+                16
+              ]
+            },
+            "then": {
+              "present": {
+                "word": "extensive"
+              }
+            },
+            "because": "mode extensive is (1 << 4)"
+          },
+          {
+            "id": "unrecognised",
+            "when": {
+              "eq": [
+                "cxx-stdlib",
+                "libc++"
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the mode is no value libc++ names"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "_LIBCPP_VERSION": "220100",
+          "_LIBCPP_HARDENING_MODE": "(268435457 << 4)"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unrecognised",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_CXX_STDLIB undefined _LIBCPP_VERSION=220100 _LIBCPP_HARDENING_MODE=(268435457 << 4) (the mode is no value libc++ names)"
+      }
+    },
+    {
+      "name": "unreadable-holds-of-the-decimal-c-types-as-unsigned",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "unreadable",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "_FORTIFY_SOURCE"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "_FORTIFY_SOURCE"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "the text has no integer reading, so the level requested cannot be read from it"
+          },
+          {
+            "id": "requested",
+            "when": {
+              "int": [
+                {
+                  "macro": "_FORTIFY_SOURCE"
+                },
+                "gt",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "_FORTIFY_SOURCE"
+                }
+              }
+            },
+            "because": "a level above zero is a request at that level"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "_FORTIFY_SOURCE": "-9223372036854775808"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "unreadable",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "_FORTIFY_SOURCE=-9223372036854775808 (the text has no integer reading, so the level requested cannot be read from it)"
+      }
+    }
+  ]
+}

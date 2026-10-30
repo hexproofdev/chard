@@ -1,0 +1,4 @@
+{"$schema": "x", "version": "2.1.0",
+ "runs": [{"tool": {"driver": {"name": "GNU C23"}},
+           "results": [{"ruleId": "-Werror=format-security", "level": "error",
+                        "message": {"text": "format not a string literal and no format arguments"}}]}]}

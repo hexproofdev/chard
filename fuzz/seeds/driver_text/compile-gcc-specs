@@ -1,0 +1,5 @@
+Using built-in specs.
+COLLECT_GCC=gcc
+ /usr/libexec/gcc/x86_64-redhat-linux/16/cc1 -E -quiet -isystem /srv/inc -U_FORTIFY_SOURCE "-D_FORTIFY_SOURCE=3" /dev/null "-mtune=generic" -O2 -fPIE -o /tmp/ccA.i
+ /usr/libexec/gcc/x86_64-redhat-linux/16/cc1 -fpreprocessed /tmp/ccA.i -include /srv/forced.h -quiet -dumpbase null -O2 -fPIE "-iplugindir=/usr/lib/gcc/x86_64-redhat-linux/16/plugin" "-fplugin=gcc-annobin" -o /tmp/ccB.s
+ as --64 -o /dev/null /tmp/ccB.s

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# The advisory lane, on a schedule rather than in the gate.
+#
+# `cargo audit` reads a live database. Its verdict is a function of the world on the day
+# it runs, not of the commit it runs against, so a green commit can turn red with no diff
+# to explain it. That is genuinely useful information -- and it is information about the
+# ecosystem rather than about the change under review, so it must not gate a pull
+# request. `make check` stays reproducible from the commit; this reports separately.
+
+name: audit
+
+on:
+  schedule:
+    # Weekly. chard has four direct dependencies and 30 packages in Cargo.lock, so the
+    # graph moves slowly; daily would be noise without being earlier in any useful way.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Queue rather than cancel, unlike ci.yml. A superseded gate run answers a commit nobody is
+# looking at any more; a superseded audit run does not, because its subject is the advisory
+# database on the day it runs. Overlap is only reachable by dispatching one by hand while the
+# cron is mid-flight, and the cost of that is a duplicate read.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: advisory database
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # Pinned and credential-free for the reasons given in ci.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # From crates.io, not a third-party action -- same reasoning as ci.yml, and it costs
+      # less here: this job is weekly and on no one's critical path.
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

@@ -1,0 +1,68 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "ELF64 little-endian x86-64 relocatable object: no program headers, IBT|SHSTK property, a .symtab with one defined function and an undefined canary reference. Every link-classification fact must be null.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": null,
+    "code_relocations": [],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [],
+    "elf_class": 64,
+    "elf_data": "little-endian",
+    "elf_type": "ET_REL",
+    "function_references": [
+      "chard_test_probe:"
+    ],
+    "gnu_property_notes": {
+      "0xc0000002": 1
+    },
+    "gnu_property_types": [
+      "0xc0000002"
+    ],
+    "gnu_relro": null,
+    "gnu_stack_executable": null,
+    "gnu_stack_present": null,
+    "has_dynamic": false,
+    "has_interp": false,
+    "machine": "x86_64",
+    "needed": [],
+    "pie": null,
+    "recorded_command_line": "",
+    "relro": null,
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".text",
+      ".note.gnu.property",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": null,
+    "static_pie": null,
+    "statically_linked": null,
+    "symbol_count": 2,
+    "symbol_tables": [
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {
+      "__stack_chk_fail": {
+        "defined": false,
+        "tables": [
+          ".symtab"
+        ]
+      }
+    },
+    "x86_ibt": true,
+    "x86_shstk": true
+  }
+}

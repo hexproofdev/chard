@@ -1,0 +1,4 @@
+clang version 22.1.8
+Configuration file: /srv/c.cfg
+ "/usr/bin/clang-22" "-cc1" "-triple" "x86_64-redhat-linux-gnu" "-E" "-resource-dir" "/usr/bin/../lib/clang/22" "-internal-isystem" "/srv/g cc/16/../../../../include/c++/16" "-D" "_GLIBCXX_ASSERTIONS" "-internal-externc-isystem" "/usr/include" "-undef" "-fdebug-compilation-dir=/srv" "-o" "/tmp/null-1a.ii" "-x" "c++" "/dev/null"
+ "/usr/bin/clang-22" "-cc1" "-emit-obj" "-resource-dir=/usr/bin/../lib/clang/22" "-o" "/dev/null" "-x" "c++-cpp-output" "/tmp/null-1a.ii"

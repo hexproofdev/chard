@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# `git archive` writes the archived commit's hash into REVISION, which `build.rs` reads
+# where there is no repository (`build/revision.rs`).
+/REVISION export-subst

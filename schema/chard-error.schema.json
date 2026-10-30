@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hexproofdev/chard/schema/chard-error.schema.json",
+  "title": "chard error envelope",
+  "description": "What stdout carries in place of a command's document when chard exits 2 (it refused the invocation or failed, a command line clap refuses among them, and a declared `--execution` that what chard observed contradicts) or 3 (`measure` built a report that contradicts itself and did not publish it). `src/error.rs` states the classification, and `tests/schema_conformance.rs` (`every_envelope_conforms_to_the_error_schema`) holds live envelopes to this file.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "chard_schema",
+    "error"
+  ],
+  "properties": {
+    "chard_schema": {
+      "description": "The major version of this document's shape. When it moves is the CLI contract's rule (`chard --help`; DESIGN.md, \"The command-line contract\"): a key chard adds is not a change, which is why every object here admits one.",
+      "type": "string",
+      "const": "1"
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "operation",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "description": "Whose action comes next: `USER_INPUT` the caller, `PERMISSION` whoever owns the filesystem, `TRANSIENT` a retry, `CONFIGURATION` the invocation's settings, `INTERNAL` a bug report against chard. On exit 3 it is always `INTERNAL`.",
+          "enum": [
+            "USER_INPUT",
+            "PERMISSION",
+            "TRANSIENT",
+            "CONFIGURATION",
+            "INTERNAL"
+          ]
+        },
+        "operation": {
+          "description": "The command that refused or failed, or `chard` where a command line names none.",
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "description": "What failed, the context chain joined by `: `.",
+          "type": "string",
+          "minLength": 1
+        },
+        "hint": {
+          "description": "What to do next, where chard can say; on exit 3, where the report it refused to publish is kept, or how to keep it.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+--sysroot=/srv/r
+-O2
+-L/srv/r/usr/lib/gcc/t/16
+-lm
+-L
+/srv/l
+-Wl,-L/srv/w
+--library-directory=/srv/a
+--library-directory
+/srv/b
+--library-directory

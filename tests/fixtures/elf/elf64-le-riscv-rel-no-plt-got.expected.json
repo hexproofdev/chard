@@ -1,0 +1,68 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "ELF64 little-endian RISC-V relocatable object in the shape gcc 16.1.1 writes for the no-plt probe's caller under -fPIE -fno-plt -march=rv64gc_zicfilp_zicfiss -fcf-protection=full: R_RISCV_GOT_HI20 against chard_no_plt_callee and R_RISCV_PCREL_LO12_I against the local label .L0 (with GNU as's trailing space), R_RISCV_RELAX and R_RISCV_ALIGN against symbol 0, a 0xc0000000 property holding 3 (RISC-V landing pads and shadow stack, which read as the aarch64 word would be BTI and PAC), and a .riscv.attributes section. What code_relocations names on RISC-V and plt-bypassed reads as present.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": null,
+    "code_relocations": [
+      "R_RISCV_GOT_HI20 chard_no_plt_callee",
+      "R_RISCV_PCREL_LO12_I .L0 "
+    ],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [],
+    "elf_class": 64,
+    "elf_data": "little-endian",
+    "elf_type": "ET_REL",
+    "function_references": [
+      "chard_no_plt_caller:",
+      "chard_no_plt_caller:.L0 ",
+      "chard_no_plt_caller:chard_no_plt_callee"
+    ],
+    "gnu_property_notes": {
+      "0xc0000000": 1
+    },
+    "gnu_property_types": [
+      "0xc0000000"
+    ],
+    "gnu_relro": null,
+    "gnu_stack_executable": null,
+    "gnu_stack_present": null,
+    "has_dynamic": false,
+    "has_interp": false,
+    "machine": "riscv",
+    "needed": [],
+    "pie": null,
+    "recorded_command_line": "",
+    "relro": null,
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".text",
+      ".rela.text",
+      ".note.gnu.property",
+      ".riscv.attributes",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": null,
+    "static_pie": null,
+    "statically_linked": null,
+    "symbol_count": 3,
+    "symbol_tables": [
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {},
+    "x86_ibt": false,
+    "x86_shstk": false
+  }
+}

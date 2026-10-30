@@ -1,0 +1,5 @@
+-O2
+-march=i686
+-mfpmath=sse
+-m32bit
+-target

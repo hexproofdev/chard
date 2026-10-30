@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# The ratchets: tests that read the repository's own text (sources, docs, schemas) and hold
+# a rule about it, run by `make ratchets` in seconds and first in `make merge-gate`, so a
+# rule broken by a change fails before the suite's minutes rather than after them.
+# Each line: a test target (`lib`, `bin`, or a file under tests/ without `.rs`), a tab, and
+# the libtest path of one test, run with --exact; or `*`, a tab and the target's number of
+# tests, for every test of that target. scripts/ratchets.sh runs them and fails unless each
+# target ran exactly the tests it was given, that many for a `*` line; tests/ratchets.rs
+# fails on a line whose target or test does not exist, or whose count is not the file's.
+# A test target that lists the tracked tree through git is a `*` line here, so the reduced gate
+# of a document-only diff runs it, or is excepted in tests/merge_gate.rs with its reason
+# (which holds this).
+lib	compile::every_exit_status_is_spelled_by_ended
+lib	compile::tests::every_spawn_site_sits_where_something_bounds_it
+lib	compile::tests::one_child_runs_at_a_time_and_its_spawner_waits_for_it
+lib	env::tests::no_libc_name_escapes_the_published_vocabulary
+lib	probe::tests::the_decoder_fingerprint_moves_on_code_and_clauses_and_not_on_comments
+bin	tests::the_contract_is_stated_once
+discarded_failures	*	1
+untyped_errors	*	1
+decode_layout	*	7
+exit_statuses	*	4
+degenerate_readings	every_defect_handle_has_its_ignored_test_and_the_reverse
+degenerate_readings	every_detect_function_in_the_runtime_module_has_a_row
+predicate_language	the_predicate_schema_vocabularies_match_the_code
+regime_arms	the_flag_lists_the_reasons_were_argued_over_are_pinned
+detector_replay	the_counts_in_the_docs_are_the_counts_in_the_corpus
+build_revision	the_tracked_archive_file_is_one_git_archive_fills_in
+ratchets	*	2
+public_tree	*	6
+proof_harnesses	*	3

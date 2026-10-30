@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# libFuzzer dictionary for `structured_diag`: the SARIF keys and levels `structured::decode`
+# reads, the text gcc and clang print around a document, and the line feed it starts at.
+lf="\x0a"
+open="{"
+close="}"
+runs="\"runs\""
+results="\"results\""
+message="\"message\""
+text="\"text\""
+level="\"level\""
+error="\"error\""
+warning="\"warning\""
+note="\"note\""
+none="\"none\""
+version="\"version\": \"2.1.0\""
+schema="\"$schema\""
+ruleId="\"ruleId\""
+banner="clang: warning: diagnostic formatting in SARIF mode is currently unstable [-Wsarif-format-unstable]"
+generated=" error generated."

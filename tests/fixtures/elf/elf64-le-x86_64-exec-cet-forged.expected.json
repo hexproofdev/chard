@@ -1,0 +1,103 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "The control's x86-64 executable, its IBT|SHSTK property kept, with .text holding main and the cet-endbr probe's three functions sized in .symtab at their addresses, each beginning lea then ret and none with endbr64: the bytes gcc 16.1.1 and clang 22.1.8 compile under -O2 -fcf-protection=none, and the property GNU ld 2.46.1 forces under -z ibt -z shstk (Fedora 44 x86_64, 2026-10-05). The marking and the code disagree on one artifact: cet-marked reads the note present at full, cet-endbr-emitted reads the code absent.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": false,
+    "data_in_code_pages": [
+      ".interp",
+      ".note.gnu.property",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic"
+    ],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [
+      "0x1=0x1",
+      "0x5=0x400268",
+      "0x6=0x400208",
+      "0xa=0x27",
+      "0xb=0x18"
+    ],
+    "elf_class": 64,
+    "elf_data": "little-endian",
+    "elf_type": "ET_EXEC",
+    "function_entries": [
+      "chard_ibt_target_a=8d4701c3",
+      "chard_ibt_target_b=8d4702c3",
+      "chard_ibt_target_c=8d4703c3"
+    ],
+    "gnu_property_notes": {
+      "0xc0000002": 1
+    },
+    "gnu_property_types": [
+      "0xc0000002"
+    ],
+    "gnu_relro": true,
+    "gnu_stack_executable": false,
+    "gnu_stack_present": true,
+    "has_dynamic": true,
+    "has_interp": true,
+    "machine": "x86_64",
+    "needed": [
+      "libc.so.6"
+    ],
+    "pie": false,
+    "recorded_command_line": "",
+    "relro": "partial",
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".interp",
+      ".note.gnu.property",
+      ".text",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": false,
+    "static_pie": false,
+    "statically_linked": false,
+    "symbol_count": 6,
+    "symbol_tables": [
+      ".dynsym",
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {
+      "__stack_chk_fail": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "__stack_chk_fail@GLIBC_2.4"
+        ]
+      },
+      "abort": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "abort@GLIBC_2.2.5"
+        ]
+      }
+    },
+    "x86_ibt": true,
+    "x86_shstk": true
+  }
+}

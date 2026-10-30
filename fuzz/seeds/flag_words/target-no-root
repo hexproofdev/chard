@@ -1,0 +1,8 @@
+-O2
+-B/srv/prefix
+-B
+/srv/p
+--gcc-toolchain=/srv/g
+-isystem
+/srv/i
+--sysroot

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Observed: toolchain clang-18.1.3-glibc2.39-ubuntu24.04, libc glibc, profile openssf-tldr,
+# 2026-09-26, measured in a docker.io/library/ubuntu:24.04 container on a Fedora 44 x86_64
+# host. The CI runner is the same image; a difference there is a finding.
+# One line per withheld verdict: <check> <verdict> <reason>.
+#
+# The same two clang carries under bare-optimized, and for the same reasons: the profile's
+# flags change neither.
+#
+# fortify-level-ge-2-subobject is not listed. Its positive control is silent here, and the
+# cause is measured: glibc 2.39's strcpy wrapper asks __builtin_object_size(__dest, 1)
+# inside an always-inline function, where clang 18.1.3 answers 16, the whole object, and
+# gcc 13.3.0 answers 8. The probe prints that answer as wrap1, and the gating rule
+# subobject-bound-lost-in-wrapper reads it and publishes unsupported, an earned limitation
+# this file does not list. The gap is the pairing of this compiler with that wrapper form,
+# not glibc's alone: glibc 2.43 with clang 22.1.8 on Fedora 44 aborts. See the project
+# ledger.
+no-delete-null-pointer-checks probe-invalid the negative control shows the observable too, so on clang the two arms cannot be told apart and the detector is not demonstrated to work here
+# strict-flex-arrays-enforced, measured in the same image at the commit that added the
+# check: its ctrl copy, past a member that is not last, is caught in no arm here, because
+# glibc 2.39's strcpy wrapper receives the whole object from clang 18.1.3 (the cause
+# fortify-level-ge-2-subobject's gating rule reads), so both control arms are
+# indeterminate under every profile.
+strict-flex-arrays-enforced probe-invalid the ctrl copy is caught in neither control arm, because this glibc's strcpy wrapper loses the subobject bound under this clang, so the arms cannot show the flag

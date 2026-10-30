@@ -1,0 +1,93 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "ELF64 little-endian x86-64 static PIE as lld 10.0.0 links one under -z rodynamic: ET_DYN, no interpreter, a dynamic section with no DT_NEEDED, and neither DT_DEBUG nor DT_FLAGS_1, so no marker of executable output. The tag shape lld 10.0.0 wrote under clang 10 -static-pie -Wl,-z,rodynamic on 2026-10-26, on an object that segfaults at startup. The reader classifies it as a shared object, which the tags cannot contradict; an executable-mode probe's reading of the classification over it is withheld.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": false,
+    "data_in_code_pages": [
+      ".note.gnu.property",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic"
+    ],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [
+      "0x5=0x4001f0",
+      "0x6=0x400190",
+      "0xa=0x27",
+      "0xb=0x18"
+    ],
+    "elf_class": 64,
+    "elf_data": "little-endian",
+    "elf_type": "ET_DYN",
+    "gnu_property_notes": {
+      "0xc0000002": 1
+    },
+    "gnu_property_types": [
+      "0xc0000002"
+    ],
+    "gnu_relro": true,
+    "gnu_stack_executable": false,
+    "gnu_stack_present": true,
+    "has_dynamic": true,
+    "has_interp": false,
+    "machine": "x86_64",
+    "needed": [],
+    "pie": false,
+    "recorded_command_line": "",
+    "relro": "partial",
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".note.gnu.property",
+      ".text",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": true,
+    "static_pie": false,
+    "statically_linked": false,
+    "symbol_count": 4,
+    "symbol_tables": [
+      ".dynsym",
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {
+      "__stack_chk_fail": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "__stack_chk_fail@GLIBC_2.4"
+        ]
+      },
+      "abort": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "abort@GLIBC_2.2.5"
+        ]
+      }
+    },
+    "x86_ibt": true,
+    "x86_shstk": true
+  }
+}

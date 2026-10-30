@@ -1,0 +1,99 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "ELF32 little-endian aarch64 (the ILP32 ABI) executable: EM_AARCH64 at ELFCLASS32, DT_BIND_NOW, PT_GNU_RELRO, BTI property. The family of the aarch64 rows at the other width, which the target witness holds (toolchain.target.abi).",
+  "facts": {
+    "aarch64_bti": true,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": true,
+    "data_in_code_pages": [
+      ".interp",
+      ".note.gnu.property",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic"
+    ],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [
+      "0x1=0x1",
+      "0x5=0x8048180",
+      "0x6=0x8048140",
+      "0xa=0x27",
+      "0xb=0x10",
+      "0x18=0x0"
+    ],
+    "elf_class": 32,
+    "elf_data": "little-endian",
+    "elf_type": "ET_EXEC",
+    "gnu_property_notes": {
+      "0xc0000000": 1
+    },
+    "gnu_property_types": [
+      "0xc0000000"
+    ],
+    "gnu_relro": true,
+    "gnu_stack_executable": false,
+    "gnu_stack_present": true,
+    "has_dynamic": true,
+    "has_interp": true,
+    "machine": "aarch64",
+    "needed": [
+      "libc.so.6"
+    ],
+    "pie": false,
+    "recorded_command_line": "",
+    "relro": "full",
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".interp",
+      ".note.gnu.property",
+      ".text",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": false,
+    "static_pie": false,
+    "statically_linked": false,
+    "symbol_count": 4,
+    "symbol_tables": [
+      ".dynsym",
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {
+      "__stack_chk_fail": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "__stack_chk_fail@GLIBC_2.4"
+        ]
+      },
+      "abort": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "abort@GLIBC_2.2.5"
+        ]
+      }
+    },
+    "x86_ibt": false,
+    "x86_shstk": false
+  }
+}

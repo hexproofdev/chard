@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# The commit a `git archive` tarball was made from. `.gitattributes` marks this file
+# `export-subst`, so `git archive` replaces the line below with the commit's full hash, and
+# `build.rs` reads it where there is no repository to ask (`build/revision.rs`). Everywhere
+# else the line is git's placeholder and names no commit.
+$Format:%H$

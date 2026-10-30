@@ -1,0 +1,7 @@
+{"$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json",
+ "version": "2.1.0",
+ "runs": [{"artifacts": [{"location": {"uri": "chard-work/incompatible_pointer_types.c"},
+                          "contents": {"text": "    /* The observable: assignment between incompatible pointer types, no cast. */\n    words = bytes;\n"}}],
+           "results": [{"ruleId": "-Wincompatible-pointer-types",
+                        "level": "error",
+                        "message": {"text": "assignment to 'int *' from incompatible pointer type 'char *'"}}]}]}

@@ -1,0 +1,14 @@
+-O2
+-m32
+-nostartfiles
+-nostdlib
+--no-standard-libraries
+-nodefaultlibs
+-nolibc
+-nostdlib++
+-nostdinc
+--no-standard-includes
+-nostdinc++
+-nostdlibinc
+-nobuiltininc
+-Wl,-z,now

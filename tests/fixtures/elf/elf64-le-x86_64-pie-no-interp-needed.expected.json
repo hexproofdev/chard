@@ -1,0 +1,99 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "ELF64 little-endian x86-64 PIE linked with no interpreter, as lld 10.0.0 links one under -pie -Wl,--no-dynamic-linker (Ubuntu 20.04 x86_64, clang 10, 2026-10-26): ET_DYN, no PT_INTERP, DT_DEBUG, no DT_FLAGS_1 (GNU ld 2.34, 2.42 and 2.46.1 write DF_1_PIE beside DT_DEBUG on the same link), and DT_NEEDED entries for libc.so.6 and libm.so.6 kept, on an object that crashes at startup. The reader classifies it as a static PIE; as-needed reads the list, which records what the linker kept.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": false,
+    "data_in_code_pages": [
+      ".note.gnu.property",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic"
+    ],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": true,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [
+      "0x1=0x1",
+      "0x5=0x4001f0",
+      "0x6=0x400190",
+      "0xa=0x31",
+      "0xb=0x18",
+      "0x15=0x0",
+      "0x1=0x27"
+    ],
+    "elf_class": 64,
+    "elf_data": "little-endian",
+    "elf_type": "ET_DYN",
+    "gnu_property_notes": {
+      "0xc0000002": 1
+    },
+    "gnu_property_types": [
+      "0xc0000002"
+    ],
+    "gnu_relro": true,
+    "gnu_stack_executable": false,
+    "gnu_stack_present": true,
+    "has_dynamic": true,
+    "has_interp": false,
+    "machine": "x86_64",
+    "needed": [
+      "libc.so.6",
+      "libm.so.6"
+    ],
+    "pie": true,
+    "recorded_command_line": "",
+    "relro": "partial",
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".note.gnu.property",
+      ".text",
+      ".dynsym",
+      ".dynstr",
+      ".dynamic",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": false,
+    "static_pie": true,
+    "statically_linked": true,
+    "symbol_count": 4,
+    "symbol_tables": [
+      ".dynsym",
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {
+      "__stack_chk_fail": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "__stack_chk_fail@GLIBC_2.4"
+        ]
+      },
+      "abort": {
+        "defined": false,
+        "tables": [
+          ".dynsym",
+          ".symtab"
+        ],
+        "versioned": [
+          "abort@GLIBC_2.2.5"
+        ]
+      }
+    },
+    "x86_ibt": true,
+    "x86_shstk": true
+  }
+}

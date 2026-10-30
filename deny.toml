@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Supply-chain policy, read by `make deny` and enforced in the gate.
+#
+# The split that matters: `bans`, `licenses` and `sources` read this file against the
+# committed Cargo.lock and are reproducible from the commit, so they belong in the
+# per-commit gate. `advisories` fetches a live database and can change verdict on a day
+# nobody touched the repository, so it runs under `make audit` in `check-full` instead.
+# `make deny` names its three checks explicitly rather than running a bare
+# `cargo deny check`, which would run all four.
+
+[graph]
+# chard is Linux and ELF only, and says so in the README. Evaluating the graph for
+# targets it does not support would admit dependencies that never get built here.
+targets = [{ triple = "x86_64-unknown-linux-gnu" }, { triple = "x86_64-unknown-linux-musl" }]
+all-features = true
+
+[licenses]
+# Exactly the licences the 30-package graph needs, verified with `cargo metadata`
+# rather than copied from a template: an allowlist admitting a licence no dependency
+# needs is an allowlist nobody has read. If this list needs to grow, that is a
+# dependency change worth noticing.
+#
+#   BSD-3-Clause              chard itself
+#   MIT / Apache-2.0          the 27 packages offering one or both
+#   Unicode-3.0               icu/unicode data in the idna path, dual-licensed under
+#                             (MIT OR Apache-2.0) AND Unicode-3.0
+#   Unlicense                 offered as an alternative by one package alongside MIT
+allow = [
+    "BSD-3-Clause",
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+
+[bans]
+# A second copy of a crate in the graph is not automatically wrong, but on a project
+# with four direct dependencies it means something was pulled in twice by accident.
+multiple-versions = "deny"
+wildcards = "deny"
+# chard's own build.rs stamps the revision and does nothing else, and the manifest
+# declares no build-dependencies and no dev-dependencies. Keeping that true is the
+# point: every build script in the graph is code that runs on a contributor's machine
+# at build time.
+[[bans.deny]]
+name = "openssl-sys"
+reason = "chard makes no network calls and links no TLS stack; an openssl in the graph means something pulled in a client"
+
+[sources]
+# Everything comes from crates.io. A git dependency or an alternative registry would
+# mean the published crate cannot be rebuilt from the registry alone.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

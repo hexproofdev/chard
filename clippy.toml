@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Words that `doc_markdown` mistakes for code identifiers but which are ordinary
+# prose here: an organisation name, an architecture name and two operating systems,
+# all of which appear throughout the docs as words rather than as items. `OpenBSD`
+# is listed because most of its mentions sit in doc comments that only compile on
+# that target, so the lint fires there and not here.
+#
+# `..` keeps clippy's own list (`FreeBSD`, `macOS`, `GitHub` among it) beside these.
+# clippy reads only a bare `..` as its list: `"..DEFAULT.."` is one more word, and with it
+# clippy's list is replaced.
+doc-valid-idents = ["OpenSSF", "OpenBSD", "AlmaLinux", "x86_64", ".."]

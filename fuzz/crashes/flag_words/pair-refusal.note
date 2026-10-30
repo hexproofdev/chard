@@ -1,0 +1,10 @@
+SPDX-License-Identifier: BSD-3-Clause
+
+`pair-refusal`: the tracked seed `seeds/flag_words/removing-none`, the list whose words
+`toolchain::runtime_removing_flags` refuses none of alone, kept here because the target failed
+on it under `make fuzz-replay` from `check-full`, on Linux x86_64 under AddressSanitizer
+(2026-10-22). The reader refuses a word that hands the next one on, `-Xpreprocessor` or
+`-Xarch_<arch>`, together with a removal after it, as the two words
+`-Xpreprocessor -nostdinc`, so a law that holds every word it returns to be refused alone fails
+on this input. `flag_words` aligns each refusal with one word refused alone or with such a pair
+refused alone, in the order law and in the head law.

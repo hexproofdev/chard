@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+/target
+
+# Default --workdir. Holds probe sources, artifacts, and captured stdout/stderr,
+# which are retained deliberately as evidence for a run but are outputs, not
+# sources.
+/chard-work
+*.stdout
+*.stderr
+
+# A third-party reference document, fetched rather than vendored: its licence has
+# not been verified for redistribution and it is not needed to build or run chard.
+# Fetch it with: curl -sSL -o compiler-flags-distro-README.md \
+#   'https://raw.githubusercontent.com/jvoisin/compiler-flags-distro/main/README.md'
+/compiler-flags-distro-README.md
+
+# Sweep outputs: downloaded distribution images, per-image guest working
+# directories, and the JSON reports a run produces. A glob rather than an
+# enumeration, because the previous list was one-name-per-directory and had
+# already fallen behind the harness that writes them: it produces
+# `chard-bare-out` and `chard-vm-bare`, and neither was ignored.
+/chard-images
+/chard-vm*
+/chard-*-out
+/chard-out*
+/archive
+
+# Working notes that name this development host: absolute paths, image cache
+# locations, sweep output directories. Tracked files stay host-free (see the
+# "Scrub the development host out of the tree" commit), so anything that has to
+# record where things live on a particular machine goes here instead.
+*.private.md
+
+# The leak gate's private pattern list: the names and host-only paths that identify a
+# developer's machine, which `scripts/leak-gate.sh` scans the object graph for. Ignored
+# because the list is the disclosure: tracked, it would publish every name it exists to
+# keep out. Each machine holds its own; the script's header says how to write one. The glob
+# covers a copy or backup made beside it.
+/scripts/leak-gate.private*
+
+# Editor detritus. Not merely untidy: a swap file is a binary snapshot of whatever was
+# being edited, and its header records the editing user and host by construction, so one
+# committed here publishes the development machine. `scripts/leak-gate.sh` scans the object
+# graph rather than the checkout, since an ignore rule leaves exposed whatever was committed
+# before it.
+*.swp
+*.swo
+*~
+
+# Agent working configuration: local tool permissions and session settings. Untracked, and
+# ignored so that a single `git add -A` does not commit it.
+.claude/
+# Output of `make clang`, removed by `make clean`.
+chard-clang.json
+# `cargo mutants` working output.
+mutants.out*/
+# aarch64 bring-up notes: predictions, the results measured against them, and the sweep
+# reports behind those results. Kept locally as evidence of a forecast made before the
+# measurement; untracked because the repository does not publish per-toolchain results.
+docs/bringup/
+
+# Review findings kept at the checkout root, not published.
+FINDINGS.md

@@ -1,0 +1,10 @@
+-O2
+--sysroot=/srv/a
+-isysroot
+/srv/b
+-fstack-protector-strong
+--sysroot
+/srv/c
+-m32
+-isysroot/srv/d
+-Wl,-z,now

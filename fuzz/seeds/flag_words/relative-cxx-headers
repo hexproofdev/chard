@@ -1,0 +1,9 @@
+-stdlib++-isystem
+v1
+-O2
+-stdlib++-isystemv2
+-stdlib++-isystem
+/abs
+-stdlib++-isystem/abs2
+-stdlib=libc++
+--gcc-install-dir=gid

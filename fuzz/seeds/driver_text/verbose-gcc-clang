@@ -1,0 +1,5 @@
+Using built-in specs.
+COLLECT_GCC=/usr/bin/gcc
+Configured with: ../configure --enable-default-pie --enable-default-ssp
+Configuration file: /etc/clang/x86_64-redhat-linux-gnu.cfg
+Thread model: posix

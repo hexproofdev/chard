@@ -1,0 +1,7 @@
+x86_64-redhat-linux
+amd64-unknown-freebsd15.1
+aarch64-linux-gnu
+arm64-apple-darwin25
+i686-pc-linux-gnu
+armv7hl-redhat-linux-gnueabi
+riscv64-linux-gnu

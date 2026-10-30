@@ -1,0 +1,11 @@
+SPDX-License-Identifier: BSD-3-Clause
+
+`comm-control`: five bytes, the uid map empty (a user namespace whose map is not written, which
+settles `container`) and `/proc/1/comm` the one character U+0006. Found by `env_reads` on its
+first campaign, under AddressSanitizer on Linux x86_64. Written raw, PID 1's name puts the byte
+U+0006 itself between the backticks (the failure message prints it escaped, `\u{6}`), so a
+control character, or a terminal escape, that a container's owner gives its PID 1
+(`prctl(PR_SET_NAME)` takes any byte but NUL) reaches the report's sentence and the terminal a
+consistency refusal prints to. The observation passes the name through the same `quoted` as the
+marker values beside it, which leaves an ordinary name in backticks. The unit test
+`pid1_s_name_is_quoted_as_a_planted_value` in `src/env.rs` holds it.

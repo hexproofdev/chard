@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hexproofdev/chard/schema/chard-predicate.schema.json",
+  "title": "chard decoder predicate",
+  "description": "A decoder for one check, written as data in the language named by $defs/language. The evaluation rules are normative in the module documentation of src/predicate/mod.rs; this schema declares the shape only. Enumerations are serde's externally tagged form: a unit variant is a string, a variant with data is a one-member object whose key is the variant's name. tests/predicate_language.rs holds every closed vocabulary here to the code and validates every conformance vector's predicate, and generated ones, against this schema. Two rules are validate's in src/predicate/mod.rs and not this schema's: clause ids are unique within a predicate, and a symbol term names a symbol on elf::WATCHED_SYMBOLS.",
+  "$ref": "#/$defs/predicate",
+  "$defs": {
+    "language": {
+      "const": "chard-predicate/1"
+    },
+    "predicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tables", "clauses", "otherwise"],
+      "properties": {
+        "tables": {
+          "description": "ELF tables whose unread truncation concludes indeterminate under the clause @truncated.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/elf_table" }
+        },
+        "clauses": {
+          "description": "Tried in order; the first whose condition holds concludes.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/clause" }
+        },
+        "otherwise": { "$ref": "#/$defs/conclusion" }
+      }
+    },
+    "clause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "when", "then", "because"],
+      "properties": {
+        "id": {
+          "description": "Unique within the predicate; never empty and never beginning with @, which the reserved clauses use.",
+          "type": "string",
+          "pattern": "^[^@]"
+        },
+        "when": { "$ref": "#/$defs/cond" },
+        "then": { "$ref": "#/$defs/conclusion" },
+        "because": {
+          "description": "The reason the clause concludes; it holds a character outside ECMA-262's \\s.",
+          "type": "string",
+          "pattern": "\\S"
+        }
+      }
+    },
+    "conclusion": {
+      "oneOf": [
+        { "enum": ["absent", "indeterminate"] },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["present"],
+          "properties": { "present": { "$ref": "#/$defs/level_of" } }
+        }
+      ]
+    },
+    "level_of": {
+      "oneOf": [
+        { "const": "none" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["word"],
+          "properties": { "word": { "type": "string", "minLength": 1 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value"],
+          "properties": { "value": { "$ref": "#/$defs/term" } }
+        }
+      ]
+    },
+    "cond": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "all": { "type": "array", "items": { "$ref": "#/$defs/cond" } },
+        "any": { "type": "array", "items": { "$ref": "#/$defs/cond" } },
+        "none-of": { "type": "array", "items": { "$ref": "#/$defs/cond" } },
+        "defined": { "$ref": "#/$defs/term" },
+        "missing": { "$ref": "#/$defs/term" },
+        "truth": { "$ref": "#/$defs/term" },
+        "eq": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/term" }, { "type": "string" }],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "int": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/term" },
+            { "$ref": "#/$defs/cmp" },
+            { "type": "integer" }
+          ],
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "any-starts-with": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/term" }, { "type": "string" }],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "any-contains": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/term" }, { "type": "string" }],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "non-empty": { "$ref": "#/$defs/term" }
+      }
+    },
+    "term": {
+      "oneOf": [
+        { "enum": ["cxx-stdlib", "symbol-names"] },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "additionalProperties": false,
+          "properties": {
+            "macro": { "type": "string" },
+            "c-int": { "type": "string" },
+            "elf": { "$ref": "#/$defs/elf_field" },
+            "symbol": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "cmp": {
+      "enum": ["eq", "ne", "lt", "le", "gt", "ge"]
+    },
+    "elf_table": {
+      "enum": [
+        "header",
+        "program-headers",
+        "gnu-stack",
+        "section-headers",
+        "section-names",
+        "dynamic",
+        "dynstr",
+        "symbols",
+        "relocations",
+        "notes",
+        "comment",
+        "code",
+        "function-entries",
+        "relocations"
+      ]
+    },
+    "elf_field": {
+      "description": "The ElfFacts keys a predicate may read, as $defs/elf_facts in chard-report.schema.json spells them.",
+      "enum": [
+        "elf_class",
+        "elf_type",
+        "machine",
+        "has_interp",
+        "has_dynamic",
+        "pie",
+        "df_1_pie",
+        "static_pie",
+        "shared_object",
+        "statically_linked",
+        "relro",
+        "gnu_relro",
+        "bind_now",
+        "gnu_stack_present",
+        "gnu_stack_executable",
+        "df_1_noopen",
+        "textrel",
+        "dt_relr",
+        "dt_debug",
+        "dt_soname",
+        "dynamic_tags",
+        "needed",
+        "rpath",
+        "runpath",
+        "gnu_property_types",
+        "x86_ibt",
+        "x86_shstk",
+        "aarch64_bti",
+        "aarch64_pac",
+        "aarch64_gcs",
+        "sections",
+        "data_in_code_pages",
+        "code_relocations",
+        "function_references",
+        "symbol_count",
+        "recorded_command_line",
+        "code_scanned",
+        "code_matches",
+        "function_entries"
+      ]
+    }
+  }
+}

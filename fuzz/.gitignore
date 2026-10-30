@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Build output, libFuzzer's crash artifacts, the growing corpus, and the lockfile of a
+# crate nothing ships. A crash worth keeping is minimised and committed under crashes/
+# with a note, by hand.
+target
+artifacts
+corpus
+coverage
+Cargo.lock
+# Written into the working directory when a target binary is run directly rather than
+# through `cargo fuzz run`.
+crash-*
+oom-*
+timeout-*
+slow-unit-*

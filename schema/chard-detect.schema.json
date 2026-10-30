@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hexproofdev/chard/schema/chard-detect.schema.json",
+  "title": "chard detect output",
+  "description": "What `chard detect <check>` prints on success: a replay of every reading a report publishes for the check (`kind: replay`), or one decoder run over one set of facts (`kind: detection`). A detection is not a verdict, since no control triple ran. `src/detect.rs` states the mechanism, and `tests/schema_conformance.rs` holds live output to this file.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/replay"
+    },
+    {
+      "$ref": "#/$defs/detection"
+    }
+  ],
+  "$defs": {
+    "decoder": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "kind",
+        "language",
+        "sha256",
+        "source",
+        "digest_agrees"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "predicate",
+            "code"
+          ]
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The predicate language, for a predicate decoder."
+        },
+        "sha256": {
+          "type": "string",
+          "minLength": 64,
+          "description": "The report's `decoders.predicates[CHECK].sha256` when `source` is `report`; this binary's decoder digest, as `chard probes` publishes it, when `source` is `corpus`."
+        },
+        "source": {
+          "enum": [
+            "report",
+            "corpus"
+          ]
+        },
+        "digest_agrees": {
+          "type": "boolean",
+          "description": "Whether the published predicate's canonical form has the digest it is published under. `false` exits 1."
+        }
+      }
+    },
+    "reads": {
+      "type": "object",
+      "description": "Each read the evaluation made, keyed `macros.NAME`, `elf.FIELD`, `elf.watched_symbols.NAME`, `elf.watched_symbols` or `elf.truncations`, with the value it returned; `null` is undefined.",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "integer",
+          "boolean",
+          "array",
+          "null"
+        ]
+      }
+    },
+    "outcome": {
+      "enum": [
+        "present",
+        "absent",
+        "indeterminate"
+      ]
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "chard_schema",
+        "kind",
+        "check",
+        "run_id",
+        "inputs_sha256",
+        "decoder",
+        "observations",
+        "expected",
+        "replayed",
+        "not_replayable",
+        "replays",
+        "restated"
+      ],
+      "properties": {
+        "chard_schema": {
+          "description": "The major version of this document's shape. When it moves is the CLI contract's rule (`chard --help`; DESIGN.md, \"The command-line contract\"): a key chard adds is not a change, which is why every object here admits one.",
+          "type": "string",
+          "const": "1"
+        },
+        "kind": {
+          "const": "replay"
+        },
+        "check": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The report's `run.id`."
+        },
+        "inputs_sha256": {
+          "type": "string",
+          "description": "The report's `run.inputs_sha256`."
+        },
+        "decoder": {
+          "$ref": "#/$defs/decoder"
+        },
+        "arm": {
+          "enum": [
+            "measured",
+            "positive",
+            "negative",
+            "regime"
+          ],
+          "description": "The one reading site `--arm` restricted the replay to."
+        },
+        "observations": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The report's observations of the check. A report with none is refused through the error envelope rather than replayed at `expected: 0`."
+        },
+        "expected": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Readings the report owes for the check: the measured build of every observation that reached its decoder, every control arm with an outcome, and any site that publishes a `decoded`. Always `replayed` plus the length of `not_replayable`."
+        },
+        "replayed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Readings re-evaluated; the length of `replays`."
+        },
+        "not_replayable": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "probe",
+              "arm",
+              "reason"
+            ],
+            "properties": {
+              "probe": {
+                "type": "string"
+              },
+              "arm": {
+                "enum": [
+                  "measured",
+                  "positive",
+                  "negative",
+                  "regime"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "code-decoder",
+                  "record-cut",
+                  "unkept-c-int-follow",
+                  "reading-absent"
+                ],
+                "description": "`reading-absent` is a site that owes a reading and publishes none, and exits 1; the others are readings no replay can reach. A code decoder is replayed through this binary over the records its site publishes, and `code-decoder` names what remains: an arm of a check whose decoder reads an artifact the store does not keep (`detect::READS_UNSTORED_ARTIFACT`); a record that does not read, or an artifact key the store does not resolve, is refused as unusable input. `record-cut` is a record an excerpt budget cut."
+              },
+              "key": {
+                "type": "string",
+                "description": "The key the Published view stopped at, for `unkept-c-int-follow`."
+              }
+            }
+          }
+        },
+        "replays": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "probe",
+              "arm",
+              "facts_key",
+              "reads",
+              "clause",
+              "outcome",
+              "level",
+              "published",
+              "agrees"
+            ],
+            "properties": {
+              "probe": {
+                "type": "string"
+              },
+              "arm": {
+                "enum": [
+                  "measured",
+                  "positive",
+                  "negative",
+                  "regime"
+                ]
+              },
+              "facts_key": {
+                "type": "string",
+                "description": "The store key of the facts the reading was evaluated over; on a code decoder's replay, the site's artifact, and empty where its build names none."
+              },
+              "macros_key": {
+                "type": "string"
+              },
+              "reads": {
+                "$ref": "#/$defs/reads"
+              },
+              "clause": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The re-evaluation's clause; `null` where it stopped at `incomplete`, and on the replay of a code decoder, which has no clause."
+              },
+              "outcome": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/outcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "level": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "incomplete": {
+                "type": "string",
+                "description": "The key the report's facts do not hold. Such a reading disagrees."
+              },
+              "published": {
+                "type": "object",
+                "description": "The reading as the report states it. A code decoder's site publishes no reading, so on its replay `clause` is `code-decoder` and `outcome` and `level` are what the site states beside it: an arm's `outcome`, or the measured `verdict` and `level`.",
+                "additionalProperties": true,
+                "required": [
+                  "clause",
+                  "outcome",
+                  "level"
+                ],
+                "properties": {
+                  "clause": {
+                    "type": "string"
+                  },
+                  "outcome": {
+                    "type": "string"
+                  },
+                  "level": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              "agrees": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "restated": {
+          "type": "array",
+          "description": "Each value the report states beside a published reading, held to what the reading licenses: a control arm's `outcome` against its reading's outcome, and a measured `on`, `off` or `partial` and its `level`, whether or not the observation carries a `gating`, against the verdict and level the measured reading gives on the check's scale; also each reading's `facts` and `macros` keys against the digests its own site's record publishes, and a measured `on`, `off` or `partial` against the control triple published beside it (`controls`), which earns a measurement when its positive arm is `present`, its negative arm `absent`, any regime arm `absent` and `discriminating` is true. `controls` is restated on every check, a code decoder's included, and an `outcome` or `verdict` beside a reading listed in `not_replayable` restates to `null` and disagrees. A regime arm is owed where the check's declaration in this binary's corpus asks for one and the report's `profile` adds a flag, and an owed arm that is unpublished or states no `outcome` withholds; and a `probe-invalid` beside a published triple is restated against it too, disagreeing where the triple discriminated. `indeterminate`, `unsupported` and `not-applicable` are not restated against the triple: beside a discriminating one they are what a gating rule or the fortify ratchet leaves, and a replay re-derives neither. Any entry with `agrees: false` exits 1.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "probe",
+              "arm",
+              "field",
+              "stated",
+              "restated",
+              "agrees"
+            ],
+            "properties": {
+              "probe": {
+                "type": "string"
+              },
+              "arm": {
+                "enum": [
+                  "measured",
+                  "positive",
+                  "negative",
+                  "regime"
+                ]
+              },
+              "field": {
+                "enum": [
+                  "outcome",
+                  "verdict",
+                  "controls",
+                  "facts",
+                  "macros"
+                ],
+                "description": "`outcome` on a control arm, `verdict` on the measured build against its reading, `controls` on the measured build against its triple, and `facts` or `macros` on any site, a reading's key against the digest its record publishes."
+              },
+              "stated": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The arm's `outcome` (`null` where it states none), the measured `verdict` (for `verdict` and `controls`), or the reading's key (`null` where it names none)."
+              },
+              "stated_level": {
+                "type": "string",
+                "description": "The measured `level` stated beside the verdict."
+              },
+              "restated": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The reading's outcome, or the verdict it licenses (`null` where it licenses no measured verdict, and where the reading was not replayed); for `controls`, the stated verdict where the triple earned it, `probe-invalid` where a triple is published and did not, `null` where none is and beside a `probe-invalid` whose triple discriminated; for `facts` and `macros`, the key the site's record binds the member to, `null` where it binds no single key."
+              },
+              "restated_level": {
+                "type": "string",
+                "description": "The measured reading's `level`."
+              },
+              "agrees": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "detection": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "chard_schema",
+        "kind",
+        "check",
+        "input",
+        "decoder",
+        "proof",
+        "outcome",
+        "level",
+        "observed"
+      ],
+      "properties": {
+        "chard_schema": {
+          "description": "The major version of this document's shape. When it moves is the CLI contract's rule (`chard --help`; DESIGN.md, \"The command-line contract\"): a key chard adds is not a change, which is why every object here admits one.",
+          "type": "string",
+          "const": "1"
+        },
+        "kind": {
+          "const": "detection"
+        },
+        "check": {
+          "type": "string"
+        },
+        "input": {
+          "enum": [
+            "artifact",
+            "elf-facts",
+            "store-entry",
+            "record"
+          ]
+        },
+        "facts_key": {
+          "type": "string",
+          "description": "The SHA-256 of the artifact, the key its facts have in a report's store."
+        },
+        "decoder": {
+          "$ref": "#/$defs/decoder"
+        },
+        "proof": {
+          "type": "boolean",
+          "description": "Whether a predicate evaluation stands behind the detection: `false` for a code decoder, and for a predicate the facts could not answer."
+        },
+        "clause": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/outcome"
+        },
+        "level": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observed": {
+          "type": "string"
+        },
+        "reads": {
+          "$ref": "#/$defs/reads"
+        },
+        "incomplete": {
+          "type": "string"
+        },
+        "expected": {
+          "type": "string",
+          "description": "A record's own `expected`."
+        },
+        "expected_level": {
+          "type": "string"
+        },
+        "agrees": {
+          "type": "boolean",
+          "description": "Whether the detection reproduces the record's `expected` and `expected_level`. `false` exits 1."
+        }
+      }
+    }
+  }
+}

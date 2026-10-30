@@ -1,0 +1,3 @@
+ /usr/libexec/gcc/aarch64-redhat-linux/16/cc1 -quiet m.c
+ /usr/libexec/gcc/aarch64-redhat-linux/16/collect2 -plugin /usr/libexec/gcc/x/liblto_plugin.so -fuse-ld=lld -o m
+COMPILER_PATH=/usr/libexec/gcc/

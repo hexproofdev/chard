@@ -1,0 +1,14 @@
+-O2
+--optimize
+--optimize=2
+--optim
+--opti=3
+-O0
+--o
+--
+--o=2
+--optimizex
+--optimize-s
+--opti=3=4
+--optimize=
+--output

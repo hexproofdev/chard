@@ -1,0 +1,77 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "ELF32 little-endian i386 relocatable object holding the same four functions and a .rel.text of Elf32_Rel entries, no addend and the symbol index above bit 8, whose references fall inside them: three of the four refer to __stack_chk_fail_local. What function_references attributes through SHT_REL, and ssp-level-emitted reads as strong.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": null,
+    "code_relocations": [
+      "R_386_PC32 __stack_chk_fail_local",
+      "R_386_PC32 ssp_escape",
+      "R_386_PC32 ssp_use"
+    ],
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [],
+    "elf_class": 32,
+    "elf_data": "little-endian",
+    "elf_type": "ET_REL",
+    "function_references": [
+      "ssp_any:",
+      "ssp_any:ssp_use",
+      "ssp_addr_taken:",
+      "ssp_addr_taken:__stack_chk_fail_local",
+      "ssp_addr_taken:ssp_escape",
+      "ssp_char_array:",
+      "ssp_char_array:__stack_chk_fail_local",
+      "ssp_char_array:ssp_escape",
+      "ssp_alloca:",
+      "ssp_alloca:__stack_chk_fail_local",
+      "ssp_alloca:ssp_escape"
+    ],
+    "gnu_property_types": [],
+    "gnu_relro": null,
+    "gnu_stack_executable": null,
+    "gnu_stack_present": null,
+    "has_dynamic": false,
+    "has_interp": false,
+    "machine": "i386",
+    "needed": [],
+    "pie": null,
+    "recorded_command_line": "",
+    "relro": null,
+    "rpath": [],
+    "runpath": [],
+    "sections": [
+      ".text",
+      ".rel.text",
+      ".symtab",
+      ".strtab",
+      ".shstrtab"
+    ],
+    "self_report": "",
+    "shared_object": null,
+    "static_pie": null,
+    "statically_linked": null,
+    "symbol_count": 7,
+    "symbol_tables": [
+      ".symtab"
+    ],
+    "textrel": false,
+    "watched_symbols": {
+      "__stack_chk_fail_local": {
+        "defined": false,
+        "tables": [
+          ".symtab"
+        ]
+      }
+    },
+    "x86_ibt": false,
+    "x86_shstk": false
+  }
+}

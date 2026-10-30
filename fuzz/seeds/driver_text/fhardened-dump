@@ -1,0 +1,1 @@
+cc1: warning: '_FORTIFY_SOURCE' is not enabled by '-fhardened' because it was specified in '-D' or '-U' [-Whardened]

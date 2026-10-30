@@ -1,0 +1,74 @@
+{
+  "synthetic": true,
+  "built_by": "tests/elf_builder/mod.rs",
+  "description": "The DF_1_NOW executable with e_shoff, e_shnum and e_shstrndx zeroed and the file cut before the section-header table, as objcopy --strip-section-headers leaves it. .dynamic is reached through PT_DYNAMIC and the property note through PT_NOTE; the symbol tables are unreachable and the reader must say so.",
+  "facts": {
+    "aarch64_bti": false,
+    "aarch64_gcs": false,
+    "aarch64_pac": false,
+    "bind_now": true,
+    "df_1_noopen": false,
+    "df_1_pie": false,
+    "dt_debug": false,
+    "dt_relr": false,
+    "dt_soname": false,
+    "dynamic_tags": [
+      "0x1=0x1",
+      "0x5=0x400240",
+      "0x6=0x4001e0",
+      "0xa=0x27",
+      "0xb=0x18",
+      "0x6ffffffb=0x1"
+    ],
+    "elf_class": 64,
+    "elf_data": "little-endian",
+    "elf_type": "ET_EXEC",
+    "gnu_property_notes": {
+      "0xc0000002": 1
+    },
+    "gnu_property_types": [
+      "0xc0000002"
+    ],
+    "gnu_relro": true,
+    "gnu_stack_executable": false,
+    "gnu_stack_present": true,
+    "has_dynamic": true,
+    "has_interp": true,
+    "machine": "x86_64",
+    "needed": [
+      "libc.so.6"
+    ],
+    "pie": false,
+    "recorded_command_line": "",
+    "relro": "full",
+    "rpath": [],
+    "runpath": [],
+    "sections": [],
+    "self_report": "",
+    "shared_object": false,
+    "static_pie": false,
+    "statically_linked": false,
+    "symbol_count": 0,
+    "textrel": false,
+    "truncations": [
+      {
+        "detail": "no section-header table: the symbol tables are unreachable, so the stack canary and the fortify symbol counts are absent here because they could not be read, not because they are not present. The dynamic segment was read instead, so RELRO, BIND_NOW, DT_RELR and the library lists are measured",
+        "kind": "unread",
+        "table": "symbols"
+      },
+      {
+        "detail": "no section-header table: nothing reached by section name was read, so the .chard.report self-report and .GCC.command.line are empty because they could not be looked up, not because the object lacks them",
+        "kind": "unread",
+        "table": "section-names"
+      },
+      {
+        "detail": ".comment: could not be looked up (no section-header table), so the section's lines were not read and the field is empty for want of a reading",
+        "kind": "unread",
+        "table": "comment"
+      }
+    ],
+    "watched_symbols": {},
+    "x86_ibt": true,
+    "x86_shstk": true
+  }
+}

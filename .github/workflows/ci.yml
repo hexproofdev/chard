@@ -1,0 +1,258 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# What CI runs is a Makefile target. The point is that the string a contributor types,
+# the string in the README and the string here are the same string -- a workflow that
+# inlines `cargo test` instead of calling `make check` is a second gate that drifts from
+# the first, and the contributor passes locally and fails here for reasons neither of
+# them can see.
+#
+# These jobs run only where the repository is pushed to GitHub, and a change merged
+# anywhere else runs none of them. Each job below runs a Makefile target, so a gate off
+# GitHub runs the same command. Off GitHub every merge runs `make merge-gate` (fmt-check,
+# clippy-gate, test, msrv-compile, spdx) and the leak gate. The `check` job's other step (deny),
+# and the msrv, kani, compiler-arms, sweep, musl and cross-check jobs, run off GitHub only
+# when someone types their target. `audit.yml` runs on a schedule.
+
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# The runner OS is pinned, not `ubuntu-latest`. `make check` runs `cargo test`, and chard's
+# tests compile probes with the *runner's* cc, `tests/detector_replay.rs` asserts on
+# specific gcc-version behaviour. A moving label means the gate can turn red on a day nobody
+# touched the repository, which is the exact property `Makefile` cites for keeping
+# `cargo audit` out of the per-commit gate.
+
+# One run per ref. A push onto a branch with a run already in flight makes the earlier
+# run's verdict answer a commit nobody is looking at any more, and on `main` two runs
+# can finish out of order and leave the older one as the visible status.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: gate (fmt, clippy-gate, test, deny, leak-gate, spdx)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # The leak gate reads the object graph -- every ref, not just the tip -- so a
+      # shallow clone would hand it a smaller graph and it would return a clean zero
+      # over the wrong span. That is the exact defect the gate exists to catch, so it
+      # must not be introduced by the checkout.
+      #
+      # Pinned to a commit, with the tag in the comment. `@v4` is a moving label the action's
+      # owner can repoint; `tj-actions/changed-files` (CVE-2025-30066) was compromised by
+      # rewriting exactly such a tag across every version, and every workflow tracking it ran
+      # the new code with no diff to review. `.github/dependabot.yml` moves this pin.
+      #
+      # `persist-credentials: false` because nothing in this workflow uses the token: it
+      # builds and tests and pushes nothing. Left at the default, checkout writes a
+      # credential into `.git/config` that stays there for every later step.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install toolchain components
+        run: rustup component add rustfmt
+
+      # The gate's clippy is a pinned release, not the runner's (the image's stable moves, and
+      # a new clippy's new lint would turn this job red with no commit). Read from the Makefile,
+      # digits and dots only, and handed to the shell through the environment, for the reason
+      # the msrv job gives for the floor.
+      - name: Read the clippy pin from the Makefile
+        id: clippy_pin
+        run: echo "v=$(sed -n 's/^CLIPPY_TOOLCHAIN := \([0-9][0-9.]*\)$/\1/p' Makefile)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install "$CLIPPY_PIN" --profile minimal --component clippy
+        env:
+          CLIPPY_PIN: ${{ steps.clippy_pin.outputs.v }}
+
+      # Built from crates.io rather than fetched by a third-party action. An action is
+      # faster, and it runs inside this job to put an executable we did not write into the
+      # path of the gate. Nothing here holds a secret and `permissions` is read-only, so the
+      # exposure would be small, but the build costs only a cold build measured at 56s on a
+      # 32-core host, single-digit minutes on a 4-core runner, and that is a price this
+      # project can pay. CI depends on GitHub and crates.io and nothing else.
+      #
+      # `--locked` uses cargo-deny's own committed lockfile, so the build is a function of
+      # the version resolved here and not of the day it runs.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      # `make check` is fmt-check + clippy-gate + test + deny + leak-gate + spdx. Every one of
+      # them is reproducible from the commit: clippy-gate runs the pinned clippy, `deny` reads a
+      # committed policy against a committed lockfile, and nothing here fetches an advisory
+      # database. The leak gate here runs without its private host-name list, which is
+      # untracked so that no clone carries it, and its last line says that scan did not run.
+      - name: make check
+        run: make check
+
+  # `cargo audit` is deliberately NOT here. It fetches a live advisory database and can
+  # change verdict on a day nobody touched the repository, so running it on a pull
+  # request turns a contributor's branch red for a reason their diff cannot explain.
+  # It runs on a schedule instead -- see audit.yml.
+
+  # The advertised MSRV, built and tested: `make msrv`. `rust-version` is a promise to every
+  # downstream resolver. This job is the full run, here and daily on the CI host; the gate a merge runs off GitHub
+  # is `make msrv-compile`, which checks the library and every test at the floor without code
+  # generation (the full floor runs daily on the CI host). With this job alone, a suite
+  # that stops compiling at the floor fails nothing until a push.
+  msrv:
+    name: build at the declared MSRV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The floor's exact release (x.y.z), as `make msrv` asks rustup for it: rustup reads a
+      # two-part `rust-version` as a channel of its own, apart from the release.
+      - name: Read the floor from the manifest
+        id: floor
+        run: echo "v=$(make -s msrv-toolchain)" >> "$GITHUB_OUTPUT"
+      # The version reaches the shell through the environment, never through `${{ }}`
+      # expansion into the script. On `pull_request` the workflow definition comes from the
+      # base but the checkout is the PR's tree, so a fork controls `Cargo.toml` -- and a
+      # `rust-version` of `1.88"; curl ... | sh #` would be spliced in as source before bash
+      # ever saw it. As `$MSRV` it is a string that fails to resolve as a toolchain.
+      - run: rustup toolchain install "$MSRV" --profile minimal
+        env:
+          MSRV: ${{ steps.floor.outputs.v }}
+      # `make msrv` reads the floor itself, digits and dots only, and quotes it in the
+      # recipe, so the value is never shell source there either.
+      - run: make msrv
+
+  # The Kani harnesses in `proofs/`, model-checked: `make kani`. They are the bounded-read
+  # and alignment arguments the ELF reader rests on. No merge gate runs `make kani`, so the
+  # harnesses run when someone types it
+  # (last run on 2026-10-29, Fedora 44 x86_64, kani-verifier 0.67.0, 7 of 7 verified in 39 s;
+  # `make kani` fails unless the run's count is the count declared under `proofs/`), and
+  # a change to `src/elf.rs` or `proofs/` since then can falsify one with
+  # every other gate green. The verifier is pinned to the version the harnesses were last
+  # proved under (0.67.0, 7 harnesses, 2026-09-29 on Darwin arm64, about 42 s) and installed
+  # from crates.io with `--locked`; `cargo kani setup` then fetches the matching bundle. A
+  # new verifier version is a change a person makes here, with a run, rather than one a
+  # runner makes on its own.
+  kani:
+    name: model-check the ELF reader's proofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Kani
+        run: cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
+      - name: make kani
+        run: make kani
+
+  # The inert-flag rows only clang has, run under clang. `make check` drives the runner's
+  # `cc`, which is gcc, so there every such row is announced and none is run;
+  # `make compiler-arms` points `cc` at clang and fails unless every row naming clang ran.
+  # Its own job, so a red mark here names this gate and no other.
+  #
+  # clang 20 from the Ubuntu archive, not the `clang` package. The gate needs clang 20 or
+  # later, measured on Ubuntu 24.04 x86_64 with the archive's clang 18.1.3, 19.1.1 and
+  # 20.1.2 at 2026-10-13: under 18 and 19 the `-fsanitize=type` row cannot build and the
+  # `-fno-sanitize-trap=local-bounds` row reads `indeterminate`, so the gate fails, and
+  # 20.1.2 ran every row (the Makefile's `compiler-arms` comment names the floor). The
+  # archive's `clang` package is 18 on this release. Putting the version's own directory first on
+  # PATH makes `clang` and `clang++` that version, which is how the gate reaches it.
+  compiler-arms:
+    name: inert-flag rows clang owns, under clang 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y clang-20 libclang-rt-20-dev
+      - run: echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
+      - name: make compiler-arms
+        run: make compiler-arms
+
+  # The corpus measured end to end on the runner's toolchains, each report held to its
+  # expectation.
+  # `make check` proves the harness against whatever `cc` is; this lane measures gcc and
+  # clang under the three profiles that answer different questions (`DESIGN.md`),
+  # with `--fail-on-missing`, so a withheld verdict on the runner's glibc toolchain turns
+  # the cell red. `scripts/sweep-gate.sh` prints each report's denominators and names
+  # every withheld cell in the log before the target's exit status is decided.
+  #
+  # A cell that withholds by design on this runner's toolchain lists what it withholds,
+  # with a reason per line, in `tests/sweep-expected/<cc>-<profile>.txt`, and the gate
+  # holds each cell to its file in both directions. The observed set is written under
+  # `chard-sweep-out/expected` as an UNREVIEWED candidate, which `make sweep` run on the same
+  # toolchain gives the maintainer to review; the gate refuses the candidate as an expectation
+  # until it is reviewed. The lane uploads nothing: its log names every withheld cell, and a
+  # report carries the runner's paths and toolchain, which this repository does not publish.
+  #
+  # One job per compiler, so a clang failure and a gcc failure are two red marks with
+  # two logs. `fail-fast` is off for the same reason: the second compiler's result is
+  # evidence whatever the first one did.
+  sweep:
+    name: corpus against ${{ matrix.cc }}, three profiles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - if: matrix.cc == 'clang'
+        run: sudo apt-get update && sudo apt-get install -y clang
+      # The compiler name reaches make as an environment variable, for the reason the
+      # MSRV job gives: a value spliced into the script by `${{ }}` would be source. The
+      # execution mode is declared: a hosted runner is a VM, and the checks that declare
+      # `needs_vm` are measured on that word alone.
+      - run: make sweep SWEEP_CC="$SWEEP_CC" SWEEP_EXECUTION=vm
+        env:
+          SWEEP_CC: ${{ matrix.cc }}
+
+  # The crate compiled for macOS (x86_64 and aarch64) and FreeBSD (x86_64): `make
+  # cross-check`, on every pull request.
+  # Every other job here runs on Linux, and code only macOS and the BSDs compile can break
+  # their builds with every job green: a private enum whose variants only the Linux read
+  # constructs, for one, is refused there by the manifest's `unused = deny`. `cargo check` links
+  # nothing and runs rustc's lints, not clippy's, so the Linux runner needs only each
+  # target's standard library. The list here
+  # is the Makefile's CROSS_TARGETS; a target the Makefile names and this line does not
+  # install fails the job rather than being skipped. OpenBSD is not among them: its target
+  # is tier 3, rustup ships no library for it, and the Makefile says how a nightly builds one.
+  cross-check:
+    name: compile for macOS (x86_64, aarch64) and FreeBSD (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-freebsd
+      - name: make cross-check
+        run: make cross-check
+
+  # chard is Linux and ELF only and ships a static musl build for images without a
+  # matching libc. Building it here keeps the README's `make musl` line honest.
+  musl:
+    name: static musl build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: make musl

@@ -1,0 +1,4 @@
+-O2
+-m32
+-fcf-protection=full
+-Wl,-z,now
