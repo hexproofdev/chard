@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# house rustfmt: stable options only. A repository copies this file to its root.
+max_width = 100
+style_edition = "2024"

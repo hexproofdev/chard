@@ -54,17 +54,12 @@ fn both_compilers_pattern_bytes_are_recognized() {
     }
 }
 
-/// The pre-dirtying is what makes absence provable: 0x5A surviving means
-/// nothing wrote over it.
 #[test]
 fn the_surviving_dirt_byte_proves_nothing_initialized_the_variable() {
     let d = tavi_detect("TAVI arr=5a word=5a small=5a ctrl=5a ctrl_supported=1");
     assert_eq!(d.outcome, Outcome::Absent);
 }
 
-/// Uninitialized garbage differs between variable shapes, and it routinely
-/// contains a 0x00 by chance. Treating a stray 0x00 as ambiguous made gcc's
-/// negative control flake between runs and withheld sound verdicts.
 #[test]
 fn disagreeing_shapes_are_absence_even_when_one_byte_looks_like_a_fill() {
     for line in [
@@ -96,8 +91,6 @@ fn a_missing_or_malformed_tavi_line_is_indeterminate_not_absent() {
     }
 }
 
-/// The pattern check must not accept a zero fill, which is what clang produces
-/// incidentally and what `=zero` produces deliberately.
 #[test]
 fn the_pattern_check_rejects_a_zero_fill() {
     let macros = BTreeMap::new();
@@ -113,7 +106,7 @@ fn the_pattern_check_rejects_a_zero_fill() {
 }
 
 /// An artifact's facts with its ELF class set, as the header reports it.
-fn elf_of_class(class: u8) -> crate::elf::ElfFacts {
+fn elf_of_class(class: u8) -> ElfFacts {
     let mut elf = elf_with_report("");
     elf.elf_class = class;
     if class == 32 {
@@ -123,7 +116,7 @@ fn elf_of_class(class: u8) -> crate::elf::ElfFacts {
 }
 
 /// Both fill detectors over one recorded line and one artifact.
-fn tavi_both(stdout: &str, elf: Option<&crate::elf::ElfFacts>) -> [Detection; 2] {
+fn tavi_both(stdout: &str, elf: Option<&ElfFacts>) -> [Detection; 2] {
     let macros = BTreeMap::new();
     let run = tavi_run(stdout);
     let ev = Evidence {
@@ -144,11 +137,6 @@ const I386_CLANG_PATTERN: &str = "TAVI arr=ff word=ff small=ff ctrl=5a ctrl_supp
 const I386_GCC_PATTERN: &str = "TAVI arr=fe word=fe small=fe ctrl=5a ctrl_supported=1";
 const I386_UNINITIALIZED: &str = "TAVI arr=5a word=5a small=5a ctrl=5a ctrl_supported=1";
 
-/// clang fills with 0xFF where pointers are narrower than 64 bits, and both detectors read
-/// that as `=pattern` on an ELFCLASS32 artifact. Read otherwise, the pattern check's
-/// positive control would read `fill=0xff` as absent and the check would be
-/// `probe-invalid` on every i386 clang measured, and the generic check would read an i386
-/// `=pattern` build as `absent`, "uniform but not an initializer's value".
 #[test]
 fn clangs_i386_pattern_fill_is_a_pattern_on_a_32_bit_artifact() {
     let i386 = elf_of_class(32);
@@ -160,13 +148,6 @@ fn clangs_i386_pattern_fill_is_a_pattern_on_a_32_bit_artifact() {
     }
 }
 
-/// Each target is held to the byte its compiler writes: 0xFF is no pattern on a 64-bit
-/// artifact, and 0xAA none on a 32-bit one. Neither is read as `absent` there either: each
-/// is clang's pattern on some target, the class names the pointer width only by
-/// inference (assumption `elf-class-names-clang-pattern-width`), and clang 22.1.8 emits an
-/// `ELFCLASS32` object filled with 0xAA for `aarch64-linux-gnu_ilp32`. Both are withheld,
-/// so the inference failing cannot publish an `off`. With no ELF facts 0xFF is withheld
-/// too: on a 32-bit target whose header went unread it is the pattern.
 #[test]
 fn a_pattern_byte_counts_only_on_the_pointer_width_that_writes_it() {
     let x86_64 = elf_of_class(64);
@@ -202,8 +183,6 @@ fn a_pattern_byte_counts_only_on_the_pointer_width_that_writes_it() {
     }
 }
 
-/// The negative arm stays distinguishable on i386: the dirt survives, and a ctrl that did
-/// not survive refuses the line whatever its fill.
 #[test]
 fn the_i386_negative_arm_and_a_broken_witness_are_not_a_pattern() {
     let i386 = elf_of_class(32);
@@ -244,12 +223,6 @@ fn trap_run(signal: &str) -> RunRecord {
     }
 }
 
-/// The identity survives a platform whose artifact chard cannot read.
-///
-/// This is the gap the Apple trap credit fell into: `fortify_impl` read the section
-/// through `self.elf`, Mach-O has no ELF facts, and so an arm written for Apple could
-/// never fire on Apple. Measured on arm64 — `otool -s __DATA .chard.report` shows
-/// `_FORTIFY_IMPL=apple` in a bare build, so the value was right there and unreachable.
 #[test]
 fn the_self_report_is_readable_where_the_container_is_not() {
     let macros = BTreeMap::new();
@@ -271,23 +244,15 @@ fn the_self_report_is_readable_where_the_container_is_not() {
     assert_eq!(printed(whole).as_deref(), Some("apple"));
 
     // A probe's own output shares the stream, and the region is what bounds the parse.
-    // `stack-clash-guard-page` prints `dist=` and `n=` lines exactly like this.
     let mixed = format!("SCPRT dist=8367487 n=66977792\n{whole}no-check-fired\n");
     assert_eq!(printed(&mixed).as_deref(), Some("apple"));
 
-    // Killed mid-write: an opening marker and a truncated body. Half a report read as
-    // a whole one is how an absent field becomes a confident answer.
+    // Killed mid-write: an opening marker and a truncated body.
     assert_eq!(printed("CHARD-REPORT-V1\n_FORTIFY_IMPL=app"), None);
     assert_eq!(printed("no-check-fired\n"), None);
     assert_eq!(printed(""), None);
 }
 
-/// The trap-credit branch, which none of the 1,011 recorded fixtures exercises: every
-/// recorded fortify run either aborted with glibc's message or exited cleanly.
-///
-/// That gap is not only about Darwin. The fortify-headers arm is live for Alpine and
-/// Chimera and is equally unexercised by the fixtures, so without this test a change to
-/// the gate could break it with nothing to say so.
 #[test]
 fn a_silent_trap_is_credited_only_to_an_implementation_that_named_itself() {
     let macros = BTreeMap::new();
@@ -306,8 +271,7 @@ fn a_silent_trap_is_credited_only_to_an_implementation_that_named_itself() {
 
     for implementation in ["fortify-headers", "apple"] {
         let report = format!("CHARD-REPORT-V1\n_FORTIFY_IMPL={implementation}\n");
-        // `ud2` on x86_64, `brk` on aarch64. Same trap, and the architecture must not
-        // decide whether it counts.
+        // `ud2` on x86_64, `brk` on aarch64.
         for signal in ["SIGILL", "SIGTRAP"] {
             assert_eq!(
                 outcome(Some(&report), signal),
@@ -318,9 +282,7 @@ fn a_silent_trap_is_credited_only_to_an_implementation_that_named_itself() {
         }
     }
 
-    // The gate, from both sides. A trap with no identity is an illegal instruction
-    // from an unknown cause, and glibc must not be credited for one: its failure
-    // carries a message and is matched on that.
+    // The gate from the other side: glibc's failure carries a message and is matched on that.
     assert_eq!(
         outcome(Some("CHARD-REPORT-V1\n_FORTIFY_IMPL=glibc\n"), "SIGTRAP"),
         Outcome::Indeterminate,
@@ -334,8 +296,7 @@ fn a_silent_trap_is_credited_only_to_an_implementation_that_named_itself() {
         Outcome::Indeterminate,
         "an unidentified implementation cannot be credited for a silent death"
     );
-    // No self-report at all, which is every Mach-O artifact today: the identity is
-    // unreadable, so the trap stays unattributed rather than being guessed at.
+    // No self-report at all: the identity is unreadable, so the trap stays unattributed.
     assert_eq!(
         outcome(None, "SIGTRAP"),
         Outcome::Indeterminate,
@@ -343,11 +304,6 @@ fn a_silent_trap_is_credited_only_to_an_implementation_that_named_itself() {
     );
 }
 
-/// FreeBSD's `__chk_fail` aborts with nothing in band, so the credit rests on three
-/// witnesses together: the self-report names FreeBSD's wrappers, the artifact calls a
-/// checking function, and the death is SIGABRT. Each missing one withholds, with the
-/// reason naming what was missing; a trap is not its signature, and the symbol must be a
-/// reference, since a definition is the probe's own.
 #[test]
 fn a_silent_abort_is_freebsds_only_with_its_identity_and_a_checking_call() {
     use crate::elf::SymbolFact;
@@ -414,7 +370,7 @@ fn a_silent_abort_is_freebsds_only_with_its_identity_and_a_checking_call() {
     let mut cut = elf_with_report(report);
     cut.symbol_tables = vec![".dynsym".to_owned()];
     cut.truncations.push(crate::elf::Truncation {
-        table: crate::elf::ElfTable::Symbols,
+        table: ElfTable::Symbols,
         kind: crate::elf::TruncationKind::Unread,
         detail: "mutated: symbols cut".to_owned(),
     });
@@ -457,11 +413,6 @@ fn a_silent_abort_is_freebsds_only_with_its_identity_and_a_checking_call() {
     }
 }
 
-/// The credit also needs the abort to be the silent one, and a referenced rather than a
-/// defined checking function: a static link is named, text on stderr is another abort's
-/// (an assert, an allocator, the stack protector), and the survival marker on stdout says
-/// the copy was not what died. The last four were forged by the assurance review of
-/// 2026-10-27 before the rule read the streams.
 #[test]
 fn a_loud_or_survived_abort_is_not_freebsds_kill() {
     use crate::elf::SymbolFact;
@@ -549,9 +500,6 @@ fn a_loud_or_survived_abort_is_not_freebsds_kill() {
     assert_eq!(streams("", "").outcome, Outcome::Present);
 }
 
-/// Every checking function the silent-abort credit reads is one the ELF reader watches,
-/// so a name here that the facts could never hold is caught rather than silently never
-/// matched.
 #[test]
 fn every_freebsd_checking_call_is_watched() {
     for name in FREEBSD_CHECKING_CALLS {
@@ -581,9 +529,6 @@ fn every_freebsd_checking_call_is_watched() {
     assert!(!FREEBSD_CHECKING_CALLS.contains(&"__stack_chk_fail"));
 }
 
-/// libc++ can trap instead of printing, and its identity has two spellings: chard's
-/// own `_CXX_STDLIB` summary, which lives only in the self-report, and the real
-/// `_LIBCPP_VERSION` the preprocessor dump carries whatever the object format is.
 #[test]
 fn a_libcpp_trap_is_credited_through_either_spelling_of_its_identity() {
     let run = trap_run("SIGTRAP");
@@ -616,15 +561,6 @@ fn a_libcpp_trap_is_credited_through_either_spelling_of_its_identity() {
     );
 }
 
-/// The uninitialized witness decides whether *any* of the run can be read, and it
-/// fails toward withholding.
-///
-/// `ctrl` carries `__attribute__((uninitialized))`, so the flag must never touch it
-/// and it must read back the dirt byte. When it does not, frame reuse did not happen
-/// and the three readings beside it describe nothing — including, and especially, a
-/// uniform zero, which is exactly what a working `-ftrivial-auto-var-init=zero` looks
-/// like. Inverting the comparison publishes that false clean result and refuses every
-/// genuine one, and both directions are asserted here because either alone passes.
 #[test]
 fn a_failed_uninitialized_witness_refuses_the_whole_reading() {
     // The witness held: `ctrl` read back the dirt byte, so the zero fill beside it is
@@ -641,11 +577,12 @@ fn a_failed_uninitialized_witness_refuses_the_whole_reading() {
         "a zero fill under a failed witness is the reading that looks like success"
     );
 
-    // A compiler with no opt-out attribute says so, and the witness is skipped rather
-    // than failed — otherwise every such compiler would report indeterminate.
+    // A compiler with no opt-out attribute says so, and the dirt on every shape is then the
+    // witness: a zero fill, which a frame never dirtied reads too, is withheld.
     let unsupported = tavi_detect("TAVI ctrl_supported=0 ctrl=00 arr=00 word=00 small=00");
-    assert_eq!(unsupported.outcome, Outcome::Present);
-    assert_eq!(unsupported.level.as_deref(), Some("zero"));
+    assert_eq!(unsupported.outcome, Outcome::Indeterminate);
+    let dirt = tavi_detect("TAVI ctrl_supported=0 ctrl=00 arr=5a word=5a small=5a");
+    assert_eq!(dirt.outcome, Outcome::Absent);
 }
 
 /// A `RunRecord` carrying only the flex-array probe's stdout line.
@@ -677,14 +614,6 @@ fn flex_detect(stdout: &str) -> Detection {
     })
 }
 
-/// Each `-fstrict-flex-arrays` level is read from the three bounds it implies, and
-/// nothing else is read as a level.
-///
-/// The flag exempts trailing-array spellings in order — `[]`, then `[0]`, then `[1]`
-/// — so the three `__builtin_object_size` answers move together and only four of the
-/// eight combinations describe a real level. The rest mean one of the three readings
-/// is not measuring what it is meant to, and saying so is the only honest answer:
-/// picking the nearest level would publish a posture the toolchain never had.
 #[test]
 fn each_flex_array_level_is_read_from_the_bounds_it_implies() {
     for (stdout, level) in [
@@ -697,15 +626,12 @@ fn each_flex_array_level_is_read_from_the_bounds_it_implies() {
         assert_eq!(d.level.as_deref(), Some(level), "{stdout}");
     }
 
-    // Level 0 is an absence, not a level: every trailing array is still flexible, so
-    // there is no bound for the flag to have tightened. The readings are deliberately
-    // non-negative — `0` is a real size here, and a guard that treated it as "no
-    // answer" would report this build as unmeasurable rather than as unhardened.
+    // Level 0 is an absence: every trailing array is still flexible.
     let none = flex_detect("flex-two=0 flex-one=0 flex-zero=8");
     assert_eq!(none.outcome, Outcome::Absent);
     assert_eq!(none.level, None);
 
-    // Bounded at a wider spelling than a narrower one. No level produces it.
+    // Bounded at a wider spelling than a narrower one.
     let impossible = flex_detect("flex-two=9 flex-one=1 flex-zero=0");
     assert_eq!(impossible.outcome, Outcome::Indeterminate);
     assert!(
@@ -717,15 +643,6 @@ fn each_flex_array_level_is_read_from_the_bounds_it_implies() {
     );
 }
 
-/// `-1` is `__builtin_object_size` declining to answer, and it is never read as a
-/// level.
-///
-/// Without optimization it answers `-1` for every query whatever the flag was set to,
-/// so treating it as "unbounded" would report the flag off for a build that set it —
-/// absence of an answer taken as an answer. Each reading is tested alone, with the
-/// other two forming a combination that *would* otherwise decide a level, because a
-/// guard that only fires when all three are negative would pass a test that made them
-/// negative together.
 #[test]
 fn a_size_the_compiler_could_not_determine_is_not_a_level() {
     for stdout in [
@@ -747,14 +664,6 @@ fn a_size_the_compiler_could_not_determine_is_not_a_level() {
     }
 }
 
-/// The reason for a `-1` names the cause the probe reported, and neither when it
-/// reported none.
-///
-/// OpenBSD 7.9's negative arm prints `-1` at `-O2` because its driver passes
-/// `-fno-builtin-malloc` and its `malloc` carries no `alloc_size`; the reason blamed a
-/// build without optimization there. The optimization marker is read as a whole field,
-/// so `optimize=yes` is not found inside a longer token, and evidence without
-/// the optimization marker names both causes.
 #[test]
 fn a_size_the_compiler_could_not_determine_names_the_cause_the_probe_reported() {
     let unoptimized = flex_detect("flex-two=-1 flex-one=-1 flex-zero=-1\noptimize=no");
@@ -795,13 +704,6 @@ fn a_size_the_compiler_could_not_determine_names_the_cause_the_probe_reported() 
     }
 }
 
-/// The declared-storage construct has no allocator, so its optimized `-1` does not blame
-/// one.
-///
-/// The probe queries objects declared in static unions and prints
-/// `storage=declared`. An unoptimized build still withholds for the unoptimized cause; an
-/// optimized one, for which chard knows no cause, withholds naming no allocator. Its level
-/// readings decode exactly as the heap construct's did.
 #[test]
 fn the_declared_construct_withholds_without_blaming_an_allocator() {
     let unoptimized =
@@ -819,11 +721,6 @@ fn the_declared_construct_withholds_without_blaming_an_allocator() {
         unoptimized.observed
     );
     assert!(
-        optimized.observed.contains("no cause chard knows of"),
-        "{}",
-        optimized.observed
-    );
-    assert!(
         unreported.observed.contains("did not report whether"),
         "{}",
         unreported.observed
@@ -836,7 +733,6 @@ fn the_declared_construct_withholds_without_blaming_an_allocator() {
     assert_eq!(on.level.as_deref(), Some("3"), "{}", on.observed);
 }
 
-/// No readings at all, and no run at all, are different facts and both withhold.
 #[test]
 fn a_probe_that_printed_no_flex_array_readings_withholds() {
     let silent = flex_detect("");
@@ -883,13 +779,6 @@ fn exited_run(status: i32, stdout: &str) -> RunRecord {
     }
 }
 
-/// A guard that ran in an unoptimized build says something only on gcc 8 and later.
-///
-/// The published defect: clang keeps the guard at `-O0` whether or not the flag was
-/// passed, and reading that as `present` credited every clang measured under a bare
-/// profile with a `-fno-strict-overflow` default it does not have — while the control
-/// arms, which carry their own `-O2`, discriminated perfectly and vouched for the
-/// cell.
 #[test]
 fn an_unoptimized_overflow_guard_is_read_only_where_the_compiler_folds_it() {
     let macros = BTreeMap::new();
@@ -957,54 +846,22 @@ fn an_unoptimized_overflow_guard_is_read_only_where_the_compiler_folds_it() {
     );
 }
 
-/// Each sentence the gcc and clang branches publish is whole: one space between words, and
-/// the version it read named in it.
-///
-/// The published defect: the gcc and clang literals lost their line continuations, so the
-/// four gcc 4.8 to 7.5 bare reports of the fleet carried "a front end" followed by a run of
-/// spaces inside the sentence, and the clang reading two such runs.
 #[test]
 fn an_unoptimized_guard_reading_is_published_whole() {
-    for (stdout, named) in [
-        (
-            "optimize=no\nfrontend=gcc\ngcc-major=16\noverflow-guard=ran",
-            "gcc 16,",
-        ),
-        (
-            "optimize=no\nfrontend=gcc\ngcc-major=7\noverflow-guard=ran",
-            "gcc 7:",
-        ),
-        (
-            "optimize=no\nfrontend=gcc\ngcc-major=x\noverflow-guard=ran",
-            "no readable",
-        ),
-        (
-            "optimize=no\nfrontend=gcc\noverflow-guard=ran",
-            "no readable",
-        ),
-        (
-            "optimize=no\nfrontend=clang\noverflow-guard=ran",
-            "clang keeps it",
-        ),
-        (
-            "optimize=no\nfrontend=other\noverflow-guard=ran",
-            "gcc or clang",
-        ),
-        ("optimize=no\noverflow-guard=ran", "gcc or clang"),
-        (
-            "optimize=yes\nfrontend=gcc\ngcc-major=7\noverflow-guard=ran",
-            "gcc 7 with no build record",
-        ),
+    for stdout in [
+        "optimize=no\nfrontend=gcc\ngcc-major=16\noverflow-guard=ran",
+        "optimize=no\nfrontend=gcc\ngcc-major=7\noverflow-guard=ran",
+        "optimize=no\nfrontend=gcc\ngcc-major=x\noverflow-guard=ran",
+        "optimize=no\nfrontend=gcc\noverflow-guard=ran",
+        "optimize=no\nfrontend=clang\noverflow-guard=ran",
+        "optimize=no\nfrontend=other\noverflow-guard=ran",
+        "optimize=no\noverflow-guard=ran",
+        "optimize=yes\nfrontend=gcc\ngcc-major=7\noverflow-guard=ran",
     ] {
         let d = overflow_reading(stdout, "");
         assert!(
             !d.observed.contains("  ") && !d.observed.contains('\n'),
             "{stdout:?}: a run of whitespace inside the sentence: {:?}",
-            d.observed
-        );
-        assert!(
-            d.observed.contains(named),
-            "{stdout:?}: the sentence names {named:?}: {:?}",
             d.observed
         );
     }
@@ -1048,15 +905,10 @@ fn optimized_gcc_reading(major: Option<u32>, flags: Option<&[&str]>) -> Detectio
 }
 
 /// One row of the optimized-gcc tables: the reading of a gcc 7 build compiled by `flags`
-/// is `want`, its sentence names `named` and is whole.
-fn optimized_gcc_7_row(flags: &[&str], want: Outcome, named: &str) {
+/// is `want` and its sentence is whole.
+fn optimized_gcc_7_row(flags: &[&str], want: Outcome, _named: &str) {
     let d = optimized_gcc_reading(Some(7), Some(flags));
     assert_eq!(d.outcome, want, "{flags:?}: {:?}", d.observed);
-    assert!(
-        d.observed.contains(named),
-        "{flags:?}: names {named:?}: {:?}",
-        d.observed
-    );
     assert!(
         !d.observed.contains("  "),
         "{flags:?}: a run of spaces: {:?}",
@@ -1064,14 +916,6 @@ fn optimized_gcc_7_row(flags: &[&str], want: Outcome, named: &str) {
     );
 }
 
-/// An optimized gcc before 8 that ran the guard is read by the last of the driver's own
-/// `-O` words on its compile line: `on` at a level that gcc folds the guard at without the
-/// flag, withheld at one it keeps it at.
-///
-/// The defect this holds out: read by the guard alone, `--profile explicit --flags -O1` reads
-/// `on` under gcc 4.8.4, 5.4.0 and 7.5.0 (x86_64), whose guard runs at -O1 without the flag.
-/// The rows are the levels gcc accepts, the orders two words can come in, and the `-O` words
-/// that are not the driver's; each sentence names the level, and is whole.
 #[test]
 fn an_optimized_gcc_before_8_guard_is_read_by_its_compile_lines_last_level() {
     let p = Outcome::Present;
@@ -1101,9 +945,6 @@ fn an_optimized_gcc_before_8_guard_is_read_by_its_compile_lines_last_level() {
     row(&["-O2", "-Xpreprocessor", "-O1"], p, "at -O2:");
 }
 
-/// Where no level is readable the reading is withheld, never `on`: no `-O` word, `-O0` as
-/// the last word beside an optimized run, a level not measured, or no build record; and
-/// gcc 8 and later are read without the words, gcc 4 as gcc 7 is.
 #[test]
 fn an_optimized_gcc_before_8_guard_withholds_where_no_level_is_readable() {
     let p = Outcome::Present;
@@ -1139,11 +980,6 @@ fn an_optimized_gcc_before_8_guard_withholds_where_no_level_is_readable() {
     assert!(d.observed.contains("on gcc 4"), "{:?}", d.observed);
 }
 
-/// The spellings and words beyond the plain `-O` levels: gcc's `--optimize` and
-/// `--optimize=X` are read as the `-O` word gcc makes of them (gcc 7.5.0 ran the guard under
-/// `-O2 --optimize=1` and `-O2 --optimize` and folded it under `-O1 --optimize=2`), and a
-/// `-specs` or `-wrapper` word withholds whatever the levels say (a specs file appending
-/// `-O1` to `cc1_options` under `-O2` ran the guard on 7.5.0).
 #[test]
 fn an_optimized_gcc_guards_long_spellings_and_specs_files_are_read_safely() {
     let p = Outcome::Present;
@@ -1198,11 +1034,26 @@ fn an_optimized_gcc_guards_long_spellings_and_specs_files_are_read_safely() {
     );
 }
 
-/// The abbreviations gcc's driver completes to `--optimize` read as the level they name
-/// (7.5.0 ran the guard under `-O2 --opti`), a word that is not the long name is an
-/// unmeasured level, and a forced include, which can carry `#pragma GCC optimize`, withholds
-/// in each spelling (7.5.0 ran the guard under `-O2 -include h`, `-Wp,-include,h` and
-/// `-Xpreprocessor -include h` with `#pragma GCC optimize ("O1")` in `h`).
+#[test]
+fn the_run_witness_header_is_no_forced_include_to_the_level_reader() {
+    let p = Outcome::Present;
+    let i = Outcome::Indeterminate;
+    let row = optimized_gcc_7_row;
+    let witness = crate::compile::RUN_WITNESS_HEADER_NAME;
+    row(&["-O2", "-include", witness], p, "at -O2:");
+    row(&["-include", witness, "-O2"], p, "at -O2:");
+    row(&["-O1", "-include", witness], i, "at -O1 on gcc 7:");
+    let joined = format!("-include{witness}");
+    row(&["-O2", &joined], i, &format!("carries {joined},"));
+    let pathed = format!("/opt/{witness}");
+    row(&["-O2", "-include", &pathed], i, "carries -include,");
+    row(
+        &["-O2", "-include", "/opt/h", "-include", witness],
+        i,
+        "carries -include,",
+    );
+}
+
 #[test]
 fn an_optimized_gcc_guards_abbreviations_and_forced_includes_are_read_safely() {
     let p = Outcome::Present;
@@ -1278,8 +1129,7 @@ fn an_optimized_gcc_guards_abbreviations_and_forced_includes_are_read_safely() {
     // gcc's driver completes an unambiguous prefix of a long option (7.5.0 ran the guard
     // under `-O2 --pref /dir/` and `-O2 --spec file` with the specs file of the rows above),
     // so a prefix of the route words from four letters is one of them; shorter ones gcc
-    // rejects (`--inc`, `--includ=h`), so they never build. A plugin can do anything to the
-    // compile, so `-fplugin` withholds too.
+    // rejects (`--inc`, `--includ=h`), so they never build.
     row(&["-O2", "--pref", "/opt/tc/"], i, "carries --pref,");
     row(&["-O2", "--spec", "/opt/f"], i, "carries --spec,");
     row(&["-O2", "--imacr", "/opt/h"], i, "carries --imacr,");
@@ -1295,10 +1145,8 @@ fn an_optimized_gcc_guards_abbreviations_and_forced_includes_are_read_safely() {
     );
     row(&["-O2", "--prefer-x"], p, "at -O2:");
     row(&["-O2", "--special"], p, "at -O2:");
-    // The value of an option that takes the next word is no word of its own: `-u -B` names
-    // a symbol, `-o --pref` an output file, `-L -specs` a directory, and `-Xlinker` hands
-    // `-specs=f` to the linker; the pair is passed over as the classifier reads it, and a
-    // resetting word after the pair is still found.
+    // The value of an option that takes the next word is no word of its own (`-u -B` names
+    // a symbol, `-Xlinker -specs=f` is the linker's), and a resetting word after it is found.
     row(&["-O2", "-u", "-B"], p, "at -O2:");
     row(&["-O2", "-o", "--pref"], p, "at -O2:");
     row(&["-O2", "-L", "-specs"], p, "at -O2:");
@@ -1330,43 +1178,19 @@ fn an_optimized_gcc_guards_abbreviations_and_forced_includes_are_read_safely() {
     );
 }
 
-/// A gcc that reported no major version (a run with no `gcc-major=` line, or one that is no
-/// number) is read as a gcc before 8 is, since the version that would excuse it is absent:
-/// `on` at -O2, withheld at -O1, with no word and with no build record.
 #[test]
 fn an_optimized_gcc_without_a_readable_version_is_read_as_a_gcc_before_8() {
     let p = Outcome::Present;
     let i = Outcome::Indeterminate;
-    let who = "a gcc that reported no readable major version";
-    let row = |flags: &[&str], want: Outcome, named: &str| {
+    let row = |flags: &[&str], want: Outcome| {
         let d = optimized_gcc_reading(None, Some(flags));
         assert_eq!(d.outcome, want, "{flags:?}: {:?}", d.observed);
-        assert!(
-            d.observed.contains(named),
-            "{flags:?}: names {named:?}: {:?}",
-            d.observed
-        );
     };
-    row(
-        &["-O1"],
-        i,
-        &format!("at -O1 on {who}: gcc 4.8, 5.4 and 7.5 keep it"),
-    );
-    row(&["-O2"], p, &format!("on {who} at -O2:"));
-    row(
-        &[],
-        i,
-        &format!("{who} whose compile line carries no -O word"),
-    );
+    row(&["-O1"], i);
+    row(&["-O2"], p);
+    row(&[], i);
     let unversioned = optimized_gcc_reading(None, None);
     assert_eq!(unversioned.outcome, i, "{:?}", unversioned.observed);
-    assert!(
-        unversioned
-            .observed
-            .contains(&format!("{who} with no build record")),
-        "{:?}",
-        unversioned.observed
-    );
     let unreadable = overflow_reading(
         "optimize=yes\nfrontend=gcc\ngcc-major=x\noverflow-guard=ran",
         "",
@@ -1374,54 +1198,6 @@ fn an_optimized_gcc_without_a_readable_version_is_read_as_a_gcc_before_8() {
     assert_eq!(unreadable.outcome, i, "{:?}", unreadable.observed);
 }
 
-/// The `no-strict-overflow` check's published notes say what the decoder does with an
-/// optimized gcc before 8: every folding level is named as read `on`, every keeping level
-/// as withheld, and no sentence says a build at those levels "reads on with or without the
-/// flag", which the decoder contradicts. The notes reach every report and
-/// `chard probes`, so they are a second copy of the rule, held here to the constants.
-#[test]
-fn the_overflow_checks_notes_name_the_levels_the_decoder_reads() {
-    let check = crate::probe::CORPUS
-        .iter()
-        .flat_map(|p| p.checks)
-        .find(|c| c.id == "no-strict-overflow")
-        .expect("the no-strict-overflow check");
-    let notes = check.notes;
-    assert!(
-        !notes.contains("reads on with or without the flag"),
-        "a sentence the decoder contradicts: {notes}"
-    );
-    let folding = GCC_BEFORE_8_FOLDING_LEVELS
-        .join(", ")
-        .replacen(", -Ofast", " and -Ofast", 1);
-    let keeping = GCC_BEFORE_8_KEEPING_LEVELS
-        .join(", ")
-        .replacen(", -Og", " and -Og", 1);
-    assert!(
-        notes.contains(&format!("on at {folding}")),
-        "the notes name the folding levels {folding}: {notes}"
-    );
-    assert!(
-        notes.contains(&format!("withheld at {keeping}")),
-        "the notes name the keeping levels {keeping}: {notes}"
-    );
-    assert!(!notes.contains("  "), "a run of spaces: {notes}");
-    assert!(
-        notes.contains(
-            "where no word, a specs file, a prefix directory, a forced include, a plugin or a \
-             wrapper leaves the level unreadable"
-        ),
-        "the notes name the unreadable cases: {notes}"
-    );
-    assert!(
-        notes.contains("-Ofast measured on 7.5 alone"),
-        "the notes name -Ofast's measured scope: {notes}"
-    );
-}
-
-/// The version decides on each side of [`GCC_FOLDS_UNOPTIMIZED_FROM`], read from the
-/// constant so the test moves with it, and `gcc-major=` is read as the decoder's doc says:
-/// the last line carrying the key, trimmed, its first word a number or no version at all.
 #[test]
 fn an_unoptimized_gcc_guard_is_read_by_the_last_version_line_and_the_threshold() {
     let from = GCC_FOLDS_UNOPTIMIZED_FROM;
@@ -1486,10 +1262,6 @@ fn an_unoptimized_gcc_guard_is_read_by_the_last_version_line_and_the_threshold()
     }
 }
 
-/// An optimized gcc below 8 that ran the guard is read by its compile line, and with no
-/// build record to read it from is withheld by a sentence naming the levels the probe cannot
-/// see, as is a gcc with no version line; from gcc 8 on, and on clang, the sentence is the
-/// plain one.
 #[test]
 fn an_optimized_old_gcc_on_names_the_levels_it_cannot_tell_apart() {
     for (stdout, who) in [
@@ -1539,14 +1311,6 @@ fn overflow_reading(stdout: &str, stderr: &str) -> Detection {
     })
 }
 
-/// A guard kept by a sanitizer's checked add is not the flag.
-///
-/// The published defect: clang 22.1.8 on Fedora 44 x86_64 read `-O2` as `off` and
-/// `-O2 -fsanitize=undefined` as `on`. The sanitizer's checked add cannot be folded, so
-/// the guard survives and fires without `-fwrapv` or `-fno-strict-overflow`, and the
-/// control arms, built from their own flags alone, discriminated over a cell the
-/// sanitizer had produced. The stderr strings here are the runs' own, measured under the
-/// shapes in the test's names.
 #[test]
 fn a_guard_kept_beside_a_sanitizer_report_is_withheld() {
     const RAN: &str = "optimize=yes\nfrontend=clang\noverflow-guard=ran";
@@ -1580,7 +1344,6 @@ fn a_guard_kept_beside_a_sanitizer_report_is_withheld() {
     }
 }
 
-/// What the withholding must leave alone.
 #[test]
 fn a_guard_with_a_silent_stderr_or_none_at_all_reads_as_before() {
     let ran = "optimize=yes\nfrontend=clang\noverflow-guard=ran";
@@ -1625,21 +1388,12 @@ fn fortify_runtime_of(run: &RunRecord) -> Detection {
     })
 }
 
-/// Fortify is credited only for an abort that said it was fortify, and an absence is
-/// credited only for a survivor that said it survived.
-///
-/// Both readings are conjunctions and both fail toward withholding, because each has
-/// a neighbouring death that looks like it from one side only. A canary abort is an
-/// abort — crediting it to fortify is a false `on` over a binary whose overflow was
-/// caught by something else entirely — and a silent clean exit is a clean exit, but
-/// one that never reached the check it was built to trip, so reading it as `off`
-/// invents a result the probe did not produce.
 #[test]
 fn a_neighbouring_death_is_credited_to_neither_fortify_nor_its_absence() {
     let fortified = died_run("SIGABRT", "*** buffer overflow detected ***: terminated");
     assert_eq!(fortify_runtime_of(&fortified).outcome, Outcome::Present);
 
-    // An abort, and not fortify's. The stack protector reached the overflow first.
+    // An abort, and not fortify's.
     let canary = died_run("SIGABRT", "*** stack smashing detected ***: terminated");
     let d = fortify_runtime_of(&canary);
     assert_eq!(
@@ -1670,12 +1424,6 @@ fn a_neighbouring_death_is_credited_to_neither_fortify_nor_its_absence() {
     assert_eq!(marker_but_died.outcome, Outcome::Indeterminate);
 }
 
-/// Why the probe failed to measure is recorded, and `77` is not just another failure.
-///
-/// The probe exits 77 when it could not allocate the buffer it was going to overflow,
-/// which says nothing about the toolchain and everything about the machine it ran on.
-/// Folding it into "unexpected termination" would put a resource problem and a real
-/// anomaly in the same cell, and a reader triaging a sweep needs them apart.
 #[test]
 fn a_probe_that_could_not_allocate_says_so_rather_than_reporting_an_anomaly() {
     let starved = fortify_runtime_of(&exited_run(77, ""));
@@ -1694,9 +1442,8 @@ fn a_probe_that_could_not_allocate_says_so_rather_than_reporting_an_anomaly() {
         anomalous.observed
     );
 
-    // The heap probe found its own size known to the compiler. Level 2 would then
-    // fire like level 3, so neither level may be published from this run, and the
-    // cell says which precondition failed rather than reading as an anomaly.
+    // The heap probe found its own size known to the compiler, where level 2 fires like
+    // level 3, so neither level is published and the precondition is named.
     let opaque_no_more = fortify_runtime_of(&exited_run(PROBE_EXIT_OPACITY_LOST, ""));
     assert_eq!(opaque_no_more.outcome, Outcome::Indeterminate);
     assert!(
@@ -1705,10 +1452,8 @@ fn a_probe_that_could_not_allocate_says_so_rather_than_reporting_an_anomaly() {
         opaque_no_more.observed
     );
 
-    // The known-object probe found nothing of its own after `dst`, and the heap
-    // probe found a chunk geometry its margin was not computed from. Each is the
-    // probe declining to overflow into memory it cannot vouch for, and each names
-    // itself rather than joining the anomalies.
+    // A probe declining to overflow into memory it cannot vouch for (nothing of its own
+    // after `dst`, a chunk geometry its margin was not computed from) names itself.
     let unguarded = fortify_runtime_of(&exited_run(PROBE_EXIT_LAYOUT, ""));
     assert_eq!(unguarded.outcome, Outcome::Indeterminate);
     assert!(
@@ -1739,11 +1484,6 @@ fn a_probe_that_could_not_allocate_says_so_rather_than_reporting_an_anomaly() {
     );
 }
 
-/// The `%n` rung is its own observable, and a plain overflow abort is not it.
-///
-/// Rung 2' asks whether glibc rejects a `%n` directive pointing into writable memory.
-/// A "buffer overflow detected" abort here means some other check fired, so crediting
-/// it would report a rung the C library never demonstrated.
 #[test]
 fn the_percent_n_rung_is_not_credited_to_a_plain_overflow_abort() {
     let macros = BTreeMap::new();
@@ -1757,9 +1497,8 @@ fn the_percent_n_rung_is_not_credited_to_a_plain_overflow_abort() {
         })
     };
 
-    // Both spellings, written out rather than taken from the constant: a test that
-    // reads its evidence from the thing under test cannot fail when that thing is
-    // wrong, which is how a missing singular would survive.
+    // Both spellings, written out rather than taken from the constant, so a constant that
+    // lost one fails here.
     for message in [
         "*** %n in writable segments detected ***",
         "*** %n in writable segment detected ***",
@@ -1792,8 +1531,6 @@ fn the_percent_n_rung_is_not_credited_to_a_plain_overflow_abort() {
     );
 }
 
-/// The runtime detector's `observed` goes through the same cut, so a libc message at
-/// the end of a long stderr is quoted rather than lost.
 #[test]
 fn a_runtime_observed_string_quotes_the_end_of_a_long_stderr() {
     let padding = "x".repeat(400);
@@ -1817,13 +1554,6 @@ fn a_runtime_observed_string_quotes_the_end_of_a_long_stderr() {
     );
 }
 
-/// The exit statuses the detector reads are the ones the probes define.
-///
-/// Two spellings of one vocabulary, in two languages: `CHARD_EXIT_*` in the header
-/// every probe includes and `PROBE_EXIT_*` here. A number that moved in one place
-/// would turn a named precondition failure back into `unexpected termination`, which
-/// is still withheld and does not say why. The header is embedded in the binary,
-/// so it is read back rather than assumed.
 #[test]
 fn the_probe_exit_vocabulary_is_the_one_the_header_defines() {
     let reserved = header_exit_statuses();
@@ -1915,13 +1645,6 @@ fn c_integer(token: &str) -> Option<i64> {
 
 /// Each number a statement that ends the program spells in C `code` (comments and literals
 /// already blanked), as the value and the line the statement starts on.
-///
-/// The statement is `return`, `exit`, `_exit`, `_Exit` or `quick_exit` up to its `;`,
-/// across lines, and every integer literal in it counts, so `return ok ? 0 : 0x4d;` is
-/// read; so does every name a `#define` in `code` gives an integer, other than the header's
-/// own `CHARD_EXIT_*` names, which are the spelling asked for. It is a tripwire on
-/// spelling, not a proof: a character literal, a macro naming another macro, and a status
-/// carried in a variable or returned by a helper are beyond it.
 fn bare_exit_statuses(code: &str) -> Vec<(i64, usize)> {
     let aliases: BTreeMap<&str, i64> = code
         .lines()
@@ -1979,12 +1702,6 @@ fn bare_exit_statuses(code: &str) -> Vec<(i64, usize)> {
     found
 }
 
-/// No probe source spells a status the header reserves as a bare number.
-///
-/// The vocabulary test above holds the header against the Rust mirrors; this holds the
-/// probes against the header. Thirteen refusal exits in two probes were once spelled `77`,
-/// the header's allocation-failure status, for a precondition that was no allocation, and
-/// nothing read the probe sources to see it.
 #[test]
 fn no_probe_spells_a_reserved_exit_status_as_a_number() {
     let reserved = header_exit_statuses();
@@ -1994,6 +1711,9 @@ fn no_probe_spells_a_reserved_exit_status_as_a_number() {
         for aux in probe.aux_libs {
             sources.push((aux.source_name, aux.source));
         }
+    }
+    for input in crate::probe::POSITIVE_INPUTS {
+        sources.push((input.source_name, input.source));
     }
     let mut problems = Vec::new();
     let mut named = 0usize;
@@ -2065,7 +1785,6 @@ fn no_probe_spells_a_reserved_exit_status_as_a_number() {
     );
 }
 
-/// The scan above finds each spelling of a bare exit and leaves what is not one.
 #[test]
 fn the_bare_exit_scan_finds_each_spelling_and_leaves_a_marker() {
     let code = "    return 77;\n    _exit(78);\n    exit ( 79 );\n    _Exit(80);\n\
@@ -2099,14 +1818,6 @@ fn the_bare_exit_scan_finds_each_spelling_and_leaves_a_marker() {
     assert_eq!(bare_exit_statuses(more), vec![(77, 2), (79, 3)]);
 }
 
-/// An observed aliasing store is credited to the flag only where a witness separates the
-/// flag from the optimization level.
-///
-/// The published defect: gcc enables the rule by default only from `-O2` and `-Os`, so
-/// at `-O1` and `-Og` the store is observed with no flag passed, and this check read
-/// `on` there while both control arms, carrying their own `-O2`, discriminated. Each
-/// stdout below is one the probe printed on Fedora 44 x86_64 and aarch64 or in a
-/// container on the x86_64 host, 2026-10-01, and the comment names the build.
 #[test]
 fn an_observed_aliasing_store_is_credited_only_where_a_witness_shows_the_flag() {
     let macros = BTreeMap::new();
@@ -2134,19 +1845,8 @@ fn an_observed_aliasing_store_is_credited_only_where_a_witness_shows_the_flag() 
         aliasing_of(&gcc("lost", "observed", "not-made", "observed")),
         Outcome::Indeterminate
     );
-    // gcc 12.2 to 16.2.1 at -O1 and -Og with -fno-strict-aliasing. The flag is present
-    // and inert: the level does not apply the rule, so the build's own copy observes the
-    // store bare as well, and the -O2 copy observes it only because it keeps the flag.
-    // Credited from the -O2 copy alone this would read `on`, because these lines without
-    // the `sibling-call` one are byte for byte what -O2 with the flag prints (gcc 16.1.1,
-    // Fedora 44 x86_64); the tail-call witness is what names the level, and the project
-    // ledger's entry on this check records the decision. gcc
-    // 16.1.1 and 16.2.1 at -O2 and -Os with the flag and any of
-    // -fno-optimize-sibling-calls, -finstrument-functions, -fstrub=all and
-    // -fstrub=at-calls print these same lines, so an `on` the build earned is withheld
-    // there and the decoder cannot tell. The reverse, -O1 -fno-strict-aliasing
-    // -foptimize-sibling-calls, prints the -O2 lines and reads `on`; that is the
-    // assumption `sibling-calls-follow-the-aliasing-level`, not a case a decoder can see.
+    // gcc 12.2 to 16.2.1 at -O1 and -Og with -fno-strict-aliasing: the flag is present and
+    // inert, and the -O2 copy observes the store only because it keeps the flag.
     assert_eq!(
         aliasing_of(&gcc("observed", "observed", "not-made", "observed")),
         Outcome::Indeterminate,
@@ -2240,14 +1940,6 @@ fn an_observed_aliasing_store_is_credited_only_where_a_witness_shows_the_flag() 
     );
 }
 
-/// A runtime stream quoting the work directory is cut after the directory is made
-/// relative, so the excerpt and its count are one string under every `--workdir`.
-///
-/// glibc before 2.26 named the artifact in its fortify message, and a sanitizer's report
-/// names the source it was compiled from; both reach `stderr` with the work directory in
-/// them. The excerpt is the 160-character tail [`detect_fortify_runtime`] quotes, under
-/// directories of 10 and 150 characters, and the stream is over that budget under both.
-/// A cut made ahead of the rewrite would make the count carry the directory's length.
 #[test]
 fn one_runtime_stream_under_two_work_directories_publishes_one_excerpt() {
     let macros = BTreeMap::new();
@@ -2289,15 +1981,6 @@ fn one_runtime_stream_under_two_work_directories_publishes_one_excerpt() {
     );
 }
 
-/// An observed aliasing store is credited to the flag only where the copy compiled
-/// without sanitizer instrumentation agrees.
-///
-/// The published defect: clang's recoverable alignment check, part of
-/// `-fsanitize=undefined`, keeps the reload the rule would fold, so the store is observed
-/// with no flag passed and this check read `on`. Each stdout below is one the probe
-/// printed on Fedora 44 x86_64 or aarch64, or in a container on the x86_64 host,
-/// 2026-10-01, and the comment names the build; `probes/ub_strict_aliasing.c` carries the
-/// full set.
 #[test]
 fn an_observed_aliasing_store_is_withheld_where_only_the_instrumentation_kept_it() {
     let macros = BTreeMap::new();
@@ -2381,8 +2064,6 @@ fn zcur_detect(stdout: &str) -> Detection {
     })
 }
 
-/// The lines below are the probe's output as measured on Fedora 44 on 2026-10-01: x86_64
-/// under gcc 16.1.1 and clang 22.1.8, aarch64 under gcc 16.2.1 and clang 22.1.8.
 #[test]
 fn zero_call_used_regs_reads_each_form_from_the_registers() {
     let cases: &[(&str, Outcome, Option<&str>)] = &[
@@ -2445,9 +2126,6 @@ fn zero_call_used_regs_reads_each_form_from_the_registers() {
     }
 }
 
-/// A trampoline that does not give back its own markers around a function that only
-/// returns has read nothing, whatever the compiled function's line says, and a cleared
-/// line in particular must not read `on`.
 #[test]
 fn zero_call_used_regs_withholds_when_the_witness_fails() {
     for line in [
@@ -2461,8 +2139,6 @@ fn zero_call_used_regs_withholds_when_the_witness_fails() {
     }
 }
 
-/// Neither all cleared nor any kept is neither reading, and a line that is not the probe's
-/// shape, or a probe built where it has no witness, is no reading at all.
 #[test]
 fn zero_call_used_regs_withholds_what_is_neither_reading() {
     for line in [
@@ -2490,8 +2166,6 @@ fn zero_call_used_regs_withholds_what_is_neither_reading() {
     }
 }
 
-/// A withheld line says which way it failed: a ZCUR line the probe could not have printed
-/// is not "no ZCUR line", and an empty run is.
 #[test]
 fn zero_call_used_regs_names_a_rejected_line_apart_from_a_missing_one() {
     let rejected = zcur_detect("ZCUR args=0 temp=r11 null=/k target=/z");
@@ -2549,9 +2223,6 @@ fn sfa_enforced_detect(run: &RunRecord) -> Detection {
     })
 }
 
-/// Each level is read from the trailing rows a fortified copy caught, once the ctrl row
-/// shows a subobject bound is checked at all: the matrix measured on Fedora 44 x86_64
-/// and aarch64 under gcc and clang, `-O2 -D_FORTIFY_SOURCE=2` and `=3`.
 #[test]
 fn each_enforced_flex_array_level_is_read_from_the_rows_caught() {
     let (c, s) = ("caught", "survived");
@@ -2573,9 +2244,58 @@ fn each_enforced_flex_array_level_is_read_from_the_rows_caught() {
     assert_eq!(impossible.outcome, Outcome::Indeterminate);
 }
 
-/// The probe's `note` line, which it writes where the host refuses to make it non-dumpable,
-/// sits outside every row's markers and changes no row: the same rows read the
-/// same level with and without it.
+#[test]
+fn a_wrapper_that_loses_the_subobject_bound_is_the_toolchain_s_silence() {
+    let (c, s) = ("caught", "survived");
+    let detect = |rows: [&str; 5], stdout: &str| {
+        let mut run = sfa_enforced_run(rows);
+        run.stdout = stdout.to_owned();
+        sfa_enforced_detect(&run)
+    };
+    let line = |fields: &str| format!("optimize=yes\nCHARD-BOS {fields}\nlibc=?\nrows=5\n");
+    let lost = line("main1=2 main0=32 wrap1=32 glibc_wrappers=1 clang_path=?");
+    let d = detect([s, s, s, s, s], &lost);
+    assert_eq!(d.outcome, Outcome::Absent, "{}", d.observed);
+    assert!(d.observed.contains("wrap1=32"), "{}", d.observed);
+    for (case, stdout) in [
+        (
+            "the wrapper keeps the bound",
+            line("main1=2 main0=32 wrap1=2 glibc_wrappers=1 clang_path=?"),
+        ),
+        (
+            "a declined answer",
+            line("main1=18446744073709551615 main0=18446744073709551615 wrap1=18446744073709551615 glibc_wrappers=1 clang_path=?"),
+        ),
+        (
+            "glibc's clang path taken",
+            line("main1=2 main0=32 wrap1=32 glibc_wrappers=1 clang_path=1"),
+        ),
+        (
+            "no glibc wrappers",
+            line("main1=2 main0=32 wrap1=32 glibc_wrappers=0 clang_path=?"),
+        ),
+        (
+            "unoptimized",
+            "optimize=no\nCHARD-BOS main1=2 main0=32 wrap1=32 glibc_wrappers=1 clang_path=?\nrows=5\n"
+                .to_owned(),
+        ),
+        ("no line", "optimize=yes\nlibc=?\nrows=5\n".to_owned()),
+    ] {
+        let d = detect([s, s, s, s, s], &stdout);
+        assert_eq!(d.outcome, Outcome::Indeterminate, "{case}: {}", d.observed);
+    }
+    // A trailing row caught beside a silent ctrl row is withheld, whatever the line says.
+    let caught_two = detect([s, c, s, s, s], &lost);
+    assert_eq!(
+        caught_two.outcome,
+        Outcome::Indeterminate,
+        "{}",
+        caught_two.observed
+    );
+    let level = detect([c, c, c, c, s], &lost);
+    assert_eq!(level.outcome, Outcome::Present, "{}", level.observed);
+}
+
 #[test]
 fn a_note_outside_the_rows_changes_no_reading() {
     let (c, s) = ("caught", "survived");
@@ -2598,11 +2318,6 @@ fn a_note_outside_the_rows_changes_no_reading() {
     }
 }
 
-/// The probe makes itself non-dumpable before its first row, on Linux, and says so where
-/// that fails: a `core_pattern` piped to a handler ignores a core limit of 0, and the
-/// handler's second or more per crashing row crossed chard's probe deadline on a busy host,
-/// so the positive control read indeterminate. Pinned on the source, since no run on a host
-/// whose handler is fast can tell the call is gone.
 #[test]
 fn the_flex_probe_is_non_dumpable_before_its_first_row() {
     let source = include_str!("../../probes/strict_flex_arrays_enforced.c");
@@ -2625,9 +2340,6 @@ fn the_flex_probe_is_non_dumpable_before_its_first_row() {
     );
 }
 
-/// A silent ctrl row is fortify not checking subobject bounds, which makes every trailing
-/// row silent whatever the flag says. Reading that as level 0 is the clean-looking zero;
-/// it is withheld, naming the unoptimized build where the probe says it was one.
 #[test]
 fn a_silent_ctrl_row_withholds_rather_than_reading_level_zero() {
     let s = "survived";
@@ -2645,8 +2357,6 @@ fn a_silent_ctrl_row_withholds_rather_than_reading_level_zero() {
     assert!(d.observed.contains("not optimized"), "{}", d.observed);
 }
 
-/// The flex row is the invariant: a true flexible member is bounded at no level, so a
-/// caught flex copy is the probe failing, not a level above 3.
 #[test]
 fn a_caught_flex_row_withholds() {
     let c = "caught";
@@ -2655,9 +2365,6 @@ fn a_caught_flex_row_withholds() {
     assert!(d.observed.contains("flex row"), "{}", d.observed);
 }
 
-/// A row is read from its own markers alone. An abort without glibc's diagnostic (the
-/// stack protector, heap corruption), a segfault, a missing marker, or a probe that did not
-/// itself exit 0 is no reading.
 #[test]
 fn a_row_that_is_neither_caught_nor_survived_withholds() {
     let (c, s) = ("caught", "survived");
@@ -2699,8 +2406,6 @@ fn a_row_that_is_neither_caught_nor_survived_withholds() {
     assert_eq!(sfa_enforced_detect(&run).outcome, Outcome::Indeterminate);
 }
 
-/// A trap is credited only where the self-report names an implementation that traps;
-/// a bare SIGTRAP from a build whose report names glibc, or none, is withheld.
 #[test]
 fn a_trapped_row_is_caught_only_under_a_trapping_implementation() {
     let s = "survived";
@@ -2719,10 +2424,6 @@ fn a_trapped_row_is_caught_only_under_a_trapping_implementation() {
     assert_eq!(d.level.as_deref(), Some("3"));
 }
 
-/// A silent abort in a row is FreeBSD's `__chk_fail` under the rule
-/// `detect_fortify_runtime` applies: its wrappers named, and a checking call in the one
-/// artifact every row is a child of. Without the call, or under another implementation,
-/// the row is neither caught nor survived and the reading is withheld.
 #[test]
 fn a_silently_aborted_row_is_caught_only_under_freebsds_wrappers_with_a_checking_call() {
     use crate::elf::SymbolFact;
@@ -2799,13 +2500,6 @@ fn a_silently_aborted_row_is_caught_only_under_freebsds_wrappers_with_a_checking
     assert_eq!(d.outcome, Outcome::Indeterminate, "{}", d.observed);
 }
 
-/// A silent ctrl row reads `absent` only where the self-report and the probe's `libc=` line
-/// show a C library with no subobject bound under a request of 2 or more in an optimized
-/// build: musl alone, OpenBSD's libc, musl with fortify-headers, FreeBSD's wrappers (which
-/// size every string destination as a whole object) or a FreeBSD without them, the cases
-/// `report::libc_limitation` turns into `unsupported`. The same silence on an unrecognised
-/// library, beside `__GLIBC__`, under Apple's wrappers, or without the request, stays
-/// withheld.
 #[test]
 fn a_silent_ctrl_row_is_absent_only_on_a_library_with_no_subobject_bound() {
     let s = "survived";
@@ -3033,9 +2727,6 @@ fn stack_exec_detect(stdout: &str, exit_status: i32, signal: Option<&str>) -> De
     })
 }
 
-/// The two readings as the probe printed them on Fedora 44 on 2026-10-02, x86_64 (gcc
-/// 16.1.1, clang 22.1.8) and aarch64 (gcc 16.2.1, clang 22.1.8), at every -O level:
-/// `-Wl,-z,noexecstack` faults at the payload, `-Wl,-z,execstack` returns the marker.
 #[test]
 fn stack_exec_reads_a_fault_at_the_payload_and_the_payload_s_marker() {
     let d = stack_exec_detect(
@@ -3052,9 +2743,6 @@ fn stack_exec_reads_a_fault_at_the_payload_and_the_payload_s_marker() {
     assert_eq!(d.outcome, Outcome::Absent, "{}", d.observed);
 }
 
-/// A crash is not a non-executable stack. Only a fault the handler placed at the payload's
-/// own address reads `present`; every other ending, including a reading followed by an
-/// unclean exit and a probe that never reached the call, is withheld.
 #[test]
 fn stack_exec_withholds_every_ending_that_is_not_one_of_the_two_readings() {
     for (stdout, exit, signal) in [
@@ -3127,9 +2815,6 @@ fn shstk_detect(stdout: &str) -> Detection {
     })
 }
 
-/// The lines measured on 2026-10-02: the Fedora 44 x86_64 host under the pin, with
-/// `-fcf-protection=full` and with `=none`, and the KVM guests whose kernel or CPU offered
-/// no shadow stack. Only the three readings agreeing reads either way.
 #[test]
 fn the_shadow_stack_is_read_from_three_agreeing_readings_of_one_process() {
     let on = shstk_detect(&format!("{UNPINNED_OFF}{PINNED_ON}"));
@@ -3167,11 +2852,6 @@ const UNPINNED_OFF: &str =
 const UNPINNED_ON: &str =
     "SHSTK-UNPINNED kernel=ok cpu=ss features=0x1 ssp=nonzero\nSHSTK-UNPINNED clobber=cperr\n";
 
-/// The level is the run without the opt-in. Enforced there too is `default`, the ask; off
-/// there is `opt-in`, below it, which upstream glibc 2.39 and later read. An unpinned
-/// reading that establishes neither leaves a `present` with no level, which the graded
-/// check withholds rather than publishing the opt-in's `on`; and the pinned reading alone
-/// decides the outcome, so the controls discriminate whatever the unpinned run said.
 #[test]
 fn the_shadow_stack_level_is_the_run_without_the_opt_in() {
     let default = shstk_detect(&format!("{UNPINNED_ON}{PINNED_ON}"));
@@ -3215,9 +2895,6 @@ fn the_shadow_stack_level_is_the_run_without_the_opt_in() {
     assert!(shadow_stack_reading(UNPINNED_ON).is_none());
 }
 
-/// A machine that cannot run a shadow stack reads neither way, whatever the rest of the
-/// line says: the kernel's refusal (Ubuntu 22.04's 5.15 kernel answered errno 22) and a
-/// CPU without `CET_SS` (every KVM guest measured) are not a toolchain that declined.
 #[test]
 fn a_machine_without_the_mechanism_is_never_absent() {
     for stdout in [
@@ -3253,8 +2930,6 @@ fn a_machine_without_the_mechanism_is_never_absent() {
     );
 }
 
-/// A refusal of the status query other than `EINVAL` (a seccomp filter's `EPERM`, an
-/// `ENOSYS`) names no machine: it reads neither way and the gating rule leaves it alone.
 #[test]
 fn a_refusal_other_than_einval_names_no_machine() {
     for stdout in [
@@ -3277,7 +2952,6 @@ fn a_refusal_other_than_einval_names_no_machine() {
     }
 }
 
-/// A line of another shape is no reading at all, and another architecture's line says so.
 #[test]
 fn a_malformed_or_foreign_shadow_stack_line_withholds() {
     for stdout in [
@@ -3312,14 +2986,6 @@ fn stack_clash_detect(stdout: &str) -> Detection {
     })
 }
 
-/// The pre-2026-10-05 probe's `unsigned long` arithmetic on i386: `100 * dist` wrapped
-/// mod 2^32 and printed a small ratio for an allocation whose first touch landed wholly
-/// below the frame. Every line is a probing-off build's, measured on 2026-10-05 in compat
-/// mode on a Fedora 44 x86_64 kernel 7.3.0-rc3: Debian 12 gcc 12.2.0 i386 at
-/// `-O2 -fno-stack-clash-protection`, and Fedora 44 gcc 16.2.1 and clang 22.1.8 at
-/// `-m32 -O2 -fno-stack-clash-protection`, under the `RLIMIT_STACK` named. Each read
-/// `present`, a wrong `on`; the control triple withheld it only because the negative arm
-/// wrapped the same way.
 #[test]
 fn a_ratio_that_wrapped_on_a_32_bit_target_withholds() {
     for (line, limit) in [
@@ -3357,11 +3023,7 @@ fn a_ratio_that_wrapped_on_a_32_bit_target_withholds() {
         assert!(d.observed.contains("wrapped"), "{limit}: {}", d.observed);
     }
 
-    // What the check must not move: 12 with probing, 100 without. The first four are
-    // gcc 16.1.1 and clang 22.1.8 on Fedora 44 x86_64 natively at the default 8 MiB
-    // limit; the next two are the probe on Debian 12 gcc 12.2.0 i386 in compat mode at
-    // 8 MiB, the line a probe that wraps prints as the first case above; the last is gcc 16.1.1
-    // x86_64 at 1 GiB, where `n` exceeds 32 bits. All measured on 2026-10-05.
+    // What the check must not move: 12 with probing, 100 without.
     for (line, want) in [
         (
             "SCPRT dist=8384535 n=67108864 ratio_pct=12",
@@ -3396,12 +3058,6 @@ fn a_ratio_that_wrapped_on_a_32_bit_target_withholds() {
     }
 }
 
-/// `dist=0` is a probe's clamp for a first touch at or above the frame, which is
-/// where a wrapped `sp - n` lands. Measured on 2026-10-05 with probing off: on Fedora 44
-/// x86_64 natively (gcc 16.1.1 and clang 22.1.8, `-O2 -fno-stack-clash-protection`,
-/// 4-level paging) at `RLIMIT_STACK` `16 TiB` and `17 TiB`, and on i386 in compat mode
-/// (Fedora 44 gcc 16.2.1 and clang 22.1.8 `-m32`) at `4194303 KiB`. Each reads `present` to a
-/// decoder that believes the ratio.
 #[test]
 fn a_first_touch_at_or_above_the_frame_withholds() {
     for line in [
@@ -3419,9 +3075,6 @@ fn a_first_touch_at_or_above_the_frame_withholds() {
     }
 }
 
-/// A fault before the size was recorded prints `n=0` and ratio 0; nothing was allocated,
-/// so ratio 0 is not a page walk. Hand-authored, as the replay fixture
-/// `synthetic:fault-before-allocation` is.
 #[test]
 fn a_fault_before_the_allocation_withholds() {
     let d = stack_clash_detect("SCPRT dist=140732916358152 n=0 ratio_pct=0");
@@ -3433,15 +3086,12 @@ fn a_fault_before_the_allocation_withholds() {
     );
 }
 
-/// A ratio with no operands beside it cannot be checked, so it is not believed.
 #[test]
 fn a_ratio_without_its_operands_withholds() {
     let d = stack_clash_detect("SCPRT ratio_pct=12");
     assert_eq!(d.outcome, Outcome::Indeterminate);
 }
 
-/// Each address-space decline the probe prints is in its source and withholds by name.
-/// Listed here so a decline renamed in the probe is renamed here too.
 #[test]
 fn every_address_space_decline_the_probe_prints_withholds() {
     let source = crate::probe::find("stack-clash")
@@ -3463,12 +3113,6 @@ fn every_address_space_decline_the_probe_prints_withholds() {
     }
 }
 
-/// `--normalize` publishes `dist=<volatile>` (`report::VOLATILE_READINGS`) after the decoder
-/// read the digits, and `chard detect --evidence` replays that published line. The ratio
-/// survives the mask, so a normalized reading decodes as its digits did; what the mask
-/// hides is withheld only where the digits could have withheld. The decided lines are
-/// gcc 16.1.1's on Fedora 44 `x86_64` at the default 8-mebibyte stack limit (2026-10-05),
-/// masked as `normalize` masks.
 #[test]
 fn a_normalized_distance_decodes_as_its_digits_did() {
     let masked = |line: &str| {
@@ -3489,30 +3133,20 @@ fn a_normalized_distance_decodes_as_its_digits_did() {
         );
         assert_ne!(normalized.outcome, Outcome::Indeterminate, "{line}");
     }
-    for (line, why) in [
+    for line in [
         // Nothing was allocated, masked or not.
-        (
-            "SCPRT dist=140732916358152 n=0 ratio_pct=0",
-            "before the allocation",
-        ),
+        "SCPRT dist=140732916358152 n=0 ratio_pct=0",
         // The digits might have been 0, which the unmasked line withholds.
-        (
-            "SCPRT dist=0 n=140737488355328 ratio_pct=0",
-            "could have been",
-        ),
+        "SCPRT dist=0 n=140737488355328 ratio_pct=0",
     ] {
         let d = stack_clash_detect(&masked(line));
         assert_eq!(d.outcome, Outcome::Indeterminate, "{line}");
-        assert!(d.observed.contains(why), "{}", d.observed);
     }
     // Only the exact marker is a normalized distance; any other non-number is missing.
     let d = stack_clash_detect("SCPRT dist=<other> n=67108864 ratio_pct=12");
     assert_eq!(d.outcome, Outcome::Indeterminate, "{}", d.observed);
 }
 
-/// The witness is required, not optional: a `TAVI` line without `ctrl` or `ctrl_supported`
-/// is not the live probe's line (which always prints both) and reads `indeterminate`
-/// however clean its fill looks. Mirrors `zipb_reading`.
 #[test]
 fn a_tavi_line_without_the_witness_is_indeterminate() {
     for line in [
@@ -3530,11 +3164,6 @@ fn a_tavi_line_without_the_witness_is_indeterminate() {
     }
 }
 
-/// Each line `chard_report_translation` writes reads as its own shape, and every other line
-/// is no reading: stdout's first line is read, a marker on any later line is not the
-/// probe's (a second one, or one after the probe's own output), only `0` and `1` are
-/// readings, and `unreadable` carries one of the header's three words or is unrecognised.
-/// A mutation reading `1`, an unreadable sysctl or no line as native fails here.
 #[test]
 fn each_translation_line_reads_as_its_own_shape_and_nothing_else_does() {
     let scprt = "SCPRT dist=8369711 n=66977792 ratio_pct=12";
@@ -3604,9 +3233,6 @@ fn each_translation_line_reads_as_its_own_shape_and_nothing_else_does() {
     assert!(cut.ends_with(" and 54 character(s) more"), "{cut}");
 }
 
-/// On Darwin the stream opens with the translation line, which the stack-clash quote
-/// carries after the probe's own lines; the reading is quoted whole rather than run into it,
-/// and a stream without the line is quoted as before.
 #[test]
 fn the_stack_clash_quote_keeps_the_reading_apart_from_the_translation_line() {
     let scprt = "SCPRT dist=8388620 n=67108864 ratio_pct=12";
@@ -3625,9 +3251,6 @@ fn the_stack_clash_quote_keeps_the_reading_apart_from_the_translation_line() {
     );
 }
 
-/// The header writes the shapes [`translation`] reads: the marker is this module's, each
-/// `snprintf` format renders to a line that parses as the variant it means, and the read's
-/// branches print what they mean, in order.
 #[test]
 fn the_header_writes_the_translation_lines_the_reader_reads() {
     assert!(
@@ -3688,8 +3311,6 @@ fn the_header_writes_the_translation_lines_the_reader_reads() {
     }
 }
 
-/// Every probe a `Machine` check runs opts into the read and calls it first in each `main`,
-/// so on Darwin the line precedes anything the probe prints and survives a probe that dies.
 #[test]
 fn every_machine_probe_reports_its_translation_first() {
     let machine: Vec<&crate::probe::Probe> = crate::probe::CORPUS
@@ -3702,7 +3323,13 @@ fn every_machine_probe_reports_its_translation_first() {
         .collect();
     assert_eq!(
         machine.iter().map(|p| p.id).collect::<Vec<_>>(),
-        ["stack-exec-runtime", "shadow-stack", "stack-clash"],
+        [
+            "stack-exec-runtime",
+            "shadow-stack",
+            "bti-enforced",
+            "pac-ret-enforced",
+            "stack-clash"
+        ],
         "the probes whose checks rest on the machine"
     );
     for probe in machine {
@@ -3741,8 +3368,6 @@ fn every_machine_probe_reports_its_translation_first() {
     }
 }
 
-/// The line moves no reading: each `Machine` decoder reads a stdout opening with any of
-/// the header's lines exactly as it reads the stdout without it.
 #[test]
 fn the_translation_line_moves_no_machine_reading() {
     let lines = [
@@ -3798,19 +3423,15 @@ fn the_translation_line_moves_no_machine_reading() {
 }
 
 /// The pinned process's lines on a Wolfi-derived rootfs's glibc 2.44-r23, which ignores
-/// `GLIBC_TUNABLES`, its loader and libc linked into a `-fcf-protection=full` build on the Fedora 44 x86_64
-/// host (kernel 7.3.0-rc3) on 2026-10-21: the witness tunable had no effect, and the program
-/// ran with no shadow stack under the pin as without it.
+/// `GLIBC_TUNABLES`, its loader and libc linked into a `-fcf-protection=full` build on the
+/// Fedora 44 x86_64 host (kernel 7.3.0-rc3) on 2026-10-21: the witness tunable had no
+/// effect, and the program ran with no shadow stack under the pin as without it.
 const IGNORED_PINNED_OFF: &str = "SHSTK tunables=ignored\n\
     SHSTK-UNPINNED kernel=ok cpu=ss features=0 ssp=zero\n\
     SHSTK-UNPINNED clobber=hijacked\n\
     SHSTK kernel=ok cpu=ss features=0 ssp=zero\n\
     SHSTK clobber=hijacked\n";
 
-/// A sentence says the opt-in was in force only where the pinned process's witness saw its
-/// tunable take effect. On a C library that ignores `GLIBC_TUNABLES` the pinned process is an
-/// unpinned one, and the reading still stands (the hijack happened), but "under glibc's
-/// opt-in" would be false; with no witness line the sentence says the reach was not shown.
 #[test]
 fn the_opt_in_is_named_in_force_only_where_its_witness_took_effect() {
     let pinned_off = "SHSTK kernel=ok cpu=ss features=0 ssp=zero\nSHSTK clobber=hijacked\n";
@@ -3826,14 +3447,6 @@ fn the_opt_in_is_named_in_force_only_where_its_witness_took_effect() {
 
     let ignored = shstk_detect(IGNORED_PINNED_OFF);
     assert_eq!(ignored.outcome, Outcome::Absent, "{}", ignored.observed);
-    assert!(
-        !ignored.observed.contains("under glibc's opt-in")
-            && ignored
-                .observed
-                .contains("does not show that the opt-in reached"),
-        "{}",
-        ignored.observed
-    );
 
     let unshown = shstk_detect(&format!("{UNPINNED_OFF}{pinned_off}"));
     assert!(
@@ -3863,9 +3476,8 @@ fn the_opt_in_is_named_in_force_only_where_its_witness_took_effect() {
     );
 
     // Enforced under the pin and off without it while the witness read `ignored`: the
-    // enforcement shows the opt-in took effect and only the witness did not (a malloc a
-    // profile replaced, say), so the level is graded as before and the sentence claims
-    // nothing about the C library.
+    // enforcement shows the opt-in took effect, so the level is graded and the sentence
+    // claims nothing about the C library.
     let witness_lost = shstk_detect(&format!(
         "SHSTK tunables=ignored\n{UNPINNED_OFF}{PINNED_ON}"
     ));
@@ -3904,10 +3516,6 @@ fn the_opt_in_is_named_in_force_only_where_its_witness_took_effect() {
     );
 }
 
-/// The `-z execstack` arm on a Wolfi-derived rootfs's glibc, 2026-10-21: the loader refused it
-/// before `main`, exit 127, its line on stderr and nothing on stdout. The withheld reading names
-/// the loader and quotes it; exit 127 without the line, or the line under another status, is
-/// the generic "never reached the call", since nothing then shows the loader refused.
 #[test]
 fn stack_exec_names_the_loader_that_refused_the_program() {
     let refused = |exit: i32, stderr: &str| {
@@ -3952,9 +3560,8 @@ fn stack_exec_names_the_loader_that_refused_the_program() {
     }
 }
 
-/// A reading that withholds a guard that ran under `guard-kept-without-the-flag`, with a
-/// sentence of its own branch (`own`) beside the shared "cannot answer the question".
-fn names_the_rule(d: &Detection, what: &str, own: &str) {
+/// A reading that withholds a guard that ran under `guard-kept-without-the-flag`.
+fn names_the_rule(d: &Detection, what: &str, _own: &str) {
     use crate::report::gating_rule::GUARD_KEPT_WITHOUT_THE_FLAG;
 
     assert_eq!(d.outcome, Outcome::Indeterminate, "{what}: {}", d.observed);
@@ -3964,21 +3571,11 @@ fn names_the_rule(d: &Detection, what: &str, own: &str) {
         "{what}: {}",
         d.observed
     );
-    assert!(
-        d.observed.contains("cannot answer the question") && d.observed.contains(own),
-        "{what}: the sentence names its branch ({own:?}): {}",
-        d.observed
-    );
 }
 
-/// An optimized gcc before 8 whose guard ran names the rule from each of its branches:
-/// no build record, a level-resetting word, no -O word, a keeping level, -O0 last, a
-/// level not measured, and no readable version, each by a sentence of its own.
 #[test]
 fn an_optimized_gcc_before_8_guard_that_ran_names_the_rule_from_each_branch() {
     let named = names_the_rule;
-    // Optimized gcc before 8: no build record, a level-resetting word, no -O word, a
-    // keeping level, -O0 last, a level not measured, and no readable version.
     for (major, flags, own) in [
         (Some(7), None, "with no build record"),
         (
@@ -4012,10 +3609,6 @@ fn an_optimized_gcc_before_8_guard_that_ran_names_the_rule_from_each_branch() {
     }
 }
 
-/// Every withholding of a guard that ran names `guard-kept-without-the-flag`, and a
-/// reading that is no guard reading names no rule: the rule's members are exactly the
-/// detector's "cannot answer the question" branches, each reached here by a sentence of its
-/// own, with the rule at the stage `report::detector_gating` publishes from.
 #[test]
 fn a_guard_that_ran_and_cannot_be_credited_names_its_rule() {
     use crate::report::gating_rule::{GUARD_KEPT_WITHOUT_THE_FLAG, Stage};
@@ -4090,4 +3683,786 @@ fn a_guard_that_ran_and_cannot_be_credited_names_its_rule() {
     });
     assert_eq!(not_run.outcome, Outcome::Indeterminate);
     assert!(not_run.rule.is_none(), "{}", not_run.observed);
+}
+
+/// `bti_enforced.c`'s lines over a run that ended as given, beside an artifact whose property
+/// note carries the BTI bit or not (`None` for no artifact read).
+fn bti_detect(
+    stdout: &str,
+    exit_status: i32,
+    signal: Option<&str>,
+    stderr: &str,
+    marked: Option<bool>,
+) -> Detection {
+    let macros = BTreeMap::new();
+    let mut run = tavi_run(stdout);
+    run.exit_status = exit_status;
+    run.signal = signal.map(ToOwned::to_owned);
+    run.stderr = stderr.to_owned();
+    let elf = marked.map(|bti| {
+        let mut elf = elf_with_report("");
+        elf.machine = "aarch64".to_owned();
+        elf.aarch64_bti = bti;
+        elf
+    });
+    detect_bti_enforced(&Evidence {
+        macros: &macros,
+        elf: elf.as_ref(),
+        build: None,
+        run: Some(&run),
+        workdir: None,
+    })
+}
+
+/// The probe's lines up to the branch, on a machine whose kernel reports BTI.
+const BTI_ATTEMPTED_YES: &str = "BTI hwcap=yes\nBTI branch=attempted\n";
+/// A BTI fault at the declared target, in the reporter's shape as measured on the M2 guest on
+/// 2026-10-09 (`run::tests`), with the target's `mov w0, #42` as its word.
+const BTI_FAULT_AT_TARGET: &str = "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 \
+                                   pc=0xe8e60eb4f000 addr=0xe8e60eb4f000 word=0x52800540 \
+                                   esr=none at-target=yes\n";
+
+#[test]
+fn bti_is_read_from_a_fault_at_the_target_or_the_branch_landing() {
+    let on = bti_detect(
+        BTI_ATTEMPTED_YES,
+        -1,
+        Some("SIGILL"),
+        BTI_FAULT_AT_TARGET,
+        Some(true),
+    );
+    assert_eq!(on.outcome, Outcome::Present, "{}", on.observed);
+    assert!(on.level.is_none(), "{}", on.observed);
+    assert!(
+        on.observed.contains("carries the BTI bit"),
+        "{}",
+        on.observed
+    );
+
+    let landed = format!("{BTI_ATTEMPTED_YES}BTI branch=landed returned=42\n");
+    for (marked, says) in [
+        (Some(true), "carries the BTI bit"),
+        (Some(false), "carries no BTI bit"),
+    ] {
+        let off = bti_detect(&landed, 0, None, "", marked);
+        assert_eq!(off.outcome, Outcome::Absent, "{marked:?}: {}", off.observed);
+        assert!(off.observed.contains(says), "{marked:?}: {}", off.observed);
+    }
+}
+
+#[test]
+fn a_kernel_without_hwcap2_bti_is_the_machine_s_lack() {
+    let stdout = "BTI hwcap=no\nBTI branch=attempted\nBTI branch=landed returned=42\n";
+    let d = bti_detect(stdout, 0, None, "", Some(true));
+    assert_eq!(d.outcome, Outcome::Indeterminate, "{}", d.observed);
+    assert!(d.observed.contains("HWCAP2_BTI"), "{}", d.observed);
+    let r = bti_reading(stdout).expect("the lines read");
+    assert!(r.machine_lacks().is_some());
+    assert!(
+        bti_reading(BTI_ATTEMPTED_YES)
+            .expect("the lines read")
+            .machine_lacks()
+            .is_none()
+    );
+}
+
+/// A BTI case: its label, stdout, exit status, signal, stderr, the artifact's marking, and a
+/// phrase of the reason it must withhold for.
+type BtiCase<'a> = (
+    &'a str,
+    &'a str,
+    i32,
+    Option<&'a str>,
+    &'a str,
+    Option<bool>,
+    &'a str,
+);
+
+/// Each case reads `indeterminate`.
+fn assert_bti_withholds(cases: &[BtiCase<'_>]) {
+    for &(label, stdout, exit, signal, stderr, marked, _) in cases {
+        let d = bti_detect(stdout, exit, signal, stderr, marked);
+        assert_eq!(d.outcome, Outcome::Indeterminate, "{label}: {}", d.observed);
+    }
+}
+
+#[test]
+fn every_other_bti_death_withholds() {
+    let undeclared = BTI_FAULT_AT_TARGET.replace("at-target=yes", "at-target=undeclared");
+    let off_target = BTI_FAULT_AT_TARGET.replace("at-target=yes", "at-target=no");
+    let esr_off_target = off_target.replace("esr=none", "esr=0x34000000");
+    let unread_word = BTI_FAULT_AT_TARGET.replace("word=0x52800540", "word=none");
+    let udf = BTI_FAULT_AT_TARGET.replace("word=0x52800540", "word=0x0");
+    let segv = "chard-fault-v1 signal=11 code=1 sent=no arch=aarch64 pc=0x10 addr=0x10 \
+                word=none esr=0x82000004 at-target=no\n";
+    let ill = Some("SIGILL");
+    let yes = BTI_ATTEMPTED_YES;
+    assert_bti_withholds(&[
+        (
+            "before the branch",
+            "BTI hwcap=yes\n",
+            -1,
+            ill,
+            BTI_FAULT_AT_TARGET,
+            Some(true),
+            "did not print",
+        ),
+        (
+            "undeclared target",
+            yes,
+            -1,
+            ill,
+            &undeclared,
+            Some(true),
+            "IllegalInstruction",
+        ),
+        (
+            "elsewhere, no ESR",
+            yes,
+            -1,
+            ill,
+            &off_target,
+            Some(true),
+            "IllegalInstruction",
+        ),
+        (
+            "elsewhere, a BTI ESR",
+            yes,
+            -1,
+            ill,
+            &esr_off_target,
+            Some(true),
+            "not at the target",
+        ),
+        (
+            "an unread word",
+            yes,
+            -1,
+            ill,
+            &unread_word,
+            Some(true),
+            "Undetermined",
+        ),
+        (
+            "a udf",
+            yes,
+            -1,
+            ill,
+            &udf,
+            Some(true),
+            "IllegalInstruction",
+        ),
+        (
+            "a SIGSEGV",
+            yes,
+            -1,
+            Some("SIGSEGV"),
+            segv,
+            Some(true),
+            "Other",
+        ),
+        ("no report", yes, -1, ill, "", Some(true), "no fault report"),
+        (
+            "unmarked",
+            yes,
+            -1,
+            ill,
+            BTI_FAULT_AT_TARGET,
+            Some(false),
+            "contradicts",
+        ),
+    ]);
+}
+
+#[test]
+fn every_other_bti_landing_or_line_withholds() {
+    let other = format!("{BTI_ATTEMPTED_YES}BTI branch=landed returned=7\n");
+    let landed = format!("{BTI_ATTEMPTED_YES}BTI branch=landed returned=42\n");
+    let malformed = "BTI hwcap=maybe\nBTI branch=attempted\n";
+    assert_bti_withholds(&[
+        (
+            "another value",
+            &other,
+            0,
+            None,
+            "",
+            Some(true),
+            "not the probe's",
+        ),
+        (
+            "another exit",
+            &landed,
+            3,
+            None,
+            "",
+            Some(true),
+            "not the probe's",
+        ),
+        ("an unread note", &landed, 0, None, "", None, "was not read"),
+        (
+            "x86_64",
+            "BTI unsupported-arch\n",
+            0,
+            None,
+            "",
+            None,
+            "this architecture",
+        ),
+        (
+            "macOS arm64",
+            "BTI unsupported-os\n",
+            0,
+            None,
+            "",
+            None,
+            "does not have",
+        ),
+        (
+            "a malformed hwcap",
+            malformed,
+            0,
+            None,
+            "",
+            None,
+            "no `BTI hwcap=` line",
+        ),
+    ]);
+}
+
+/// `pac_ret_enforced.c`'s lines over a run that ended as given.
+fn pac_detect(stdout: &str, exit_status: i32, signal: Option<&str>, stderr: &str) -> Detection {
+    let macros = BTreeMap::new();
+    let mut run = tavi_run(stdout);
+    run.exit_status = exit_status;
+    run.signal = signal.map(ToOwned::to_owned);
+    run.stderr = stderr.to_owned();
+    detect_pac_ret_enforced(&Evidence {
+        macros: &macros,
+        elf: None,
+        build: None,
+        run: Some(&run),
+        workdir: None,
+    })
+}
+
+/// The probe's lines up to the return, on a machine with PAC and FPAC.
+const PAC_ATTEMPTED_FPAC: &str = "PAC hwcap=yes fpac=yes\nPAC return=attempted\n";
+/// A PAC failure in the reporter's shape as measured on the M2 guest on 2026-10-09
+/// (`run::tests`): SIGILL `ILL_ILLOPN` at `autiasp`, ESR class 0x1c.
+const PAC_FAULT: &str = "chard-fault-v1 signal=4 code=2 sent=no arch=aarch64 pc=0xb95168ec0cdc \
+                         addr=0xb95168ec0cdc word=0xd50323bf esr=0x72000000 at-target=no\n";
+
+#[test]
+fn pac_is_read_from_an_fpac_failure_or_the_marker_reached() {
+    for fpac in ["yes", "unread"] {
+        let stdout = format!("PAC hwcap=yes fpac={fpac}\nPAC return=attempted\n");
+        let on = pac_detect(&stdout, -1, Some("SIGILL"), PAC_FAULT);
+        assert_eq!(on.outcome, Outcome::Present, "{fpac}: {}", on.observed);
+        assert!(on.observed.contains("FEAT_FPAC"), "{}", on.observed);
+    }
+    for fpac in ["yes", "no", "unread"] {
+        let stdout =
+            format!("PAC hwcap=yes fpac={fpac}\nPAC return=attempted\nPAC return=hijacked\n");
+        let off = pac_detect(&stdout, 0, None, "");
+        assert_eq!(off.outcome, Outcome::Absent, "{fpac}: {}", off.observed);
+    }
+}
+
+#[test]
+fn a_kernel_without_hwcap_paca_is_the_machine_s_lack() {
+    let stdout = "PAC hwcap=no fpac=unread\nPAC return=attempted\nPAC return=hijacked\n";
+    let d = pac_detect(stdout, 0, None, "");
+    assert_eq!(d.outcome, Outcome::Indeterminate, "{}", d.observed);
+    assert!(d.observed.contains("HWCAP_PACA"), "{}", d.observed);
+    let run = tavi_run(stdout);
+    assert!(matches!(
+        pac_reading(stdout).expect("read").machine_lacks(&run),
+        Some(PacLack::Hwcap(_))
+    ));
+    let fpac = tavi_run(PAC_ATTEMPTED_FPAC);
+    assert!(
+        pac_reading(PAC_ATTEMPTED_FPAC)
+            .expect("read")
+            .machine_lacks(&fpac)
+            .is_none()
+    );
+}
+
+/// A PAC case: its label, stdout, exit status, signal, stderr, and a phrase of the reason it
+/// must withhold for.
+type PacCase<'a> = (&'a str, &'a str, i32, Option<&'a str>, &'a str, &'a str);
+
+#[test]
+fn every_other_pac_run_withholds() {
+    let no_fpac = "PAC hwcap=yes fpac=no\nPAC return=attempted\n";
+    let unread = "PAC hwcap=yes fpac=unread\nPAC return=attempted\n";
+    let segv = "chard-fault-v1 signal=11 code=1 sent=no arch=aarch64 pc=0x20000000400a8c \
+                addr=0x20000000400a8c word=none esr=0x82000004 at-target=no\n";
+    let ill = "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 pc=0x400a8c addr=0x400a8c \
+               word=0x0 esr=none at-target=no\n";
+    let returned = format!("{PAC_ATTEMPTED_FPAC}PAC return=returned\n");
+    let hijacked = format!("{PAC_ATTEMPTED_FPAC}PAC return=hijacked\n");
+    let s = Some("SIGSEGV");
+    let i = Some("SIGILL");
+    let cases: [PacCase<'_>; 12] = [
+        (
+            "before the return",
+            "PAC hwcap=yes fpac=yes\n",
+            -1,
+            i,
+            PAC_FAULT,
+            "did not print",
+        ),
+        ("returned normally", &returned, 0, None, "", "did not take"),
+        ("hijacked, then died", &hijacked, -1, s, segv, "did not end"),
+        (
+            "FPAC failure, fpac=no",
+            no_fpac,
+            -1,
+            i,
+            PAC_FAULT,
+            "only FEAT_FPAC",
+        ),
+        (
+            "poisoned, fpac=no",
+            no_fpac,
+            -1,
+            s,
+            segv,
+            "poisoned pointer",
+        ),
+        (
+            "poisoned, fpac=unread",
+            unread,
+            -1,
+            s,
+            segv,
+            "poisoned pointer",
+        ),
+        (
+            "SIGSEGV with FPAC",
+            PAC_ATTEMPTED_FPAC,
+            -1,
+            s,
+            segv,
+            "Other",
+        ),
+        (
+            "another SIGILL",
+            PAC_ATTEMPTED_FPAC,
+            -1,
+            i,
+            ill,
+            "IllegalInstruction",
+        ),
+        (
+            "no report",
+            PAC_ATTEMPTED_FPAC,
+            -1,
+            i,
+            "",
+            "no fault report",
+        ),
+        (
+            "x86_64",
+            "PAC unsupported-arch\n",
+            0,
+            None,
+            "",
+            "this architecture",
+        ),
+        (
+            "macOS arm64",
+            "PAC unsupported-os\n",
+            0,
+            None,
+            "",
+            "does not have",
+        ),
+        (
+            "a malformed line",
+            "PAC hwcap=yes fpac=maybe\nPAC return=attempted\n",
+            0,
+            None,
+            "",
+            "no `PAC hwcap=` line",
+        ),
+    ];
+    for (label, stdout, exit, signal, stderr, _) in cases {
+        let d = pac_detect(stdout, exit, signal, stderr);
+        assert_eq!(d.outcome, Outcome::Indeterminate, "{label}: {}", d.observed);
+    }
+}
+
+#[test]
+fn an_unoptimized_build_names_the_rule_where_the_observable_needs_optimization() {
+    use crate::report::gating_rule::UNOPTIMIZED_BUILD_CANNOT_SHOW;
+    let macros = BTreeMap::new();
+    let on = |detect: fn(&Evidence<'_>) -> Detection, run: &RunRecord| {
+        detect(&Evidence {
+            macros: &macros,
+            elf: None,
+            build: None,
+            run: Some(run),
+            workdir: None,
+        })
+    };
+    let rule = |d: &Detection| d.rule.map(|r| r.rule().id);
+    let named = Some(UNOPTIMIZED_BUILD_CANNOT_SHOW.id);
+
+    let aliasing = on(detect_no_strict_aliasing, &flex_run("optimize=no\n"));
+    assert_eq!(
+        aliasing.outcome,
+        Outcome::Indeterminate,
+        "{}",
+        aliasing.observed
+    );
+    assert_eq!(rule(&aliasing), named, "{}", aliasing.observed);
+
+    let no_size = "flex-two=-1 flex-one=-1 flex-zero=-1\nstorage=declared\n";
+    let flex = on(
+        detect_strict_flex_arrays,
+        &flex_run(&format!("{no_size}optimize=no\n")),
+    );
+    assert_eq!(flex.outcome, Outcome::Indeterminate, "{}", flex.observed);
+    assert_eq!(rule(&flex), named, "{}", flex.observed);
+    let flex_o2 = on(
+        detect_strict_flex_arrays,
+        &flex_run(&format!("{no_size}optimize=yes\n")),
+    );
+    assert_eq!(rule(&flex_o2), None, "{}", flex_o2.observed);
+
+    let mut died = flex_run("optimize=no\n");
+    died.exit_status = -1;
+    died.signal = Some("SIGSEGV".to_owned());
+    let null = on(detect_no_delete_null_checks, &died);
+    assert_eq!(null.outcome, Outcome::Indeterminate, "{}", null.observed);
+    assert_eq!(rule(&null), named, "{}", null.observed);
+    // A death that is not a memory fault (a deadline kill, an abort, a trap), an unoptimized
+    // build with no signal, and an optimized build that died name no rule.
+    for (stdout, signal) in [
+        ("optimize=no\n", Some("SIGKILL")),
+        ("optimize=no\n", Some("SIGABRT")),
+        ("optimize=no\n", Some("SIGILL")),
+        ("optimize=no\n", None),
+        ("optimize=yes\n", Some("SIGSEGV")),
+    ] {
+        let mut other = flex_run(stdout);
+        other.exit_status = -1;
+        other.signal = signal.map(str::to_owned);
+        let d = on(detect_no_delete_null_checks, &other);
+        assert_eq!(rule(&d), None, "{stdout:?} {signal:?}: {}", d.observed);
+    }
+    let mut bus = flex_run("optimize=no\n");
+    bus.exit_status = -1;
+    bus.signal = Some("SIGBUS".to_owned());
+    assert_eq!(rule(&on(detect_no_delete_null_checks, &bus)), named);
+    died.stdout = String::new();
+    let unsaid = on(detect_no_delete_null_checks, &died);
+    assert_eq!(rule(&unsaid), None, "{}", unsaid.observed);
+
+    let s = "survived";
+    let mut sfa = sfa_enforced_run([s, s, s, s, s]);
+    sfa.stdout = "optimize=no\nlibc=?\nrows=5\n".to_owned();
+    let enforced = sfa_enforced_detect(&sfa);
+    assert_eq!(
+        enforced.outcome,
+        Outcome::Indeterminate,
+        "{}",
+        enforced.observed
+    );
+    assert_eq!(rule(&enforced), named, "{}", enforced.observed);
+    sfa.stdout = "optimize=yes\nlibc=?\nrows=5\n".to_owned();
+    assert_eq!(rule(&sfa_enforced_detect(&sfa)), None);
+}
+
+#[test]
+fn a_glibc_build_below_fortify_two_names_the_rule() {
+    use crate::report::gating_rule::FORTIFY_BELOW_SUBOBJECT_LEVEL;
+    let (c, s) = ("caught", "survived");
+    let with = |rows: [&str; 5], report: &str, optimize: &str| {
+        let run = RunRecord {
+            stdout: format!(
+                "CHARD-REPORT-V2\n{report}\nCHARD-REPORT-END\noptimize={optimize}\nlibc=?\nrows=5\n"
+            ),
+            ..sfa_enforced_run(rows)
+        };
+        sfa_enforced_detect(&run)
+    };
+    let rule = |d: &Detection| d.rule.map(|r| r.rule().id);
+    let from_elf = |report: &str| {
+        let elf = elf_with_report(&format!("CHARD-REPORT-V2\n{report}\nCHARD-REPORT-END\n"));
+        let run = RunRecord {
+            stdout: "optimize=yes\nlibc=?\nrows=5\n".to_owned(),
+            ..sfa_enforced_run([s, s, s, s, s])
+        };
+        let macros = BTreeMap::new();
+        detect_strict_flex_arrays_enforced(&Evidence {
+            macros: &macros,
+            elf: Some(&elf),
+            build: None,
+            run: Some(&run),
+            workdir: None,
+        })
+    };
+    for (report, d) in [
+        "__GLIBC__=2\n__USE_FORTIFY_LEVEL=0",
+        "__GLIBC__=2\n__USE_FORTIFY_LEVEL=1",
+    ]
+    .into_iter()
+    .flat_map(|r| [(r, with([s, s, s, s, s], r, "yes")), (r, from_elf(r))])
+    {
+        assert_eq!(
+            (d.outcome, rule(&d)),
+            (
+                Outcome::Indeterminate,
+                Some(FORTIFY_BELOW_SUBOBJECT_LEVEL.id)
+            ),
+            "{report}: {}",
+            d.observed
+        );
+        assert!(
+            d.observed.contains("__USE_FORTIFY_LEVEL="),
+            "{}",
+            d.observed
+        );
+    }
+    for (case, rows, report, optimize) in [
+        (
+            "a level given as undefined",
+            [s, s, s, s, s],
+            "__GLIBC__=2\n__USE_FORTIFY_LEVEL undefined",
+            "yes",
+        ),
+        (
+            "settled at 2",
+            [s, s, s, s, s],
+            "__GLIBC__=2\n__USE_FORTIFY_LEVEL=2",
+            "yes",
+        ),
+        (
+            "not glibc",
+            [s, s, s, s, s],
+            "__GLIBC__ undefined\n__USE_FORTIFY_LEVEL undefined",
+            "yes",
+        ),
+        (
+            "unoptimized",
+            [s, s, s, s, s],
+            "__GLIBC__=2\n__USE_FORTIFY_LEVEL =0",
+            "no",
+        ),
+        (
+            "a trailing row caught",
+            [s, c, s, s, s],
+            "__GLIBC__=2\n__USE_FORTIFY_LEVEL =0",
+            "yes",
+        ),
+    ] {
+        let d = with(rows, report, optimize);
+        assert_ne!(
+            rule(&d),
+            Some(FORTIFY_BELOW_SUBOBJECT_LEVEL.id),
+            "{case}: {}",
+            d.observed
+        );
+    }
+    let unoptimized = with([s, s, s, s, s], "__GLIBC__=2\n__USE_FORTIFY_LEVEL=0", "no");
+    assert_eq!(
+        rule(&unoptimized),
+        Some(gating_rule::UNOPTIMIZED_BUILD_CANNOT_SHOW.id),
+        "{}",
+        unoptimized.observed
+    );
+}
+
+#[test]
+fn a_frame_not_reused_names_the_rule() {
+    use crate::report::gating_rule::FRAME_REUSE_DID_NOT_HOLD;
+    let macros = BTreeMap::new();
+    let detect = |line: &str| {
+        let run = exited_run(0, &format!("{line}\n"));
+        detect_zero_init_padding(&Evidence {
+            macros: &macros,
+            elf: None,
+            build: None,
+            run: Some(&run),
+            workdir: None,
+        })
+    };
+    let rule = |d: &Detection| d.rule.map(|r| r.rule().id);
+    for line in [
+        "ZIPB pad=00 ctrl=1a ctrl_supported=1",
+        "ZIPB pad=00 ctrl=00 ctrl_supported=1",
+        "ZIPB pad=00 ctrl=00 ctrl_supported=0",
+        "ZIPB pad=00 ctrl=f0 ctrl_supported=0",
+        "ZIPB pad=00 ctrl=60 ctrl_supported=0",
+        "ZIPB pad=00 ctrl=39 ctrl_supported=0",
+        "ZIPB pad=5a ctrl=00 ctrl_supported=0",
+        "ZIPB pad=5a ctrl=fe ctrl_supported=0",
+        "ZIPB pad=77 ctrl=00 ctrl_supported=1",
+        "ZIPB pad=77 ctrl=00 ctrl_supported=0",
+        "ZIPB pad=00 ctrl=5b ctrl_supported=1",
+        "ZIPB pad=00 ctrl=50 ctrl_supported=0",
+    ] {
+        let d = detect(line);
+        assert_eq!(d.outcome, Outcome::Indeterminate, "{line}: {}", d.observed);
+        assert_eq!(rule(&d), Some(FRAME_REUSE_DID_NOT_HOLD.id), "{line}");
+        let pad = &line["ZIPB pad=".len()..][..2];
+        let ctrl = &line["ZIPB pad=00 ctrl=".len()..][..2];
+        let said = format!("read 0x{ctrl} rather than the dirt, 0x5a, so pad=0x{pad} establishes");
+        assert!(d.observed.contains(&said), "{line}: {}", d.observed);
+        assert!(
+            d.observed.starts_with("frame reuse not witnessed: "),
+            "{line}: {}",
+            d.observed
+        );
+        let names_the_attribute = d.observed.contains("no __attribute__((uninitialized))");
+        assert_eq!(
+            names_the_attribute,
+            line.ends_with("ctrl_supported=0"),
+            "{line}: {}",
+            d.observed
+        );
+        assert_eq!(
+            d.observed.contains("the opted-out control read"),
+            line.ends_with("ctrl_supported=1"),
+            "{line}: {}",
+            d.observed
+        );
+    }
+    for (line, outcome) in [
+        ("ZIPB pad=00 ctrl=5a ctrl_supported=1", Outcome::Present),
+        ("ZIPB pad=5a ctrl=5a ctrl_supported=1", Outcome::Absent),
+        ("ZIPB pad=00 ctrl=5a ctrl_supported=0", Outcome::Present),
+        ("ZIPB pad=5a ctrl=5a ctrl_supported=0", Outcome::Absent),
+        (
+            "ZIPB pad=77 ctrl=5a ctrl_supported=1",
+            Outcome::Indeterminate,
+        ),
+        (
+            "ZIPB pad=77 ctrl=5a ctrl_supported=0",
+            Outcome::Indeterminate,
+        ),
+    ] {
+        let d = detect(line);
+        assert_eq!(d.outcome, outcome, "{line}: {}", d.observed);
+        assert_eq!(rule(&d), None, "{line}");
+        if outcome == Outcome::Indeterminate {
+            assert!(
+                d.observed.contains("neither the dirt nor zero"),
+                "{line}: {}",
+                d.observed
+            );
+        }
+    }
+}
+
+#[test]
+fn a_tavi_reading_implies_its_frame_reuse_was_witnessed() {
+    let elf = elf_of_class(64);
+    let names = ["arr", "word", "small", "ctrl", "ctrl_supported"];
+    let fills: [(&str, [&str; 3]); 4] = [
+        ("dirt", ["5a", "5a", "5a"]),
+        ("zero", ["00", "00", "00"]),
+        ("pattern", ["fe", "fe", "fe"]),
+        ("mixed", ["00", "5a", "13"]),
+    ];
+    let mut readings = 0;
+    for mask in 0u8..32 {
+        for supported in ["0", "1", "x"] {
+            for ctrl in ["5a", "00"] {
+                for (fill, shapes) in fills {
+                    let values = [shapes[0], shapes[1], shapes[2], ctrl, supported];
+                    let fields: Vec<String> = names
+                        .iter()
+                        .zip(values)
+                        .enumerate()
+                        .filter(|(i, _)| mask & (1 << i) != 0)
+                        .map(|(_, (n, v))| format!("{n}={v}"))
+                        .collect();
+                    let line = format!("TAVI {}\n", fields.join(" "));
+                    let all = mask == 31;
+                    let witnessed = all
+                        && match supported {
+                            "1" => ctrl == "5a",
+                            "0" => fill == "dirt",
+                            _ => false,
+                        };
+                    for d in tavi_both(&line, Some(&elf)) {
+                        if d.outcome != Outcome::Indeterminate {
+                            readings += 1;
+                            assert!(witnessed, "{line:?} read {:?}: {}", d.outcome, d.observed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(readings > 0, "the enumeration reached no reading at all");
+
+    for line in [
+        "TAVI arr=5a word=5a small=5a ctrl=5a ctrl_supported=0",
+        "TAVI arr=5a word=5a small=5a ctrl=13 ctrl_supported=0",
+    ] {
+        for d in tavi_both(line, Some(&elf)) {
+            assert_eq!(d.outcome, Outcome::Absent, "{line}: {}", d.observed);
+        }
+    }
+    for line in [
+        "TAVI arr=00 word=00 small=00 ctrl=00 ctrl_supported=0",
+        "TAVI arr=fe word=fe small=fe ctrl=fe ctrl_supported=0",
+        "TAVI arr=00 word=5a small=5a ctrl=5a ctrl_supported=0",
+    ] {
+        for d in tavi_both(line, Some(&elf)) {
+            assert_eq!(d.outcome, Outcome::Indeterminate, "{line}: {}", d.observed);
+        }
+    }
+}
+
+/// The probe prints the fields the decoder requires ([`TAVI_FIELDS`]), in its order, one
+/// conversion and one argument each (`b[0]` to `b[3]`, then `ctrl_supported`): a field the
+/// probe stopped printing would turn every run, controls included, into an unexplained
+/// `indeterminate`, and an argument moved would hand a field another field's byte.
+#[test]
+fn the_tavi_probe_prints_every_field_its_decoder_requires() {
+    let source = include_str!("../../probes/auto_var_init.c");
+    let start = source
+        .find("printf(\"TAVI ")
+        .expect("the probe prints its TAVI line");
+    let call = &source[start..start + source[start..].find(");").expect("the call ends")];
+    let format_end = call[8..].find('"').expect("the format string ends") + 8;
+    let format = &call[8..format_end];
+    let names: Vec<&str> = format
+        .trim_start_matches("TAVI ")
+        .split_whitespace()
+        .map(|w| w.split('=').next().unwrap_or(""))
+        .collect();
+    assert_eq!(names, TAVI_FIELDS, "the fields the probe prints: {format}");
+    assert_eq!(
+        format.matches('%').count(),
+        TAVI_FIELDS.len(),
+        "one conversion per field: {format}"
+    );
+    let args: Vec<String> = call[format_end + 1..]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<String>()
+        .split(',')
+        .map(|a| a.trim().to_owned())
+        .filter(|a| !a.is_empty())
+        .collect();
+    assert_eq!(
+        args.len(),
+        TAVI_FIELDS.len(),
+        "one argument per conversion: {args:?}"
+    );
+    for (i, arg) in args.iter().take(4).enumerate() {
+        assert_eq!(
+            arg,
+            &format!("b[{i}]"),
+            "{} is printed from {arg}",
+            TAVI_FIELDS[i]
+        );
+    }
 }

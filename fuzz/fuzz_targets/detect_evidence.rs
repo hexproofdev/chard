@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! `chard detect --evidence` over arbitrary JSON: every corpus check, alone and with each
-//! arm selected. A report handed to `chard detect` is the one input chard reads that a
-//! third party may have written, so a malformed one is a `UserError`, never a panic.
-//!
-//! Two invariants hold for every input, not only for an unedited report. A replay's counts
-//! close (`Replay::closes`: every reading the report owed is replayed or named as not
-//! replayable, and `replayed` is the replays listed), since a replay that lost a reading
-//! would agree with itself over less than it was handed. And the decoding is deterministic:
-//! the same input decoded twice serializes the same, or is refused with the same message,
-//! since `chard detect`'s output is evidence a reader compares across runs.
+//! arm selected. A report handed to `chard detect` is an input chard reads that a third
+//! party may have written, so a malformed one is a `UserError`, never a panic.
 
 #![no_main]
 
@@ -19,10 +12,14 @@ use libfuzzer_sys::{fuzz_mutator, fuzz_target};
 mod json_mutator;
 
 fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
-    json_mutator::mutate(data, size, max_size, seed)
+    json_mutator::mutate(data, size, max_size, seed, &[])
 });
 
 /// What `chard detect` would print: the output's JSON, or the refusal's message and hint.
+#[expect(
+    clippy::expect_used,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn printed(decoded: &Result<Output, chard::error::UserError>) -> String {
     match decoded {
         Ok(output) => serde_json::to_string(output).expect("an Output serializes"),

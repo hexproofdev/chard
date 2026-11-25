@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Each command's exit statuses, held to the sites in the source that return them.
-//!
-//! The CLI's contract (`CONTRACT` in `src/main.rs`) gives every status one meaning, and the
-//! meaning is what a caller routes on: `1` a gate the caller can act on with the document
-//! written, `3` a defect in chard to report. A `detect` that returned `3` for a report that
-//! disagrees with its replay would carry the first meaning on the second's code, and without a
-//! test saying which statuses a command can return the overload would stand in the contract's
-//! own words. This test reads every site in `src/main.rs` that makes an exit status (an
-//! `ExitCode::from`, `error::emit`, `error::emit_contradiction`), attributes it to the
-//! function it sits in, and compares the statuses each function can return with the table
-//! below; `src/error.rs` is read for the status each of its two emitters returns. A new
-//! site, or a status at a site the table does not list for that function, fails here and is
-//! named. Like `tests/untyped_errors.rs`, a text scan: a tripwire held to the source, not a
-//! proof about every path, and the end-to-end statuses are `tests/detect_cli.rs`'s
-//! (`detect`'s `1`), `tests/fake_driver.rs`'s (`measure`'s `0` and `1`) and
-//! `tests/error_classes.rs`'s (`2`).
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,9 +36,14 @@ const EXPECTED: &[(&str, &[&str], &[&str])] = &[
         "measure_command",
         &["measure"],
         // `2` here is a refusal or a failure, and the operator's `--execution` contradicted by
-        // what chard observed. `measure` itself makes none: it says how the run ended, and
-        // `measure_command` makes the status and the closing line from that one value.
-        &["EXIT_OK", "EXIT_GATE", "EXIT_FAILURE", "EXIT_CONTRADICTION"],
+        // what chard observed.
+        &[
+            "EXIT_OK",
+            "EXIT_GATE",
+            "EXIT_MACHINE_LIMIT",
+            "EXIT_FAILURE",
+            "EXIT_CONTRADICTION",
+        ],
     ),
 ];
 
@@ -50,6 +53,32 @@ const EMITTERS: &[(&str, &str)] = &[
     ("error::emit_contradiction(", "EXIT_CONTRADICTION"),
     ("error::emit_declaration_contradicted(", "EXIT_FAILURE"),
 ];
+
+/// The `error::EXIT_` constants `Closed::status` returns: a site `ExitCode::from(closed.status())`
+/// can return any of them. It is how `measure_command` exits with the status its closing line
+/// names, and reading it here keeps that site as checked as one that names its constant.
+fn closed_statuses(source: &str) -> BTreeSet<String> {
+    let body = source
+        .split("impl Closed {")
+        .nth(1)
+        .and_then(|rest| rest.split("const fn status(&self) -> u8 {").nth(1))
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("src/main.rs has Closed::status");
+    let named: BTreeSet<String> = exit_words(body);
+    assert!(
+        !named.is_empty(),
+        "Closed::status names no error::EXIT_ constant"
+    );
+    named
+}
+
+/// The `EXIT_` words of `text`.
+fn exit_words(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| w.starts_with("EXIT_"))
+        .map(str::to_owned)
+        .collect()
+}
 
 /// The text from `open` (just past an opening parenthesis) to its matching close.
 fn balanced(text: &str) -> &str {
@@ -108,11 +137,19 @@ fn statuses_by_fn(source: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut sites = 0usize;
     for (offset, _) in source.match_indices("ExitCode::from(") {
         let body = balanced(&source[offset + "ExitCode::from(".len()..]);
-        let named: BTreeSet<String> = body
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|w| w.starts_with("EXIT_"))
-            .map(str::to_owned)
-            .collect();
+        let function = enclosing_fn(source, offset);
+        let named = if body.trim() == "closed.status()" {
+            closed_statuses(source)
+        } else {
+            // `measure_command` makes its code from the ending's status alone, so the status
+            // it exits with is the one its closing line names; a site there naming a constant
+            // could exit with another.
+            assert_ne!(
+                function, "measure_command",
+                "measure_command makes an exit code from {body}, not from closed.status()"
+            );
+            exit_words(body)
+        };
         assert!(
             !named.is_empty(),
             "an ExitCode::from site in {} names no error::EXIT_ constant: {body}",
@@ -155,8 +192,7 @@ fn each_command_returns_the_statuses_the_contract_gives_it_and_no_other() {
         .collect();
     assert_eq!(
         found, expected,
-        "the exit statuses src/main.rs makes, by function, are not the table's; a new status \
-         at a site is a change to the CLI's contract (CONTRACT), and goes there first"
+        "the exit statuses src/main.rs makes, by function, are not the table's"
     );
 }
 
@@ -192,8 +228,7 @@ fn only_measure_exits_3_and_only_through_its_envelope() {
     // And it writes the envelope its arguments describe (whose shape and hint
     // `tests/schema_conformance.rs` holds through `contradiction_envelope`), which
     // `measure_command` hands the count and the file `report::publish` kept, as `measure`
-    // returned them. A text scan: no run reaches a contradiction short of a defect in chard,
-    // so the write itself is witnessed only by injected-defect reproductions made by hand.
+    // returned them.
     let words = |text: &str| text.split_whitespace().collect::<String>();
     assert!(
         words(emitter).contains(&words(
@@ -207,12 +242,12 @@ fn only_measure_exits_3_and_only_through_its_envelope() {
              report::RefusalCause::Defect, } => { return Ok(Closed::Contradicted { \
              contradictions, quarantine, });"
         )) && words(source).contains(&words(
-            "Closed::Contradicted { contradictions, quarantine, } => ( \
-             error::emit_contradiction(*contradictions, quarantine.as_deref()), \
-             error::EXIT_CONTRADICTION, ),"
+            "Closed::Contradicted { contradictions, quarantine, } => \
+             error::emit_contradiction(*contradictions, quarantine.as_deref()),"
+        )) && words(source).contains(&words(
+            "Self::Contradicted { .. } => error::EXIT_CONTRADICTION,"
         )),
-        "measure hands emit_contradiction the count and the quarantine publish kept, and only \
-         for a refusal whose cause is chard's own"
+        "measure hands emit_contradiction publish's count and quarantine, on a defect alone"
     );
     // The constant's definition, its doc's mentions and the emitter's return; nothing else.
     let outside_docs = error
@@ -222,23 +257,25 @@ fn only_measure_exits_3_and_only_through_its_envelope() {
         .count();
     assert_eq!(
         outside_docs, 2,
-        "src/error.rs uses EXIT_CONTRADICTION in code only where it is defined and where \
-         emit_contradiction returns it ({uses} mentions in all)"
+        "EXIT_CONTRADICTION's code uses are not its definition and return ({uses} in all)"
     );
 }
 
 #[test]
 fn the_statuses_are_the_numbers_the_contract_states() {
-    use chard::error::{EXIT_CONTRADICTION, EXIT_FAILURE, EXIT_GATE, EXIT_OK};
+    use chard::error::{EXIT_CONTRADICTION, EXIT_FAILURE, EXIT_GATE, EXIT_MACHINE_LIMIT, EXIT_OK};
     assert_eq!(
-        (EXIT_OK, EXIT_GATE, EXIT_FAILURE, EXIT_CONTRADICTION),
-        (0, 1, 2, 3)
+        (
+            EXIT_OK,
+            EXIT_GATE,
+            EXIT_FAILURE,
+            EXIT_CONTRADICTION,
+            EXIT_MACHINE_LIMIT
+        ),
+        (0, 1, 2, 3, 4)
     );
 }
 
-/// `measure` has one caller, `measure_command`, which writes the closing line after the
-/// match that makes the status, so no status `measure` ends on is returned without it. A
-/// text scan, beside `tests/fake_driver.rs`'s end-to-end runs of each path a run can end on.
 #[test]
 fn measure_has_one_caller_and_it_closes_every_run() {
     let source = include_str!("../src/main.rs");
@@ -260,11 +297,13 @@ fn measure_has_one_caller_and_it_closes_every_run() {
         .nth(1)
         .and_then(|rest| rest.split("\n}\n").next())
         .expect("measure_command's body");
-    let matched = body
-        .find("let (code, status) = match &closed")
-        .expect("the match");
+    let matched = body.find("let code = match &closed").expect("the match");
+    assert!(
+        !body.contains("let status"),
+        "measure_command binds no status of its own; it exits with closed.status()"
+    );
     let closed = body
-        .find("error::note(&closing_line(&closed, status, &ending));")
+        .find("error::note(&closing_line(&closed, closed.status(), &ending));")
         .expect("the closing line");
     // The panic hook goes in before the run, so a panic in it closes with its own line; no
     // test can make chard panic, so a hand reproduction is its witness.
@@ -276,7 +315,6 @@ fn measure_has_one_caller_and_it_closes_every_run() {
     );
     assert!(
         matched < closed && body[closed..].trim_end().ends_with("code"),
-        "measure_command writes the closing line after the status is made, and returns that \
-         status next"
+        "measure_command writes the closing line after the status, then returns the status"
     );
 }

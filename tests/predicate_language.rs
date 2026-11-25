@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! `chard-predicate/1` held to its vectors, its schema, and itself.
-//!
-//! The language's rules are normative in `src/predicate/mod.rs`, and a reader outside chard
-//! re-evaluates published predicates with those rules. What makes the rules checkable from
-//! outside is `schema/chard-predicate-vectors.json`: each vector is a predicate, the facts it
-//! reads, and the result. The file's digest is pinned here per language version, so an
-//! expected result that changes without a new `LANGUAGE` fails the build rather than
-//! silently redefining what an existing version meant.
-//!
-//! The property tests are the evaluator's two promises. The Published view of serialized
-//! facts concludes what the Live view concluded over the facts themselves, and removing
-//! any key the Live evaluation read makes the Published evaluation stop with that key as
-//! `Incomplete`, never reach a different conclusion.
+//! The predicate language held to its vectors, its schema, and itself.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -26,81 +27,12 @@ use serde_json::Value;
 
 mod common;
 
-/// The sha256 of `schema/chard-predicate-vectors.json` under each language version.
-///
-/// A new version gets a new row, and an old row is never edited once a publication has
-/// carried its version: the vectors a version was published with are what that version
-/// means. Until a publication carries `chard-predicate/1`, a change to its vectors re-pins
-/// its row rather than adding a version.
-const PINS: &[(&str, &str)] = &[(
-    "chard-predicate/1",
-    "59bb46b132c9b491ae354f978f33c064ddba57262ea88e7b64b06ecc1f6b6eb2",
-)];
-
-/// Set to a path to write every vector's `observed` as rendered, keyed by vector name.
-const RENDERED_VAR: &str = "CHARD_VECTORS_RENDERED";
-
 fn vectors_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/chard-predicate-vectors.json")
 }
 
 fn vectors_bytes() -> Vec<u8> {
     std::fs::read(vectors_path()).expect("the vectors file is readable")
-}
-
-/// The pin rule: the file names a language, the language has a pin, and the pin is the
-/// file's digest.
-fn pin_check(bytes: &[u8]) -> Result<(), String> {
-    let doc: Value = serde_json::from_slice(bytes).map_err(|e| format!("not JSON: {e}"))?;
-    let language = doc
-        .get("language")
-        .and_then(Value::as_str)
-        .ok_or("the vectors name no language")?;
-    let (_, pinned) = PINS
-        .iter()
-        .find(|(version, _)| *version == language)
-        .ok_or_else(|| format!("{language} has no pin; a new version adds a row to PINS"))?;
-    let actual = chard::digest::sha256_hex(bytes);
-    if actual == *pinned {
-        Ok(())
-    } else {
-        Err(format!(
-            "the vectors for {language} hash to {actual}, and the pin says {pinned}: an \
-             expected result changed without a new language version"
-        ))
-    }
-}
-
-#[test]
-fn the_vectors_are_the_ones_this_language_version_was_pinned_with() {
-    let bytes = vectors_bytes();
-    let doc: Value = serde_json::from_slice(&bytes).expect("the vectors are JSON");
-    assert_eq!(
-        doc["language"], LANGUAGE,
-        "the vectors are for another version"
-    );
-    pin_check(&bytes).unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// The pin bites: one expected outcome edited, with the language left alone, fails.
-#[test]
-fn an_edited_expectation_without_a_new_version_fails_the_pin() {
-    let text = String::from_utf8(vectors_bytes()).expect("UTF-8");
-    let edited = "\"outcome\": \"absent\"";
-    assert!(text.contains(edited), "the doctoring has nothing to edit");
-    let doctored = text.replacen(edited, "\"outcome\": \"present\"", 1);
-    assert_ne!(doctored, text);
-    let refused =
-        pin_check(doctored.as_bytes()).expect_err("a doctored vector file passed the pin");
-    assert!(
-        refused.contains("without a new language version"),
-        "{refused}"
-    );
-
-    // A version bump with no pin row is refused too, rather than trusted unpinned.
-    let bumped = text.replacen(LANGUAGE, "chard-predicate/999", 1);
-    let refused = pin_check(bumped.as_bytes()).expect_err("an unpinned version passed");
-    assert!(refused.contains("has no pin"), "{refused}");
 }
 
 fn outcome_str(eval: &Evaluation) -> &'static str {
@@ -177,6 +109,64 @@ const PINNED_CASES: &[(&str, &str)] = &[
         "integer-reading-accepts-a-leading-plus",
         "the integer reading of `+2`",
     ),
+    (
+        "c-int-text-holding-an-equals-sign-is-not-followed",
+        "text that is not a macro's name read by c-int as Undefined, with no read of it",
+    ),
+    (
+        "c-int-text-that-is-no-name-is-undefined-under-a-filter",
+        "the same text over a trimmed map read as Undefined, not as Incomplete",
+    ),
+    (
+        "c-int-text-that-is-no-name-is-not-looked-up-in-the-map",
+        "a map key that is not a macro's name left unread by c-int",
+    ),
+    (
+        "c-int-text-holding-a-space-is-not-followed",
+        "text holding a space read by c-int as Undefined, with no read of it",
+    ),
+    (
+        "c-int-suffixed-number-is-not-followed",
+        "a suffixed number read by c-int as Undefined, though the map holds it as a key",
+    ),
+    (
+        "c-int-follows-a-name-holding-a-dollar",
+        "`$` in a macro's name",
+    ),
+    (
+        "c-int-name-holding-a-dollar-outside-the-filter-is-incomplete",
+        "a name outside the filter still read as Incomplete",
+    ),
+    (
+        "c-int-follows-a-name-outside-ascii",
+        "a letter outside ASCII in a macro's name",
+    ),
+    (
+        "c-int-text-holding-a-no-break-space-is-not-followed",
+        "white space outside ASCII in no macro's name",
+    ),
+    (
+        "c-int-follows-a-name-spelt-as-a-universal-character-name",
+        "a universal character name in a macro's name",
+    ),
+    (
+        "c-int-text-holding-a-backslash-is-not-followed",
+        "a backslash that opens no universal character name in no macro's name",
+    ),
+    (
+        "c-int-looks-a-name-up-as-it-is-spelt",
+        "a name holding a letter outside ASCII does not find a key that spells the letter \
+         as a universal character name",
+    ),
+    (
+        "c-int-short-universal-character-name-is-not-followed",
+        "a universal character name's digit count: six after `\\U` is no name",
+    ),
+    (
+        "macro-term-naming-no-macro-is-undefined-without-a-read",
+        "a macro term naming text that is not a macro's name: refused by validate, and \
+         Undefined to the evaluator",
+    ),
 ];
 
 /// The schema, read once per call; small enough that caching buys nothing.
@@ -208,53 +198,41 @@ fn watch_list() -> Vec<String> {
         .collect()
 }
 
-/// The regeneration's half that only the binary can do: every vector's `observed` as this
-/// chard renders it, by name, written where [`RENDERED_VAR`] says, for the file's maintainer
-/// to write back (the commit that moves the sentences names the command).
-fn write_rendered(rendered_by_name: &serde_json::Map<String, Value>) {
-    if let Some(out) = std::env::var_os(RENDERED_VAR).map(std::path::PathBuf::from) {
-        let json = serde_json::to_string_pretty(rendered_by_name).expect("strings serialize");
-        std::fs::write(&out, json).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
-        println!(
-            "{} observed sentence(s) written to {}",
-            rendered_by_name.len(),
-            out.display()
-        );
-    }
+/// What a run over a vector file saw.
+#[derive(Default)]
+struct Tally {
+    ran: usize,
+    conformed: usize,
+    names: BTreeSet<String>,
+    clauses_seen: BTreeSet<String>,
+    incomplete_seen: BTreeSet<String>,
+    /// Each vector that did not evaluate to its expected result, by name, with what it
+    /// did instead.
+    failures: BTreeMap<String, Vec<String>>,
 }
 
-/// A vector marked `refused_by_validate` pins what the evaluator does with a predicate a
-/// reader should have refused; every other vector holds a valid predicate.
-fn validate_as_marked(name: &str, vector: &Value, p: &Predicate) {
-    let refused = vector.get("refused_by_validate") == Some(&Value::Bool(true));
-    match (predicate::validate(p), refused) {
-        (Ok(()), false) | (Err(_), true) => {}
-        (Ok(()), true) => panic!("{name}: validate accepts a vector marked refused"),
-        (Err(e), false) => panic!("{name}: {e}"),
-    }
-}
-
-#[test]
-fn every_vector_evaluates_to_its_expected_result() {
-    let doc: Value = serde_json::from_slice(&vectors_bytes()).expect("the vectors are JSON");
-    let vectors = doc["vectors"].as_array().expect("a vectors array");
-    let mut ran = 0usize;
-    let mut names = BTreeSet::new();
-    let mut clauses_seen = BTreeSet::new();
-    let mut incomplete_seen = BTreeSet::new();
-    let mut failures = Vec::new();
-    let mut conformed = 0usize;
-    let mut rendered_by_name = serde_json::Map::new();
-    for vector in vectors {
+/// Evaluate every vector of `doc` and hold it to its expected result.
+fn run_vectors(doc: &Value) -> Tally {
+    let mut tally = Tally::default();
+    for vector in doc["vectors"].as_array().expect("a vectors array") {
         let name = vector["name"].as_str().expect("a named vector");
-        assert!(names.insert(name), "vector name {name} appears twice");
+        assert!(
+            tally.names.insert(name.to_owned()),
+            "vector name {name} appears twice"
+        );
+        let mut failures = Vec::new();
         let p: Predicate = serde_json::from_value(vector["predicate"].clone())
             .unwrap_or_else(|e| panic!("{name}: the predicate does not deserialize: {e}"));
-        validate_as_marked(name, vector, &p);
+        let refused = vector.get("refused_by_validate") == Some(&Value::Bool(true));
+        match (predicate::validate(&p), refused) {
+            (Ok(()), false) | (Err(_), true) => {}
+            (Ok(()), true) => failures.push("validate accepts a vector marked refused".to_owned()),
+            (Err(e), false) => failures.push(format!("validate refuses it: {e}")),
+        }
         // Every vector's predicate is the shape the schema declares, the ones `validate`
         // refuses included: the rules it adds are the ones the schema cannot state.
         assert_schema_conforms(&vector["predicate"], name);
-        conformed += 1;
+        tally.conformed += 1;
         let facts = &vector["facts"];
         let filter: Option<Vec<String>> = facts
             .get("macros_filter")
@@ -267,44 +245,61 @@ fn every_vector_evaluates_to_its_expected_result() {
         let view =
             Published::new(macros, filter.as_deref(), elf, watch_list.as_deref()).expect("objects");
         let got = predicate::evaluate(&p, &view);
-        ran += 1;
+        tally.ran += 1;
         let expect = &vector["expect"];
         match (expect.as_str(), got) {
             (Some(key), Err(incomplete)) => {
                 let expected = key.strip_prefix("incomplete:").expect("incomplete:<key>");
-                incomplete_seen.insert(expected.to_owned());
+                tally.incomplete_seen.insert(expected.to_owned());
                 if incomplete.0 != expected {
-                    failures.push(format!(
-                        "{name}: Incomplete({}) not {expected}",
-                        incomplete.0
-                    ));
+                    failures.push(format!("Incomplete({}) not {expected}", incomplete.0));
                 }
             }
-            (Some(key), Ok(eval)) => failures.push(format!("{name}: expected {key}, got {eval:?}")),
+            (Some(key), Ok(eval)) => failures.push(format!("expected {key}, got {eval:?}")),
             (None, Err(incomplete)) => {
-                failures.push(format!("{name}: unexpected Incomplete({})", incomplete.0));
+                failures.push(format!("unexpected Incomplete({})", incomplete.0));
             }
             (None, Ok(eval)) => {
-                clauses_seen.insert(eval.clause.clone());
+                tally.clauses_seen.insert(eval.clause.clone());
                 let level = eval.level.clone().map_or(Value::Null, Value::String);
                 if expect["clause"] != eval.clause.as_str()
                     || expect["outcome"] != outcome_str(&eval)
                     || expect["level"] != level
                 {
-                    failures.push(format!("{name}: got {eval:?}"));
+                    failures.push(format!("got {eval:?}"));
                 }
                 if let Some(observed) = expect.get("observed") {
                     let rendered = predicate::render_observed(&p, &eval);
-                    rendered_by_name.insert(name.to_owned(), Value::String(rendered.clone()));
                     if *observed != rendered.as_str() {
-                        failures.push(format!("{name}: observed {rendered:?}"));
+                        failures.push(format!("observed {rendered:?}"));
                     }
                 }
             }
         }
+        if !failures.is_empty() {
+            tally.failures.insert(name.to_owned(), failures);
+        }
     }
-    // Before the assertions, so a run whose sentences moved still writes them.
-    write_rendered(&rendered_by_name);
+    tally
+}
+
+#[test]
+fn every_vector_evaluates_to_its_expected_result() {
+    let doc: Value = serde_json::from_slice(&vectors_bytes()).expect("the vectors are JSON");
+    let vectors = doc["vectors"].as_array().expect("a vectors array");
+    let Tally {
+        ran,
+        conformed,
+        names,
+        clauses_seen,
+        incomplete_seen,
+        failures,
+    } = run_vectors(&doc);
+    let names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    let failures: Vec<String> = failures
+        .iter()
+        .flat_map(|(name, why)| why.iter().map(move |w| format!("{name}: {w}")))
+        .collect();
     println!(
         "{ran} of {} vectors evaluated, {conformed} predicates held to the schema",
         vectors.len()
@@ -377,6 +372,10 @@ const MACRO_NAMES: &[&str] = &[
 ];
 
 const MACRO_VALUES: &[&str] = &[
+    // Text that is no macro's name, so the two views are compared over it too.
+    "B=1",
+    "a b",
+    "3L",
     "",
     "0",
     "1",
@@ -465,6 +464,7 @@ fn gen_elf(rng: &mut Rng) -> ElfFacts {
         bind_now: gen_opt_bool(rng),
         gnu_stack_present: gen_opt_bool(rng),
         gnu_stack_executable: gen_opt_bool(rng),
+        rwx_segment: gen_opt_bool(rng),
         df_1_noopen: rng.coin(),
         textrel: rng.coin(),
         dt_relr: rng.coin(),
@@ -503,6 +503,7 @@ fn gen_elf(rng: &mut Rng) -> ElfFacts {
         symbol_count: rng.below(40),
         watched_symbols: watched,
         truncations,
+        run_witness: Vec::new(),
         self_report: String::new(),
         recorded_command_line: gen_list(rng, WORDS).join(" "),
         comment: Vec::new(),
@@ -604,7 +605,7 @@ fn published_macros(
     let mut filter: BTreeSet<String> = map.keys().cloned().collect();
     for read in &live.reads {
         if let ReadKey::Macro(name) = &read.key {
-            filter.insert(name.clone());
+            filter.insert(name.as_str().to_owned());
         }
     }
     let mut object = serde_json::to_value(map).expect("a string map serializes");
@@ -621,8 +622,9 @@ type MacroPublication = Option<(Value, Vec<String>)>;
 /// A published `ElfFacts` object as a re-evaluated publication carries it: serialized, with
 /// `truncations` written out even when empty, since `ElfFacts`' own serializer omits the
 /// empty list and the Published view reads an absent one as `Incomplete`, and
-/// `data_in_code_pages`, `code_relocations` and `function_references` written out as `null`
-/// where the serializer omits them, as `report::serialize_stored_elf` states all three.
+/// `data_in_code_pages`, `code_relocations`, `function_references` and `rwx_segment`
+/// written out as `null` where the serializer omits them, as `report::serialize_stored_elf`
+/// states all four.
 fn publish_elf(facts: &ElfFacts) -> Value {
     let mut json = serde_json::to_value(facts).expect("ElfFacts serializes");
     let map = json.as_object_mut().expect("an object");
@@ -633,6 +635,7 @@ fn publish_elf(facts: &ElfFacts) -> Value {
     map.entry("data_in_code_pages").or_insert(Value::Null);
     map.entry("code_relocations").or_insert(Value::Null);
     map.entry("function_references").or_insert(Value::Null);
+    map.entry("rwx_segment").or_insert(Value::Null);
     json
 }
 
@@ -651,7 +654,7 @@ fn remove_each_read(
         let key = read.key.published_key();
         let (macro_pub, elf_pub) = match &read.key {
             ReadKey::Macro(name) => (
-                macros.map(|m| published_macros(m, live, Some(name))),
+                macros.map(|m| published_macros(m, live, Some(name.as_str()))),
                 elf_json.cloned(),
             ),
             ReadKey::Elf(_) | ReadKey::Symbol(_) | ReadKey::SymbolNames | ReadKey::Truncations => {
@@ -812,8 +815,6 @@ fn the_published_view_concludes_what_the_live_view_concluded_and_a_removed_read_
     );
 }
 
-/// The generator the property test draws from writes predicates the schema accepts, so
-/// the schema admits every shape of term, condition and conclusion the evaluator runs.
 #[test]
 fn every_generated_predicate_conforms_to_the_schema() {
     let schema = predicate_schema();
@@ -887,9 +888,6 @@ fn validate_refuses_duplicate_reserved_and_unexplained_clauses() {
     assert!(refused.contains("WATCHED_SYMBOLS"), "{refused}");
 }
 
-/// The schema's structure bites: each document below breaks one rule the schema states,
-/// and the validator names it. The first is a valid predicate, so a refusal of the rest is
-/// the rule and not a schema that refuses everything.
 #[test]
 fn the_predicate_schema_refuses_what_its_structure_forbids() {
     let schema = predicate_schema();
@@ -987,9 +985,6 @@ fn the_predicate_schema_refuses_what_its_structure_forbids() {
     }
 }
 
-/// `validate` and the schema's `\S` refuse the same one-character reasons: the whitespace
-/// each counts is ECMA-262's `\s`, which differs from Rust's `White_Space` at U+0085 and
-/// U+FEFF.
 #[test]
 fn validate_and_the_schema_agree_on_which_reasons_are_blank() {
     let schema = predicate_schema();
@@ -1138,7 +1133,16 @@ fn the_predicate_schema_vocabularies_match_the_code() {
         .iter()
         .map(|f| f.as_str().to_owned())
         .collect();
-    assert_eq!(strings(&defs["elf_field"]["enum"]), fields);
+    // Open as the report schema's copy is: the known fields and any string, so a
+    // predicate a later chard publishes validates, while chard's own reader refuses a
+    // term naming a field it does not know
+    // (`an_unknown_elf_field_validates_and_fails_the_predicate_on_read`).
+    assert_eq!(
+        defs["elf_field"]["anyOf"][1],
+        serde_json::json!({"type": "string"}),
+        "elf_field's second branch is any string"
+    );
+    assert_eq!(strings(&defs["elf_field"]["anyOf"][0]["enum"]), fields);
     let tables: BTreeSet<String> = ElfTable::ALL
         .iter()
         .map(|t| t.as_str().to_owned())
@@ -1176,6 +1180,64 @@ fn the_predicate_schema_vocabularies_match_the_code() {
         from_match,
         "the schema's levels are not the code's"
     );
+}
+
+#[test]
+fn an_unknown_elf_field_validates_and_fails_the_predicate_on_read() {
+    fn rename_first_elf_term(value: &mut Value, to: &str) -> bool {
+        match value {
+            Value::Object(map) => {
+                if map.len() == 1
+                    && let Some(Value::String(field)) = map.get_mut("elf")
+                {
+                    *field = to.to_owned();
+                    return true;
+                }
+                map.values_mut().any(|v| rename_first_elf_term(v, to))
+            }
+            Value::Array(items) => items.iter_mut().any(|v| rename_first_elf_term(v, to)),
+            _ => false,
+        }
+    }
+    let unknown = "a_field_no_chard_reads";
+    assert!(
+        ElfField::ALL.iter().all(|f| f.as_str() != unknown),
+        "the stand-in for a later chard's field is a field this chard knows"
+    );
+    let schema = predicate_schema();
+    let mut held = 0usize;
+    let tables = || {
+        predicate::macro_channel::table()
+            .iter()
+            .chain(predicate::elf_static::table())
+    };
+    for (check, published) in tables() {
+        let mut json = serde_json::to_value(published()).expect("a predicate serializes");
+        if !rename_first_elf_term(&mut json, unknown) {
+            continue;
+        }
+        // As a consumer pinned to the published schema reads it: the producer reading holds
+        // chard's own output to the known values, on purpose.
+        let mut errors = Vec::new();
+        common::schema::validate_as_published(&json, &schema, &schema, "", &mut errors);
+        assert!(
+            errors.is_empty(),
+            "{check}: the open schema refuses a predicate naming an unknown elf field:\n{}",
+            errors.join("\n")
+        );
+        let read = serde_json::from_value::<Predicate>(json);
+        let err = read.expect_err("a predicate naming an unknown elf field deserializes");
+        assert!(
+            err.to_string().contains(unknown),
+            "{check}: the refusal does not name the field: {err}"
+        );
+        held += 1;
+    }
+    assert!(
+        tables().any(|(check, _)| *check == "rwx-segment-absent"),
+        "rwx-segment-absent's predicate is in the table"
+    );
+    assert!(held > 0, "no corpus predicate reads an ELF field");
 }
 
 /// Exhaustive, so a new `Conclusion` fails to compile here before it can drift from the
@@ -1218,9 +1280,6 @@ fn one_of_keys(def: &Value) -> BTreeSet<String> {
     keys
 }
 
-/// Every key a serialized `ElfFacts` carries is either a readable field or one of the
-/// exclusions `ElfField`'s documentation gives a reason for, so a field added to the
-/// reader is classified here before a predicate can be written against it.
 #[test]
 fn every_elf_facts_key_is_a_readable_field_or_a_named_exclusion() {
     const EXCLUDED: &[&str] = &[
@@ -1267,4 +1326,77 @@ fn every_elf_facts_key_is_a_readable_field_or_a_named_exclusion() {
     assert_eq!(accounted.len(), ElfField::ALL.len());
     accounted.extend(EXCLUDED.iter().map(|k| (*k).to_owned()));
     assert_eq!(keys, accounted);
+}
+
+/// Whether `cond` compares a macro's integer reading `gt 0`, and whether it compares one
+/// `ne 0` or reads one under `truth`, the two tests C's "non-zero" names.
+fn zero_tests(cond: &Cond, above: &mut bool, non_zero: &mut bool) {
+    match cond {
+        Cond::All(members) | Cond::Any(members) | Cond::NoneOf(members) => {
+            for member in members {
+                zero_tests(member, above, non_zero);
+            }
+        }
+        Cond::Int(Term::Macro(_), Cmp::Gt, 0) => *above = true,
+        Cond::Int(Term::Macro(_), Cmp::Ne, 0) | Cond::Truth(Term::Macro(_)) => *non_zero = true,
+        Cond::Int(_, _, _)
+        | Cond::Truth(_)
+        | Cond::Defined(_)
+        | Cond::Missing(_)
+        | Cond::Eq(_, _)
+        | Cond::AnyStartsWith(_, _)
+        | Cond::AnyContains(_, _)
+        | Cond::NonEmpty(_) => {}
+    }
+}
+
+/// The clauses `a_clause_testing_a_macro_above_zero_does_not_say_non_zero` holds, as
+/// `check clause`, in table order.
+const HELD_ABOVE_ZERO: &[&str] = &[
+    "fortify-requested requested-without-optimization",
+    "fortify-requested requested",
+    "fortify-effective freebsd-unoptimized",
+    "pie-macro set",
+    "pic-macro set",
+    "gcs-macro set",
+    "branch-protection-macro full",
+    "branch-protection-macro branch",
+    "branch-protection-macro return",
+    "exceptions-macro set",
+];
+
+#[test]
+fn a_clause_testing_a_macro_above_zero_does_not_say_non_zero() {
+    let tables = predicate::macro_channel::table()
+        .iter()
+        .chain(predicate::elf_static::table());
+    let mut held = Vec::new();
+    let mut failures = Vec::new();
+    for (check, predicate) in tables {
+        for clause in &predicate().clauses {
+            let (mut above, mut non_zero) = (false, false);
+            zero_tests(&clause.when, &mut above, &mut non_zero);
+            if !above || non_zero {
+                continue;
+            }
+            held.push(format!("{check} {}", clause.id));
+            let because = clause.because.to_lowercase();
+            if ["non-zero", "nonzero", "non zero", "not zero"]
+                .iter()
+                .any(|word| because.contains(word))
+            {
+                failures.push(format!("{check} {}: {}", clause.id, clause.because));
+            }
+        }
+    }
+    // The clauses held, pinned, so one that stops comparing a macro above zero, or gains a
+    // `ne 0` beside it, leaves the rule loudly.
+    assert_eq!(
+        held, HELD_ABOVE_ZERO,
+        "the clauses comparing a macro above zero"
+    );
+    assert!(
+        failures.is_empty(),
+        "a clause testing gt 0 says non-zero: {failures:?}"
+    );
 }

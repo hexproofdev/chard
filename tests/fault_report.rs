@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The fault reporter in `probes/chard_selfreport.h`, exercised on the host.
-//!
-//! `tests/fault_classes.c` provokes one fault per build. Each case is built, run through
-//! [`chard::run::execute`] exactly as a probe is, and the record's [`RunRecord::fault`]
-//! read back: the C half (what the handler writes, and that the process still dies by
-//! the signal it took) and the Rust half (how the line is classified) are held together
-//! here, on whatever hardware runs the suite. The unit tests in `src/run.rs` hold the
-//! classification to lines measured on each architecture; this file is where a line is
-//! produced.
-//!
-//! What runs is decided by the host: the x86 cases on x86_64, the aarch64 cases on
-//! aarch64, and the BTI and PAC cases only where the kernel lists `bti` and `paca`. No
-//! gate in this repository runs on aarch64, so the aarch64 cases run only where someone
-//! runs the suite on aarch64 Linux by hand. A case the host cannot run says so on stderr,
-//! which `cargo test` hides; set `CHARD_REQUIRE_FAULT_CASES=1` (read by this test alone)
-//! to make every such skip a failure, so a run meant to cover the aarch64 path cannot
-//! pass without it.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 mod common;
 
@@ -34,10 +31,14 @@ fn required() -> bool {
     std::env::var_os("CHARD_REQUIRE_FAULT_CASES").is_some_and(|v| v == "1")
 }
 
-/// A case group this host cannot run: said on stderr, or a failure when required.
-fn skip(why: &str) {
-    assert!(!required(), "CHARD_REQUIRE_FAULT_CASES=1, and {why}");
-    eprintln!("{why}");
+/// A case group this host cannot run: a capability gap in the ledger, or a failure when
+/// required.
+fn skip(cases: &str, why: &str) {
+    assert!(
+        !required(),
+        "CHARD_REQUIRE_FAULT_CASES=1, and {cases} did not run: {why}"
+    );
+    common::capability_gap(cases, why);
 }
 
 /// Whether the kernel lists `feature` for this CPU. An unreadable `/proc/cpuinfo` is a
@@ -187,14 +188,17 @@ fn shared_cases(work: &common::Work, trap_signal: &str) {
             assert_eq!(word & 0xff_ffff, 0xb9_0f67, "{word:#x}");
         }
     } else {
-        skip("clang is not on PATH; the clang sanitizer trap did not run");
+        skip("the clang sanitizer trap", "clang is not on PATH");
     }
 }
 
 #[test]
 fn each_fault_the_host_can_provoke_is_reported_and_classified() {
     if !cfg!(target_os = "linux") {
-        skip("the fault reporter emits on Linux only; nothing to exercise here");
+        skip(
+            "the fault classes",
+            "the fault reporter emits on Linux only; nothing to exercise here",
+        );
         return;
     }
     if !common::require_cc("the fault reporter's classes") {
@@ -225,7 +229,7 @@ fn each_fault_the_host_can_provoke_is_reported_and_classified() {
             );
             assert!(landing.output_contains("returned 7"));
         } else {
-            skip("this CPU lists no bti; the BTI cases did not run");
+            skip("the BTI cases", "this CPU lists no bti");
         }
         if cpu_has("paca") {
             // With FEAT_FPAC the authenticating instruction faults; without it the
@@ -237,23 +241,31 @@ fn each_fault_the_host_can_provoke_is_reported_and_classified() {
                 }
                 Some("SIGSEGV") => {
                     assert_eq!(run.fault(), Some(Fault::Other));
-                    skip("no FEAT_FPAC here: the PAC case faulted on use, as expected without it");
+                    skip(
+                        "the PAC failure case",
+                        "no FEAT_FPAC here: the case faulted on use, as expected without it",
+                    );
                 }
                 other => panic!("the PAC case died by {other:?}: {run:?}"),
             }
         } else {
-            skip("this CPU lists no paca; the PAC case did not run");
+            skip("the PAC case", "this CPU lists no paca");
         }
     } else {
-        skip("no fault cases for this architecture");
+        skip("the fault classes", "no fault cases for this architecture");
     }
 }
 
-/// Without `CHARD_WANT_FAULT_REPORT` the header adds nothing to a probe: no handler, no
-/// line, and the death reads by its bare signal.
 #[test]
 fn a_probe_that_does_not_ask_for_the_reporter_writes_no_report() {
-    if !cfg!(target_os = "linux") || !common::require_cc("the fault reporter's opt-in") {
+    if !cfg!(target_os = "linux") {
+        skip(
+            "the fault reporter's opt-in",
+            "the fault reporter emits on Linux only; nothing to exercise here",
+        );
+        return;
+    }
+    if !common::require_cc("the fault reporter's opt-in") {
         return;
     }
     let work = common::Work::new("chard-fault", "opt-in");

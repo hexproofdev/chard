@@ -1,45 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! The readers of the files chard describes its environment from, over arbitrary contents:
 //! `env::read_uid_map` (`/proc/self/uid_map`), the execution-mode observer
-//! `env::observe_execution_mode` over a whole `env::PlatformReads` (the runtime marker files,
-//! `/run/systemd/container`, PID 1's `container=` word, `/proc/1/cgroup`, `/proc/1/comm` and
-//! the uid map), and the kernel-spelling rules behind `/proc/sys/kernel/arch`
-//! (`env::kernel_byte_order_as`, `env::runs_natively`). Inside a container these files are
-//! the container owner's, so a reading here is one a third party wrote for, and the observer
-//! decides `container`, which refuses an asserted `host` or `vm` through the consistency pass.
-//!
-//! The input is the reads: the bytes decoded as UTF-8 lossily and split at every record
-//! separator (U+001E) into, in order, the uid map, `/run/systemd/container`, PID 1's
-//! environment, `/proc/1/cgroup`, `/proc/1/comm`, the kernel's machine, the runtime marker
-//! (`podman` or `docker` name one, anything else none), `os-release`, `cpuinfo` and the
-//! kernel release. A field missing from the end, or one that is U+0018 alone, is a read the
-//! platform did not make (`None`); a file read is U+0015 alone for an absent file and U+0006
-//! alone for one that refused, with chard's own words for the refusal. Held for every input:
-//!
-//! - each reader returns without a panic, and returns the same reading twice;
-//! - `read_uid_map` reads fields and lines, not spacing: the text and its lines' fields
-//!   joined by one space, blank lines dropped, read the same. It reads `Unwritten` exactly
-//!   where no line holds a field, and `Malformed` exactly where some line is not three fields
-//!   of ASCII digits within `u32` (checked here by a parse of its own), quoting those lines
-//!   joined by `, `; `Identity` is the one extent `0 0 4294967295`, and any extents it reads,
-//!   written back one to a line, read to themselves;
-//! - the observer concludes nothing but `container`, and concludes it exactly when a positive
-//!   marker is there: a runtime marker file, a cgroup naming `docker`, `libpod`, `containerd`
-//!   or `lxc`, a non-blank `/run/systemd/container`, a non-empty first `container=` word, or a
-//!   uid map that reads `Unwritten` or as extents other than the identity. Silence, an
-//!   absence, a refusal and a malformed map settle nothing. A barren set of reads is the one
-//!   sentence that says so; an engine is a cgroup word the cgroup carries;
-//! - the observation is a sentence for a report and a terminal: every character in it prints
-//!   as itself (nothing `char::escape_debug` escapes, controls, format and separator
-//!   characters among them, is left raw), whatever the files held;
-//! - a kernel's spelling decides its byte order whatever chard's own build is
-//!   (`kernel_byte_order_as` under either order), chard's own spelling decides chard's build's
-//!   order, and `runs_natively` says `true` only for an order it was given that is the
-//!   kernel's.
-//!
-//! The seeds under `seeds/env_reads/` are the shapes `env.rs`'s unit tests and
-//! `tests/platform_reads.rs` write, and the maps its documentation quotes, which name no
-//! host.
+//! `env::observe_execution_mode` over a whole `env::PlatformReads`, and the kernel-spelling
+//! rules behind `/proc/sys/kernel/arch` (`env::kernel_byte_order_as`, `env::runs_natively`).
+//! Inside a container these files are the container owner's, so a reading here is one a third
+//! party wrote for, and the observer decides `container`, which refuses an asserted `host` or
+//! `vm` through the consistency pass.
 
 #![no_main]
 
@@ -123,7 +89,7 @@ fn is_number(field: &str) -> bool {
         || (significant.len() <= 10
             && significant
                 .parse::<u64>()
-                .is_ok_and(|v| v <= u64::from(u32::MAX)))
+                .is_ok_and(|v| u32::try_from(v).is_ok()))
 }
 
 fn check_uid_map(text: &str) -> UidMap {
@@ -253,8 +219,7 @@ fn check_observation(reads: &PlatformReads) {
         );
     }
     // Every character prints as itself: none is one `char::escape_debug` escapes, but the
-    // quotes, which print as themselves, and the backslash, which every escape writes. That
-    // an escape reads apart from a planted backslash is `quoted`'s unit test.
+    // quotes, which print as themselves, and the backslash, which every escape writes.
     assert!(
         observation
             .chars()
@@ -291,7 +256,11 @@ fn check_spelling(spelling: &str) {
                 Some(ByteOrder::BigEndian),
             ] {
                 let runs = runs_natively(read, artifact, class, order);
-                assert_eq!(runs_natively(read, artifact, class, order), runs);
+                assert_eq!(
+                    runs_natively(read, artifact, class, order),
+                    runs,
+                    "a second reading of {artifact} {class}-bit {order:?} differs"
+                );
                 if runs == Some(true) {
                     assert!(
                         order.is_some() && order == little,

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+---
+extends: .lints/yaml/yamllint.yml
+
+# The house width is 100 (.lints/yaml/yamllint.yml). The workflows are not reflowed yet: 182 lines
+# run past it, most of them shell in `run:` blocks. The standard allows this one local setting
+# until the reflow commit, which removes it.
+rules:
+  line-length: disable

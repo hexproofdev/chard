@@ -1,40 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Regression tests for ELF facts, pinned against a real compiler.
-//!
-//! Every test here exists because chard got the answer wrong once, in the same
-//! way each time: it reported a hardening feature as absent when the feature was
-//! present. That failure mode is silent and indistinguishable from a genuine
-//! "this distro does not enable it", which makes it the one class of bug this
-//! project cannot ship. Unit tests over synthetic buffers would not have caught
-//! any of the three, each needed a real toolchain's output.
-//!
-//! ## Skips must be loud
-//!
-//! These tests need a real compiler, and a test that quietly returns when one is
-//! missing lets `ok. 6 passed` mean "nothing was checked": the testing analogue of
-//! the false `off` the whole project exists to prevent. So a missing toolchain is a
-//! FAILURE by default. Set `CHARD_ALLOW_TEST_SKIP=1` to downgrade it to a skip for
-//! the genuinely-unable case (a cross-build host, a sandbox with no compiler); the
-//! variable's presence is then the record that coverage was reduced.
-//!
-//! Skips for a *capability* the toolchain lacks (an unsupported flag) remain
-//! permitted and are announced on stderr, because those are properties of the
-//! compiler rather than of the environment.
-//!
-//! ## The host that emits no ELF
-//!
-//! `build_and_read` models two outcomes: the toolchain refused the flag (a skip), or the
-//! link succeeded and chard's reader failed (a panic, because that is the regression this
-//! file exists to catch). A host whose `cc` emits Mach-O is neither. It links fine and the
-//! reader is right to refuse, since there is no ELF there, so it would arrive as the panic,
-//! blaming the reader for the host.
-//!
-//! That is [`emits_elf`], checked per test rather than over the file. A `#![cfg]` on the
-//! module is wrong for the same reason `std::process::exit(0)` is wrong in `common`: it makes
-//! the binary report `ok. 0 passed`, a green line over
-//! nothing, which is the failure mode the section above calls out by name. Announcing
-//! seven times that seven tests did not apply is noisier, and true.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,39 +28,24 @@ const PROBE_SOURCE: &str = "int chard_test_probe(void) { return 0; }\n\
 const LIBRARY_SOURCE: &str = "int chard_test_probe(void) { return 0; }\n";
 
 /// Locate a C compiler, failing the test if there is none.
-///
-/// Returns `None` only when the operator has explicitly allowed skips, so the
-/// default outcome of "no compiler on this machine" is red rather than green.
 fn cc() -> Option<PathBuf> {
     for name in ["cc", "gcc", "clang"] {
         if let Ok(path) = chard::toolchain::resolve_driver(name) {
             return Some(path);
         }
     }
-    assert!(
-        std::env::var_os("CHARD_ALLOW_TEST_SKIP").is_some(),
-        "no C compiler found on PATH, so this test verified nothing. These tests each \
-         exist because chard once published a wrong hardening verdict, and a green \
-         suite that checked nothing is exactly the failure mode they guard against. \
-         Install a compiler, or set CHARD_ALLOW_TEST_SKIP=1 to accept reduced coverage \
-         deliberately."
-    );
-    common::capability_gap(
-        "whole test",
-        "no C compiler, and CHARD_ALLOW_TEST_SKIP is set",
+    // `refuse` fails the test unless the operator allowed skips.
+    common::refuse(
+        "no C compiler found on PATH",
+        "the ELF note readings these tests hold, each of which guards against a wrong \
+         hardening verdict",
     );
     None
 }
 
 /// Build `source` with `flags`, returning the extracted facts, or `None` when the
-/// toolchain refused: a compiler that cannot honor a flag is a skip, not a
-/// failure, because these tests are about chard's reading of the output.
-///
-/// What is *not* a skip: the link succeeding and `elf::facts_for` then failing. Returned as
-/// `None` through `.ok()`, a regression in chard's own ELF reader, the exact subject of every
-/// test in this file, would arrive as "the toolchain lacks a capability" and the test would
-/// return green. Two outcomes with opposite meanings would share one channel, so the reader
-/// failure panics with the parse error.
+/// toolchain refused: a compiler that cannot honor a flag is a capability gap ([`refused`]
+/// records it), not a failure, because these tests are about chard's reading of the output.
 fn build_and_read(
     driver: &Path,
     source: &Path,
@@ -101,9 +65,7 @@ fn build_and_read(
     match elf::facts_for(out) {
         Ok(facts) => Some(facts),
         Err(e) => panic!(
-            "{} linked {} with {flags:?}, and chard could not read the result: {e}.\n\
-             This is a failure of the reader these tests exist to pin, not a toolchain \
-             that lacks a capability.",
+            "{} linked {} with {flags:?}, and chard could not read the result: {e}",
             driver.display(),
             out.display(),
         ),
@@ -111,11 +73,6 @@ fn build_and_read(
 }
 
 /// Does this host's `cc` emit the object format every test here reads?
-///
-/// Separate from [`cc`], which answers "is there a compiler". Both must hold, and they
-/// fail differently: no compiler is an environment the operator can fix, where a Mach-O
-/// host is one where the question does not arise. The tests stay compiled either way, so a
-/// change that breaks them is still caught by `cargo test` on a Mac.
 fn emits_elf(verifies: &str) -> bool {
     if common::ELF_HOST {
         return true;
@@ -131,12 +88,18 @@ fn is_x86_64() -> bool {
     std::env::consts::ARCH == "x86_64"
 }
 
-/// The off-by-four in GNU note padding.
-///
-/// `readelf -n` reports "x86 feature: IBT, SHSTK" for any `-fcf-protection=full`
-/// build, but chard reported neither, because it padded `namesz` up to the note
-/// alignment independently instead of aligning the absolute descriptor offset.
-/// Both control arms then read the same, so the bug looked like "CET is off here".
+/// An arm whose build `build_and_read` refused under FLAGS: a capability gap where DRIVER
+/// builds SOURCE with no flags, and a failure where it builds nothing.
+fn refused(driver: &Path, source: &Path, out: &Path, arm: &str, flags: &[&str]) {
+    assert!(
+        build_and_read(driver, source, out, &[]).is_some(),
+        "{} builds nothing from {} with {flags:?} or with no flags",
+        driver.display(),
+        source.display()
+    );
+    common::capability_gap(arm, &format!("the toolchain refused {}", flags.join(" ")));
+}
+
 #[test]
 fn cet_markings_are_read_from_the_gnu_property_note() {
     if !emits_elf("that CET markings are read from the GNU property note") {
@@ -200,12 +163,6 @@ fn cet_markings_are_read_from_the_gnu_property_note() {
     );
 }
 
-/// `DF_1_NOOPEN` is `0x40`. chard had `0x4`, which is `DF_1_GROUP`.
-///
-/// Also pins the discovery that made the wrong constant hard to notice: the flag
-/// only takes effect on a shared object. On an executable the linker accepts it,
-/// emits `DT_FLAGS_1`, and leaves the bit clear, so measuring it on an
-/// executable yields "off" whatever the constant says.
 #[test]
 fn nodlopen_sets_df_1_noopen_on_a_shared_object() {
     if !emits_elf("that -z nodlopen sets DF_1_NOOPEN on a shared object") {
@@ -255,11 +212,6 @@ fn nodlopen_sets_df_1_noopen_on_a_shared_object() {
     );
 }
 
-/// A shared library is not a static PIE.
-///
-/// `static_pie` was defined as "`ET_DYN` with no interpreter", which every `.so`
-/// satisfies. Any probe that linked a library would have had its `pie` column
-/// corrupted.
 #[test]
 fn a_shared_library_is_classified_as_a_shared_object() {
     if !emits_elf("that a shared library is classified as a shared object") {
@@ -300,8 +252,6 @@ fn a_shared_library_is_classified_as_a_shared_object() {
     assert_eq!(facts.statically_linked, Some(false));
 }
 
-/// The stack-protector observable, both arms. Guards against a probe whose
-/// canary the optimizer removes, which would read as "no stack protector".
 #[test]
 fn stack_protector_reference_appears_and_disappears_with_the_flag() {
     if !emits_elf("that the stack-protector reference tracks the flag") {
@@ -344,9 +294,7 @@ fn stack_protector_reference_appears_and_disappears_with_the_flag() {
         protected.watched_symbols.keys().collect::<Vec<_>>()
     );
     // An unstripped link carries the reference in `.symtab` as well as `.dynsym`, and
-    // `.strtab` spells it `__stack_chk_fail@GLIBC_2.4`. Keyed on the raw spelling, the
-    // `.symtab` entry never matched and every fortified binary reported the canary in
-    // `.dynsym` alone. The section list says whether there is a `.symtab` to find it in.
+    // `.strtab` spells it `__stack_chk_fail@GLIBC_2.4`.
     if protected.sections.iter().any(|s| s == ".symtab") {
         let canary = protected
             .watched_symbols
@@ -355,8 +303,7 @@ fn stack_protector_reference_appears_and_disappears_with_the_flag() {
             .expect("asserted present above");
         assert!(
             canary.tables.iter().any(|t| t == ".symtab"),
-            "an unstripped binary must show the canary in .symtab, whatever version \
-             suffix .strtab appended; tables were {:?}, versioned spellings {:?}",
+            "an unstripped binary's canary is not in .symtab: tables {:?}, versioned {:?}",
             canary.tables,
             canary.versioned
         );
@@ -380,10 +327,6 @@ fn stack_protector_reference_appears_and_disappears_with_the_flag() {
     );
 }
 
-/// RELRO has three states and chard must not collapse them: `-z relro` alone leaves the
-/// PLT's GOT writable where the linker places its function slots outside `PT_GNU_RELRO`
-/// (GNU ld, gold, lld and mold on Linux, this test's host), which is materially weaker than
-/// `-z relro -z now`.
 #[test]
 fn relro_distinguishes_partial_from_full() {
     if !emits_elf("that RELRO is read as partial or full") {
@@ -396,22 +339,17 @@ fn relro_distinguishes_partial_from_full() {
     let ws = common::Work::new("elf", "relro");
     let source = ws.write("probe.c", PROBE_SOURCE);
 
-    if let Some(full) = build_and_read(
-        &driver,
-        &source,
-        &ws.path("relro-full"),
-        &["-Wl,-z,relro", "-Wl,-z,now"],
-    ) {
+    let plain = ws.path("relro-plain");
+    let flags = ["-Wl,-z,relro", "-Wl,-z,now"];
+    if let Some(full) = build_and_read(&driver, &source, &ws.path("relro-full"), &flags) {
         assert_eq!(full.relro.as_deref(), Some("full"));
         assert_eq!((full.gnu_relro, full.bind_now), (Some(true), Some(true)));
+    } else {
+        refused(&driver, &source, &plain, "full RELRO arm", &flags);
     }
 
-    if let Some(partial) = build_and_read(
-        &driver,
-        &source,
-        &ws.path("relro-partial"),
-        &["-Wl,-z,relro", "-Wl,-z,lazy"],
-    ) {
+    let flags = ["-Wl,-z,relro", "-Wl,-z,lazy"];
+    if let Some(partial) = build_and_read(&driver, &source, &ws.path("relro-partial"), &flags) {
         assert_eq!(
             partial.relro.as_deref(),
             Some("partial"),
@@ -421,20 +359,18 @@ fn relro_distinguishes_partial_from_full() {
             (partial.gnu_relro, partial.bind_now),
             (Some(true), Some(false))
         );
+    } else {
+        refused(&driver, &source, &plain, "partial RELRO arm", &flags);
     }
 
-    if let Some(none) = build_and_read(
-        &driver,
-        &source,
-        &ws.path("relro-none"),
-        &["-Wl,-z,norelro"],
-    ) {
+    let flags = ["-Wl,-z,norelro"];
+    if let Some(none) = build_and_read(&driver, &source, &ws.path("relro-none"), &flags) {
         assert_eq!(none.relro.as_deref(), Some("none"));
+    } else {
+        refused(&driver, &source, &plain, "no-RELRO arm", &flags);
     }
 }
 
-/// An executable stack and an absent `PT_GNU_STACK` are different states, and the
-/// second one is not evidence of a non-executable stack.
 #[test]
 fn executable_stack_is_visible_in_the_program_header() {
     if !emits_elf("that an executable stack is visible in the program header") {
@@ -447,43 +383,46 @@ fn executable_stack_is_visible_in_the_program_header() {
     let ws = common::Work::new("elf", "execstack");
     let source = ws.write("probe.c", PROBE_SOURCE);
 
-    if let Some(exec) = build_and_read(&driver, &source, &ws.path("stack-x"), &["-Wl,-z,execstack"])
-    {
+    let plain = ws.path("stack-plain");
+    let flags = ["-Wl,-z,execstack"];
+    if let Some(exec) = build_and_read(&driver, &source, &ws.path("stack-x"), &flags) {
         assert_eq!(exec.gnu_stack_present, Some(true));
         assert_eq!(
             exec.gnu_stack_executable,
             Some(true),
             "-z execstack must show PF_X on PT_GNU_STACK"
         );
+    } else {
+        refused(&driver, &source, &plain, "executable-stack arm", &flags);
     }
 
-    if let Some(noexec) = build_and_read(
-        &driver,
-        &source,
-        &ws.path("stack-nx"),
-        &["-Wl,-z,noexecstack"],
-    ) {
+    let flags = ["-Wl,-z,noexecstack"];
+    if let Some(noexec) = build_and_read(&driver, &source, &ws.path("stack-nx"), &flags) {
         assert_eq!(noexec.gnu_stack_present, Some(true));
         assert_eq!(noexec.gnu_stack_executable, Some(false));
+    } else {
+        refused(&driver, &source, &plain, "non-executable-stack arm", &flags);
     }
 }
 
-/// musl's CRT objects carry no CET property, so the linker's AND-reduction clears
-/// IBT/SHSTK for every musl binary, even though `-fcf-protection=full` is accepted
-/// and sets `__CET__=3`.
-///
-/// This is the clearest demonstration available that a requested flag and a marked
-/// artifact are different claims, and it is why chard's macro-channel verdict for
-/// `-fcf-protection` must never be read as evidence about the binary. The linker
-/// itself will say so, but only if asked with `-Wl,-z,cet-report`, which no
-/// distribution enables.
 #[test]
 fn cet_markings_do_not_survive_a_musl_link() {
     if !emits_elf("that CET markings do not survive a musl link") {
         return;
     }
+    let verifies = "that CET markings do not survive a musl link";
+    if !is_x86_64() {
+        common::capability_gap(
+            verifies,
+            "CET properties are x86-specific and this host is not x86_64",
+        );
+        return;
+    }
     let Ok(musl) = chard::toolchain::resolve_driver("musl-gcc") else {
-        eprintln!("SKIP: musl-gcc not installed; this asserts a cross-libc property");
+        common::capability_gap(
+            verifies,
+            "musl-gcc is not installed, and this asserts a cross-libc property",
+        );
         return;
     };
     let Some(glibc) = cc() else { return };
@@ -496,7 +435,13 @@ fn cet_markings_do_not_survive_a_musl_link() {
         &ws.path("cet-glibc"),
         &["-fcf-protection=full"],
     ) else {
-        eprintln!("SKIP: toolchain cannot honour -fcf-protection=full");
+        refused(
+            &glibc,
+            &source,
+            &ws.path("cet-glibc-plain"),
+            verifies,
+            &["-fcf-protection=full"],
+        );
         return;
     };
     // The control: on glibc the very same flag does produce the markings, so a
@@ -506,19 +451,167 @@ fn cet_markings_do_not_survive_a_musl_link() {
         "glibc control must carry the markings"
     );
 
-    let Some(with_musl) = build_and_read(
+    // Not a gap: musl-gcc is installed and the glibc build above honoured the flag, so a
+    // link that fails here is a broken musl toolchain or a broken test, and either is a
+    // failure rather than an arm the host lacks.
+    let with_musl = build_and_read(
         &musl,
         &source,
         &ws.path("cet-musl"),
         &["-fcf-protection=full"],
-    ) else {
-        eprintln!("SKIP: musl-gcc could not link the probe");
-        return;
-    };
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "{} is installed and could not link the probe under -fcf-protection=full",
+            musl.display()
+        )
+    });
     assert!(
         !with_musl.x86_ibt && !with_musl.x86_shstk,
-        "musl's unmarked CRT objects must AND the CET property away; if this now \
-         passes, Fedora has rebuilt musl with -fcf-protection and the finding is \
-         obsolete rather than wrong"
+        "a musl link under -fcf-protection=full kept a CET marking"
     );
+}
+
+/// A unit of assembly the driver preprocesses, defining one function, with the marking
+/// that keeps the stack non-executable so the link warns of nothing.
+const ASSEMBLY_SOURCE: &str = "\t.text\n\t.globl chard_test_asm\nchard_test_asm:\n\
+                               \t.section .note.GNU-stack,\"\",%progbits\n";
+
+#[test]
+fn the_run_witness_header_puts_the_runs_nonce_in_every_shape_of_build() {
+    if !emits_elf("that the run-witness header's note reaches each shape of build") {
+        return;
+    }
+    let Some(driver) = cc() else {
+        common::capability_gap("whole test", "no C compiler on PATH");
+        return;
+    };
+    let ws = common::Work::new("elf", "run-witness");
+    let witness = chard::compile::RunWitness::derived_in(["elf-notes"], ws.dir())
+        .expect("writing the run-witness header");
+    let header = ws.path(chard::compile::RUN_WITNESS_HEADER_NAME);
+    let header = header.to_str().expect("a UTF-8 path");
+    let nonce = witness.nonce_hex().to_owned();
+    let main_source = ws.write("main.c", "int main(void) { return 0; }\n");
+    let unit = ws.write("probe.c", PROBE_SOURCE);
+    let assembly = ws.write("unit.S", ASSEMBLY_SOURCE);
+
+    let strict = ["-Wall", "-Wextra", "-Werror", "-include", header];
+    let with = |more: &[&'static str]| -> Vec<&str> {
+        strict.iter().copied().chain(more.iter().copied()).collect()
+    };
+    // A second unit with no `main` of its own, for the program of two units.
+    let second = ws.write("second.c", LIBRARY_SOURCE);
+    let unit_arg = second.to_str().expect("a UTF-8 path");
+    let assembly_arg = assembly.to_str().expect("a UTF-8 path");
+    let two_units: Vec<&str> = strict.iter().copied().chain([unit_arg]).collect();
+    let with_assembly: Vec<&str> = strict.iter().copied().chain([assembly_arg]).collect();
+    let shapes: [(&str, &Path, Vec<&str>); 8] = [
+        ("a C object", &unit, with(&["-c"])),
+        ("a linked program", &main_source, with(&[])),
+        ("a shared object", &unit, with(&["-shared", "-fPIC"])),
+        ("a program of two units", &main_source, two_units),
+        (
+            "a program with an assembly unit",
+            &main_source,
+            with_assembly,
+        ),
+        ("an assembly object", &assembly, with(&["-c"])),
+        (
+            "a program linked under --gc-sections",
+            &main_source,
+            with(&[
+                "-O2",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-Wl,--gc-sections",
+            ]),
+        ),
+        (
+            "a program built under -undef",
+            &main_source,
+            with(&["-undef"]),
+        ),
+    ];
+    let mut read = 0usize;
+    for (index, (shape, source, flags)) in shapes.iter().enumerate() {
+        let out = ws.path(&format!("shape-{index}"));
+        // A shape that does not build is a failure, never a gap: each is a build the host's
+        // compiler makes without the header, so a failure with it is the header's doing,
+        // a diagnostic under `-Werror` among them.
+        let facts = build_and_read(&driver, source, &out, flags).unwrap_or_else(|| {
+            panic!("the host's compiler did not build {shape} with {flags:?} and the header")
+        });
+        assert_eq!(
+            facts.run_witness.as_slice(),
+            std::slice::from_ref(&nonce),
+            "{shape} does not carry the run's nonce and nothing else"
+        );
+        assert_eq!(witness.confirm(&facts), Ok(()), "{shape}");
+        assert!(
+            facts.sections.iter().any(|s| s == elf::RUN_WITNESS_SECTION),
+            "{shape}: {:?}",
+            facts.sections
+        );
+        read += 1;
+    }
+    assert_eq!(read, shapes.len(), "a shape was not read");
+
+    // The same unit without the header carries no witness, so the readings above are the
+    // header's and not something the toolchain writes by itself.
+    let plain = build_and_read(&driver, &unit, &ws.path("plain.o"), &["-c"])
+        .expect("the host's compiler builds an object");
+    assert_eq!(plain.run_witness, Vec::<String>::new());
+    assert_eq!(
+        witness.confirm(&plain),
+        Err(chard::compile::WitnessAbsence::Missing)
+    );
+}
+
+#[test]
+fn the_run_witness_header_builds_as_c89_and_in_a_cxx_unit() {
+    if !emits_elf("that the run-witness header builds as C89 and as C++") {
+        return;
+    }
+    let Some(driver) = cc() else {
+        common::capability_gap("whole test", "no C compiler on PATH");
+        return;
+    };
+    let ws = common::Work::new("elf", "run-witness-languages");
+    let witness = chard::compile::RunWitness::derived_in(["elf-notes-languages"], ws.dir())
+        .expect("writing the run-witness header");
+    let header = ws.path(chard::compile::RUN_WITNESS_HEADER_NAME);
+    let header = header.to_str().expect("a UTF-8 path");
+    let nonce = witness.nonce_hex().to_owned();
+    let unit = ws.write("probe.c", LIBRARY_SOURCE);
+
+    // C89 under `-pedantic-errors`: the header's file-scope `__asm__` is no diagnostic.
+    let strict_c89 = [
+        "-std=c89",
+        "-pedantic-errors",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-include",
+        header,
+        "-c",
+    ];
+    let c89 = build_and_read(&driver, &unit, &ws.path("c89.o"), &strict_c89)
+        .expect("the header builds as C89 under -pedantic-errors");
+    assert_eq!(c89.run_witness.as_slice(), std::slice::from_ref(&nonce));
+
+    // A C++ unit, where the host has a C++ driver beside its C one.
+    match chard::compile::cxx_driver_for(&driver) {
+        Some(cxx) => {
+            let source = ws.write("unit.cpp", "int chard_test_cxx() { return 0; }\n");
+            let flags = ["-Wall", "-Wextra", "-Werror", "-include", header, "-c"];
+            let object = build_and_read(&cxx, &source, &ws.path("cxx.o"), &flags)
+                .expect("the header builds in a C++ unit");
+            assert_eq!(object.run_witness.as_slice(), std::slice::from_ref(&nonce));
+        }
+        None => common::capability_gap(
+            "the run-witness header in a C++ unit",
+            "no C++ driver beside the host's C driver",
+        ),
+    }
 }

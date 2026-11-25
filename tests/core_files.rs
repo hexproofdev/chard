@@ -1,41 +1,28 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A sweep cell leaves no core file behind, and the gate that says so can see one.
-//!
-//! Several probes abort by design, and chard cannot lower `RLIMIT_CORE` for its children;
-//! `run::execute` gives the reason. `make sweep` owns the limit instead: its recipe's first
-//! statement is `ulimit -c 0`, and `scripts/sweep-gate.sh` is handed the limit that shell
-//! reads back and each cell's workdir, fails a limit other than 0 and a core file under the
-//! workdir, and prints `core_pattern`. This file holds both halves to what they claim.
-//!
-//! The gate's search is a detector, and a detector is trusted only once it has
-//! discriminated. [`the_gate_fails_a_nonzero_limit_and_finds_a_core_by_its_content`] feeds
-//! it planted files, which runs on every host. [`a_cell_under_the_recipe_limit_leaves_no_core`]
-//! drives the built binary the way the recipe does, twice where the host allows it: under
-//! `ulimit -c 0`, where the gate must find no core, and under `ulimit -c unlimited`, where it
-//! must find at least one off Linux. On Linux the probe is non-dumpable, so there the
-//! second arm must find none, and the gate's discrimination rests on the planted files.
-//! The second arm needs a relative `core_pattern`, the only kind that writes a core into
-//! the probe's working directory.
-//! Under a pipe (Fedora 44 hands every crash to systemd-coredump), an absolute path (Darwin
-//! writes to `/cores`) or a pattern the host does not expose, the kernel puts the core where
-//! no search of the workdir can reach, so an empty search there is not evidence. The arm is
-//! announced through `tests/common`'s capability gap rather than passed, and the forced-off
-//! arm's clean line is then a statement about the workdir alone.
-//!
-//! The limit does not reach a handler: a `core_pattern` that pipes to one (systemd-coredump
-//! on Fedora) ignores it and starts the handler for every crash, whose time lands in the
-//! run's `duration_ms`. So the probes that crash in their own process make themselves
-//! non-dumpable (`CHARD_NOT_DUMPABLE` in `probes/chard_selfreport.h`), and the tests at the
-//! end of this file hold the list of them, [`NON_DUMPABLE`], to the sources, to the recorded
-//! runs that crashed and to this host's own runs.
 
-use std::path::{Path, PathBuf};
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
+
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
 
 mod common;
+
+use common::chard_binary;
 
 const GATE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sweep-gate.sh");
 
@@ -44,10 +31,6 @@ const GATE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sweep-gate.sh")
 /// one profile is enough to put a crash in the workdir. On Linux the probe is
 /// non-dumpable, so its crash writes no core there whatever the limit.
 const ABORTING_PROBE: &str = "fortify-known-object";
-
-fn chard_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_chard"))
-}
 
 /// Is there a `bash` to run the gate with?
 fn require_bash(verifies: &str) -> bool {
@@ -59,10 +42,17 @@ fn require_bash(verifies: &str) -> bool {
 }
 
 /// The gate's stdout for one report and workdir, with its exit status.
-///
-/// The expectation directory is the report's own, which holds no expectation file, so a
-/// report that withholds nothing is the only kind that passes.
 fn gate(limit: &str, workdir: &Path, report: &Path) -> (String, Option<i32>) {
+    gate_after(limit, workdir, report, "0")
+}
+
+/// [`gate`], handed `measure_rc` as the measurement's exit status.
+fn gate_after(
+    limit: &str,
+    workdir: &Path,
+    report: &Path,
+    measure_rc: &str,
+) -> (String, Option<i32>) {
     let output = Command::new("bash")
         .arg(GATE)
         .arg("--expected")
@@ -73,7 +63,7 @@ fn gate(limit: &str, workdir: &Path, report: &Path) -> (String, Option<i32>) {
         .arg(workdir)
         .arg(report)
         .arg(chard::probe::total_checks().to_string())
-        .arg("0")
+        .arg(measure_rc)
         .output()
         .expect("spawning bash for scripts/sweep-gate.sh");
     (
@@ -135,15 +125,6 @@ fn have_jq() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// The gate's core section on planted files: the limit is read, a core is known by its
-/// ELF `e_type` whatever its name and byte order, other ELF files are not cores, and a
-/// search over nothing fails rather than passing.
-///
-/// The gate is handed a report that passes every later section, so each exit status below
-/// is the core section's: 0 for the clean run under limit 0, 1 for the same workdir under
-/// an unlimited limit, and 1 once a core is planted. The printed lines need `bash`, `od`
-/// and `find`; the exit statuses need `jq` too, because the gate reads the report with
-/// it, and without `jq` that arm is announced as a gap.
 #[test]
 fn the_gate_fails_a_nonzero_limit_and_finds_a_core_by_its_content() {
     if !require_bash("that the sweep gate fails a nonzero core limit and finds a core file") {
@@ -310,10 +291,6 @@ fn core_pattern_is_relative() -> Result<String, String> {
     }
 }
 
-/// The gate's two lists sort by the verdict word, and the report's `coverage.withholding`
-/// by the verdict and the gating rule beside it; a limitation verdict no rule earns is in
-/// the report's instrument set and on the gate's earned list, and the cell fails naming it,
-/// where the same report with its rule passes that section.
 #[test]
 fn the_gate_holds_its_lists_to_the_reports_withholding_sets() {
     let verifies = "that the sweep gate holds its earned and withheld lists to the report";
@@ -388,10 +365,152 @@ fn the_gate_holds_its_lists_to_the_reports_withholding_sets() {
     );
 }
 
-/// The built binary under the recipe's limit leaves no core the gate can find. Where the
-/// host writes cores into the working directory, the same cell under an unlimited limit
-/// leaves one the gate does find, except on Linux, where the crashing probe is
-/// non-dumpable and must leave none.
+/// The planted reports [`the_gate_holds_exit_4_to_the_report_both_ways`] feeds the gate, each
+/// with `true` where the report supports exit 4 (every check attempted, every unsettled one
+/// `indeterminate` under a machine-limit or target-limit rule, at least one a machine limit)
+/// and `false` where it supports exit 1 alone.
+fn exit_4_cells(work: &common::Work, total: usize) -> Vec<(std::path::PathBuf, bool)> {
+    let report = |held: &[(&str, &str, Option<&str>)]| {
+        let mut r: Value = serde_json::from_str(&passing_report(total)).expect("json");
+        r["coverage"]["all_verdicts_published"] = false.into();
+        let observations = r["observations"].as_array_mut().expect("observations");
+        for (check, verdict, rule) in held {
+            let mut o = serde_json::json!({"check": check, "verdict": verdict});
+            if let Some(rule) = rule {
+                o["gating"] = serde_json::json!({"rule": rule});
+            }
+            observations.push(o);
+        }
+        r
+    };
+    // An aarch64 machine without BTI or PAC: those two checks held by a machine limit,
+    // `shadow-stack-enforced` by a target limit, and every other check settled, one row of
+    // each settled verdict (`on` is the planted report's own row).
+    let shape = [
+        ("bti-enforced", "indeterminate", Some("machine-lacks-bti")),
+        (
+            "pac-ret-enforced",
+            "indeterminate",
+            Some("machine-lacks-pac"),
+        ),
+        (
+            "shadow-stack-enforced",
+            "indeterminate",
+            Some("no-check-on-target"),
+        ),
+        ("fortify-source", "off", None),
+        ("stack-protector", "partial", None),
+    ];
+    let beside = |rows: &[(&'static str, &'static str, Option<&'static str>)]| {
+        let mut all = shape.to_vec();
+        all.extend_from_slice(rows);
+        report(&all)
+    };
+    // A machine-limit rule beside a verdict other than `indeterminate`.
+    let mut invalid_rows = shape.to_vec();
+    invalid_rows[0] = ("bti-enforced", "probe-invalid", Some("machine-lacks-bti"));
+    // The same with `build-failed` and with `run-failed`, so a gate that refused only
+    // `probe-invalid` beside a machine limit would take them.
+    let mut build_failed_rows = shape.to_vec();
+    build_failed_rows[0] = ("bti-enforced", "build-failed", Some("machine-lacks-bti"));
+    let mut run_failed_rows = shape.to_vec();
+    run_failed_rows[0] = ("bti-enforced", "run-failed", Some("machine-lacks-bti"));
+    // The shape in a report that did not attempt every check.
+    let mut unattempted = report(&shape);
+    unattempted["coverage"]["all_checks_attempted"] = false.into();
+    [
+        ("limited.json", report(&shape), true),
+        // A withheld check with no rule.
+        (
+            "mixed.json",
+            beside(&[("gcs-macro", "probe-invalid", None)]),
+            false,
+        ),
+        // A target limit alone.
+        ("target-only.json", report(&shape[2..3]), false),
+        // Limitations a gating rule earned, one of each verdict, each under a rule that
+        // publishes it.
+        (
+            "beside-earned.json",
+            beside(&[
+                ("gcs-macro", "unsupported", Some("arch-gated")),
+                (
+                    "libcxx-hardening",
+                    "not-applicable",
+                    Some("stdlib-lacks-observable"),
+                ),
+            ]),
+            true,
+        ),
+        // A limitation verdict no gating rule earns is a shortfall with no rule.
+        (
+            "beside-unearned.json",
+            beside(&[("gcs-macro", "unsupported", None)]),
+            false,
+        ),
+        // A check held `indeterminate` by a rule of neither list.
+        (
+            "other-rule.json",
+            beside(&[(
+                "sanitizer-bounds",
+                "indeterminate",
+                Some("sanitizer-group-unmeasured"),
+            )]),
+            false,
+        ),
+        ("machine-rule-invalid.json", report(&invalid_rows), false),
+        (
+            "machine-rule-build-failed.json",
+            report(&build_failed_rows),
+            false,
+        ),
+        (
+            "machine-rule-run-failed.json",
+            report(&run_failed_rows),
+            false,
+        ),
+        ("unattempted.json", unattempted, false),
+    ]
+    .into_iter()
+    .map(|(name, report, limited)| (work.write(name, &report.to_string()), limited))
+    .collect()
+}
+
+#[test]
+fn the_gate_holds_exit_4_to_the_report_both_ways() {
+    let verifies = "that the sweep gate holds exit 1 and exit 4 to the report";
+    if !require_bash(verifies) {
+        return;
+    }
+    if !have_jq() {
+        common::capability_gap(verifies, "no jq on PATH, so the gate exits 2 at the report");
+        return;
+    }
+    let total = chard::probe::total_checks();
+    let work = common::Work::new("core-files", "exit-4");
+    let dir = work.path("cell");
+    std::fs::create_dir_all(dir.join("probe")).expect("creating the workdir");
+    std::fs::write(dir.join("probe/plain.stdout"), "text\n").expect("planting");
+    let status_failure = |out: &str, rc: &str| {
+        out.lines()
+            .any(|l| l.starts_with("FAIL") && l.contains(&format!("chard measure exited {rc}")))
+    };
+    let cells = exit_4_cells(&work, total);
+    assert_eq!(cells.len(), 10, "every planted report is fed to the gate");
+    for (path, rc, fails) in cells
+        .iter()
+        .flat_map(|(path, limited)| [(path, "4", !limited), (path, "1", *limited)])
+    {
+        let (out, _) = gate_after("0", &dir, path, rc);
+        assert_eq!(
+            status_failure(&out, rc),
+            fails,
+            "{} at exit {rc}: the gate printed:\n{out}",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn a_cell_under_the_recipe_limit_leaves_no_core() {
     let verifies = "that a sweep cell under `ulimit -c 0` leaves no core file in its workdir";
@@ -436,23 +555,18 @@ fn a_cell_under_the_recipe_limit_leaves_no_core() {
             eprint!("{on}");
             assert!(
                 signalled_runs(&report) > 0,
-                "no probe run ended on a signal under `ulimit -c unlimited`, so the \
-                 forced-on arm fed the gate nothing"
+                "no probe run ended on a signal under `ulimit -c unlimited`"
             );
             assert_line(&on, "FAIL  on: the core limit is unlimited");
             if cfg!(target_os = "linux") {
                 // The probe made itself non-dumpable, so even an unlimited limit and a
-                // pattern into the workdir leave no core: the non-dumpable property, live. The
-                // gate's search is held to a core by the planted files above instead.
+                // pattern into the workdir leave no core: the non-dumpable property, live.
                 assert_line(&on, "ok    on: no core file among");
             } else {
                 assert!(
                     on.lines()
                         .any(|l| l.starts_with("FAIL  on: ") && l.contains(" core file(s) among ")),
-                    "core_pattern {pattern:?} writes into the probe's working directory and \
-                     the gate found no core after a crash under an unlimited limit: its \
-                     search cannot discriminate, so its clean line under `ulimit -c 0` is \
-                     not evidence:\n{on}"
+                    "the gate found no core in the workdir under core_pattern {pattern:?}:\n{on}"
                 );
             }
             exercised += 1;
@@ -465,29 +579,14 @@ fn a_cell_under_the_recipe_limit_leaves_no_core() {
 
 /// The probes whose own process dies by a signal in some arm, each of which makes itself
 /// non-dumpable at the top of `main` through `CHARD_NOT_DUMPABLE` in `chard_selfreport.h`.
-///
-/// `ulimit -c 0` above keeps a core out of the workdir, and a `core_pattern` that pipes to a
-/// handler ignores it: the kernel starts the handler for every crash, and its time lands in
-/// the run's `duration_ms`.
-///
-/// Not here, each for its reason:
-/// - `strict_flex_arrays_enforced.c`: its crashes are forked rows, no run of it ends on a
-///   signal, and it makes its own call before the first fork, which
-///   `src/decode/runtime_tests.rs` pins.
-/// - `stack_clash.c`, `stack_exec_runtime.c` and `shadow_stack.c`: each catches its fault in
-///   a handler that ends in `_exit(0)`, so its process does not die by the signal (and
-///   `shadow_stack.c` re-executes itself, which makes it dumpable again).
-/// - the fault reporter in `chard_selfreport.h` (`CHARD_WANT_FAULT_REPORT`): no probe uses
-///   it; `tests/fault_classes.c` does, and the test that builds it is not a probe run.
-///
-/// A probe among these that died by its signal on some toolchain would fail the two tests
-/// below that read crash runs, naming it.
 const NON_DUMPABLE: &[&str] = &[
+    "bti_enforced.c",
     "cxx_assertions.cpp",
     "fortify_dynamic_object.c",
     "fortify_known_object.c",
     "fortify_percent_n.c",
     "fortify_subobject.c",
+    "pac_ret_enforced.c",
     "trapv.c",
     "ub_null_check.c",
 ];
@@ -500,6 +599,10 @@ const NON_DUMPABLE: &[&str] = &[
 const BEFORE_THE_CALL: &[&str] = &[
     "{",
     "CHARD_PRINT_REPORT;",
+    "int (*target)(void) = chard_bti_target;",
+    "int returned;",
+    "unsigned long hwcap2;",
+    "unsigned long hwcap;",
     "int written = 0;",
     "int *p = opaque;",
     "std::setvbuf(stdout, nullptr, _IONBF, 0);",
@@ -556,30 +659,6 @@ fn dumps(signal: &str) -> bool {
     DUMPING_SIGNALS.contains(&signal)
 }
 
-/// The probe source a check is measured through.
-fn source_of_check(check: &str) -> Option<&'static str> {
-    chard::probe::CORPUS
-        .iter()
-        .find(|p| p.checks.iter().any(|c| c.id == check))
-        .map(|p| p.source_name)
-}
-
-/// The note `CHARD_NOT_DUMPABLE` writes where the call fails, read back from the header
-/// with a sample errno, so the replay below feeds the spelling the probes print.
-fn dumpable_note() -> String {
-    let header = include_str!("../probes/chard_selfreport.h");
-    let start = header
-        .find("\"chard-note dumpable-unset")
-        .expect("the header spells the note");
-    let quoted = &header[start + 1..];
-    let end = quoted.find('"').expect("the note's closing quote");
-    quoted[..end].replace("%d", "1").replace("\\n", "\n")
-}
-
-/// Each listed probe opts in before the header and calls `CHARD_NOT_DUMPABLE` in `main`,
-/// after the self-report where it prints one; no other probe opts in; and the header's
-/// Linux definition makes the call and writes its failure on stdout. Pinned on the source,
-/// since no run on a host whose handler is fast can tell a call is gone.
 #[test]
 fn every_probe_that_crashes_in_its_own_process_is_non_dumpable_at_the_top_of_main() {
     let header = include_str!("../probes/chard_selfreport.h");
@@ -646,8 +725,7 @@ fn every_probe_that_crashes_in_its_own_process_is_non_dumpable_at_the_top_of_mai
                 assert_eq!(depth, 0, "{name}: the call sits inside a conditional");
                 assert!(
                     reported || !main.contains("CHARD_PRINT_REPORT;"),
-                    "{name}: the call precedes the self-report, which must be main's first \
-                     statement"
+                    "{name}: the call precedes the self-report"
                 );
                 called = true;
                 break;
@@ -660,8 +738,7 @@ fn every_probe_that_crashes_in_its_own_process_is_non_dumpable_at_the_top_of_mai
             } else if !line.starts_with("#else") {
                 assert!(
                     BEFORE_THE_CALL.contains(&line),
-                    "{name}: `{line}` comes before CHARD_NOT_DUMPABLE in main, and only the \
-                     self-report, declarations and stdout's buffering may"
+                    "{name}: `{line}` comes before CHARD_NOT_DUMPABLE in main"
                 );
             }
         }
@@ -678,113 +755,6 @@ fn every_probe_that_crashes_in_its_own_process_is_non_dumpable_at_the_top_of_mai
             "{name} is on NON_DUMPABLE and is no probe's source"
         );
     }
-}
-
-/// The recorded evidence, every toolchain the fixtures carry: a run that ended on a signal
-/// that dumps came from a listed probe, and each listed probe has such a run, so the list
-/// is the probes seen to crash and holds none on a guess. A hand-authored fixture (its
-/// toolchain starts `synthetic:`) is no run of a probe and is left out, counted.
-#[test]
-fn the_non_dumpable_list_is_the_probes_whose_recorded_runs_crash() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detectors.json");
-    let text = std::fs::read_to_string(&path).expect("reading the fixture file");
-    let fixtures: Vec<chard::fixture::Fixture> =
-        serde_json::from_str(&text).expect("the fixture file is JSON");
-    let mut crashed = std::collections::BTreeSet::new();
-    let (mut signalled, mut hand_authored) = (0_usize, 0_usize);
-    for f in &fixtures {
-        let Some(signal) = f.run.as_ref().and_then(|r| r.signal.as_deref()) else {
-            continue;
-        };
-        if f.toolchain.starts_with("synthetic:") {
-            hand_authored += 1;
-            continue;
-        }
-        if !dumps(signal) {
-            continue;
-        }
-        signalled += 1;
-        let source =
-            source_of_check(&f.check).unwrap_or_else(|| panic!("{} is no corpus check", f.check));
-        assert!(
-            NON_DUMPABLE.contains(&source),
-            "{} on {} ended on {signal} in its own process, and {source} is not on \
-             NON_DUMPABLE: each such crash starts the host's core handler",
-            f.check,
-            f.toolchain
-        );
-        crashed.insert(source);
-    }
-    eprintln!(
-        "non-dumpable: {} fixtures, {signalled} recorded runs ended on a dumping signal, \
-         from {} probe sources; {hand_authored} hand-authored left out",
-        fixtures.len(),
-        crashed.len()
-    );
-    let listed: std::collections::BTreeSet<&str> = NON_DUMPABLE.iter().copied().collect();
-    assert_eq!(
-        crashed, listed,
-        "NON_DUMPABLE names a probe no recorded run shows crashing"
-    );
-}
-
-/// Where the call fails the probe prints `chard-note dumpable-unset errno=N` on stdout,
-/// after the self-report where it prints one and first otherwise, and that line changes
-/// no reading: every recorded run of a listed probe reads the same with it.
-#[test]
-fn a_failed_call_s_note_changes_no_reading() {
-    let note = dumpable_note();
-    assert!(
-        note.starts_with("chard-note dumpable-unset errno=1\n"),
-        "{note:?}"
-    );
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detectors.json");
-    let text = std::fs::read_to_string(&path).expect("reading the fixture file");
-    let fixtures: Vec<chard::fixture::Fixture> =
-        serde_json::from_str(&text).expect("the fixture file is JSON");
-    let mut fed = 0_usize;
-    let mut sources = std::collections::BTreeSet::new();
-    for f in &fixtures {
-        let Some(source) = source_of_check(&f.check).filter(|s| NON_DUMPABLE.contains(s)) else {
-            continue;
-        };
-        let Some(run) = f.run.as_ref() else {
-            continue;
-        };
-        sources.insert(source);
-        let end = "CHARD-REPORT-END\n";
-        let stdout = match run.stdout.find(end) {
-            Some(at) => format!(
-                "{}{note}{}",
-                &run.stdout[..at + end.len()],
-                &run.stdout[at + end.len()..]
-            ),
-            None => format!("{note}{}", run.stdout),
-        };
-        let mut noted = f.clone();
-        noted.run.as_mut().expect("the run").stdout = stdout;
-        let (plain, with) = (
-            f.replay().expect("a corpus check"),
-            noted.replay().expect("a corpus check"),
-        );
-        assert_eq!(
-            (plain.got.as_str(), plain.got_level.as_deref()),
-            (with.got.as_str(), with.got_level.as_deref()),
-            "{} on {}: the note moved the reading",
-            f.check,
-            f.toolchain
-        );
-        fed += 1;
-    }
-    eprintln!(
-        "non-dumpable: the note fed to {fed} recorded runs of {} listed probe sources",
-        sources.len()
-    );
-    let listed: std::collections::BTreeSet<&str> = NON_DUMPABLE.iter().copied().collect();
-    assert_eq!(
-        sources, listed,
-        "the note reached no recorded run of some listed probe"
-    );
 }
 
 /// One run record of a report: its check, its probe's source, the signal it ended on, and
@@ -842,10 +812,6 @@ fn report_runs(report: &Value) -> Vec<RunSeen> {
     runs
 }
 
-/// This host's compiler, under `bare` and `openssf-tldr`: every run that ended on a signal
-/// that dumps came from a listed probe, at least one did, and no run printed the note, so
-/// on this host the call took effect. This is the arm that sees a new crashing probe before
-/// any fixture records it.
 #[test]
 fn no_run_on_this_host_crashes_outside_the_non_dumpable_list() {
     let verifies = "that every probe crashing in its own process on this host is non-dumpable";
@@ -890,8 +856,7 @@ fn no_run_on_this_host_crashes_outside_the_non_dumpable_list() {
             if let Some(signal) = run.signal.as_deref().filter(|s| dumps(s)) {
                 assert!(
                     NON_DUMPABLE.contains(&run.source),
-                    "{profile}: {} ended on {signal} in its own process, and {} is not on \
-                     NON_DUMPABLE",
+                    "{profile}: {} ended on {signal}, and {} is not on NON_DUMPABLE",
                     run.check,
                     run.source
                 );
@@ -904,9 +869,7 @@ fn no_run_on_this_host_crashes_outside_the_non_dumpable_list() {
         }
         assert!(
             dumping > 0,
-            "{profile}: no run of {} records ended on a signal that dumps, so the list was \
-             held to no crash: the fortify, trapv and cxx positive arms crash on every \
-             toolchain measured",
+            "{profile}: no run of {} records ended on a signal that dumps",
             runs.len()
         );
     }

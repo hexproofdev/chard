@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# House markdown standard (rumdl 0.3.4). A repository copies this file to .lints/md/rumdl.toml,
+# unedited, and its root .rumdl.toml says `extends = ".lints/md/rumdl.toml"` plus only the local
+# settings the standard's markdown guide allows. Every enabled rule is an error; the gate runs
+# `rumdl check --fail-on error`. Measured over 25 checkouts.
+
+[global]
+# An allowlist: a rule not named here does not run; the markdown guide gives the rejected ones.
+enable = [
+  # defects: something renders wrong, points nowhere, or hides text
+  "MD001", "MD018", "MD024", "MD025", "MD036", "MD041", "MD042", "MD045", "MD051", "MD052",
+  "MD053", "MD056", "MD057", "MD066", "MD067", "MD068", "MD070", "MD075", "MD080", "MD086",
+  "MD087", "MD092", "MD094",
+  # agent safety: hidden or deceptive characters in text that agents read as instructions
+  "MD083", "MD084", "MD095",
+  # one style
+  "MD003", "MD004", "MD005", "MD007", "MD009", "MD010", "MD012", "MD013", "MD019", "MD020",
+  "MD021", "MD022", "MD023", "MD026", "MD027", "MD028", "MD029", "MD030", "MD031", "MD032",
+  "MD035", "MD037", "MD038", "MD039", "MD040", "MD046", "MD047", "MD048", "MD049", "MD050",
+  "MD055", "MD058", "MD062", "MD064", "MD065", "MD069", "MD071", "MD076", "MD077",
+  # house words: empty here; a repository lists its own terms locally
+  "MD061",
+]
+exclude = ["**/goldens/**", "**/reviews/**", "**/review/**", "**/lanes/done/**", "**/CHANGELOG.md"]
+# The fix for MD018 adds the space, which turns a wrapped "#150 ..." line into a heading: rewrap by hand.
+unfixable = ["MD018"]
+cache = false   # no .rumdl_cache directory in the repository
+
+[MD001]
+severity = "error"
+[MD003]
+style = "atx"
+severity = "error"
+[MD004]
+style = "dash"
+severity = "error"
+[MD005]
+severity = "error"
+[MD007]
+severity = "error"
+[MD009]
+severity = "error"
+[MD010]
+severity = "error"
+[MD012]
+severity = "error"
+[MD013]
+line-length = 100
+code-blocks = false
+tables = false
+headings = false
+severity = "error"   # a repository not yet reflowed sets "info" locally, once, until its reflow commit
+[MD018]
+severity = "error"
+[MD019]
+severity = "error"
+[MD020]
+severity = "error"
+[MD021]
+severity = "error"
+[MD022]
+severity = "error"
+[MD023]
+severity = "error"
+[MD024]
+siblings-only = true   # CHANGELOG-style "Added" under each version is fine
+severity = "error"
+[MD025]
+front-matter-title = ""   # a guide may carry a front-matter title and its own H1 (45 of 47 guides measured do)
+severity = "error"
+[MD026]
+punctuation = ".,;:!"   # a question is a heading; a sentence is not
+severity = "error"
+[MD027]
+severity = "error"
+[MD028]
+severity = "error"
+[MD029]
+severity = "error"
+[MD030]
+severity = "error"
+[MD031]
+severity = "error"
+[MD032]
+severity = "error"
+[MD035]
+severity = "error"
+[MD036]
+severity = "error"
+[MD037]
+severity = "error"
+[MD038]
+severity = "error"
+[MD039]
+severity = "error"
+[MD040]
+severity = "error"   # the fix writes `text`; an agent can tell what to run from what to read
+[MD041]
+severity = "error"
+[MD042]
+severity = "error"
+[MD045]
+severity = "error"
+[MD046]
+style = "fenced"
+severity = "error"
+[MD047]
+severity = "error"
+[MD048]
+style = "backtick"
+severity = "error"
+[MD049]
+severity = "error"
+[MD050]
+severity = "error"
+[MD051]
+severity = "error"
+[MD052]
+severity = "error"
+[MD053]
+severity = "error"
+[MD055]
+severity = "error"
+[MD056]
+severity = "error"
+[MD057]
+severity = "error"
+[MD058]
+severity = "error"
+[MD061]
+severity = "error"
+[MD062]
+severity = "error"
+[MD064]
+severity = "error"
+[MD065]
+severity = "error"
+[MD066]
+severity = "error"
+[MD067]
+severity = "error"
+[MD068]
+severity = "error"
+[MD069]
+severity = "error"
+[MD070]
+severity = "error"
+[MD071]
+severity = "error"
+[MD075]
+severity = "error"
+[MD076]
+severity = "error"
+[MD077]
+severity = "error"
+[MD080]
+severity = "error"
+[MD083]
+severity = "error"
+[MD084]
+strict = true          # default mode flags only deprecated code points; strict adds zero-width, bidi overrides (Trojan Source), soft hyphens, BOMs
+allow = ["U+FE0F"]     # the emoji variation selector (as in a warning sign); the only one found, 59 of 59. Spell it U+XXXX: under rumdl 0.3.4, "FE0F" or "\\uFE0F" silently allow everything
+severity = "error"
+[MD086]
+severity = "error"
+[MD087]
+severity = "error"
+[MD092]
+severity = "error"
+[MD094]
+severity = "error"
+[MD095]
+severity = "error"

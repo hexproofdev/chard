@@ -1,200 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! `chard-predicate/1`: a decoder written as data, and the one evaluator that runs it.
-//!
-//! A detector on the macro and elf-static channels is a pure function from published facts
-//! to a reading: an outcome, a level, and the clause that decided it. Written as Rust, that
-//! function is visible only to someone who trusts chard's build. Written as a [`Predicate`],
-//! it is a value that serializes into the report beside the facts it read, and any reader
-//! can re-evaluate it with this module's rules and compare. This module is the normative
-//! statement of those rules; `DESIGN.md` points here rather than restating them.
-//!
-//! The types are owned and deserializable on purpose. An in-binary predicate is built once
-//! behind a `std::sync::LazyLock` and handed out as `fn() -> &'static Predicate`, and the
-//! value the report publishes is that same value serialized. `const` data would need a
-//! second, borrowed type that cannot be deserialized, so the published predicate would not
-//! be the one chard evaluated.
-//!
-//! # Values
-//!
-//! A [`Term`] evaluates to a [`Fact`], one of five shapes: `Undefined`, `Bool`, `Int`,
-//! `Text` and `List`.
-//!
-//! - `macro NAME`: `Text` of the macro's replacement text, or `Undefined` when the map
-//!   does not define it. A macro defined with no replacement text is `Text("")`.
-//! - `c-int NAME`: the integer libc++'s hardening mode names, read from the value of
-//!   `NAME` by this rule. The text is
-//!   trimmed; then, at most eight times: the
-//!   text is trimmed, the run of `(` it starts with and the run of `)` it ends with are
-//!   stripped, each independently of the other and of balance, and the result is trimmed
-//!   again (a parenthesis behind whitespace inside that run stays); when the text
-//!   holds `<<`, it is split at the first one into `a` and `b`, each trimmed and read as
-//!   an unsigned 32-bit decimal, and the value is `a` shifted left by `b` within 32 bits:
-//!   a shift count of 32 or more is `Undefined`, so is a shift that would carry a bit
-//!   past bit 31 (`3 << 31` is `Undefined`; `1 << 31` is 2147483648), and a side that
-//!   does not read as a decimal is `Undefined`; text that reads as an unsigned 32-bit
-//!   decimal is itself; anything else
-//!   is looked up as a macro name, and a name that is undefined, or whose trimmed value
-//!   is the name itself, gives `Undefined`. Eight steps without a number give
-//!   `Undefined`. `NAME` and every name followed are reads.
-//!
-//!   A decimal, here and in the integer reading below, is Rust's `str::parse`: ASCII
-//!   digits with an optional leading `+` (`+2` is 2), a leading `-` as well for the
-//!   signed `i64` reading, and nothing else, so an interior space, a `0x` prefix or a
-//!   `U` suffix does not read. To trim is `str::trim`: it removes, at both ends, every
-//!   character with the Unicode `White_Space` property, U+0085 and U+3000 included.
-//! - `cxx-stdlib`: `decode::common::cxx_stdlib`'s ladder. `_CXX_STDLIB`'s value when it is defined,
-//!   else `Text("libc++")` when `_LIBCPP_VERSION` is defined, else `Text("libstdc++")`
-//!   when `__GLIBCXX__` is defined, else `Undefined`. Each rung consulted is a read, and a
-//!   rung that answers ends the ladder.
-//! - `elf FIELD`: the `ElfFacts` field whose serialized JSON key is `FIELD` ([`ElfField`]).
-//!   `null` is `Undefined`, a boolean is `Bool`, an integer that fits `i64` is `Int`, a
-//!   string is `Text` and an array of strings is `List`. A non-negative integer above
-//!   `i64::MAX` is `Undefined`, which is how the Live view reads a `usize` count that
-//!   large; any other number, a float included, is the wrong shape (see Views).
-//! - `symbol NAME`: `Bool(defined)` for an entry of `watched_symbols`, `Undefined` for a
-//!   watched name the map does not hold. The watch list is the symbol channel's filter,
-//!   as the published filter is the macro channel's: the map holds only the watched names
-//!   the reader found, so its silence about any other name is not a reading. A name
-//!   outside the watch list is `Incomplete`, keyed `elf.watched_symbols.NAME`, never
-//!   `Undefined`. Which list is the watch list depends on the view (see Views): the Live
-//!   view's is `elf::WATCHED_SYMBOLS`, the list of the chard that read the artifact, and
-//!   the Published view's is the list the publication says its reader watched, since a
-//!   later chard's list can hold a name the reader never looked for. [`validate`] refuses
-//!   a predicate naming a symbol outside `elf::WATCHED_SYMBOLS`.
-//! - `symbol-names`: `List` of the keys of `watched_symbols`, in map order. The list means
-//!   something only beside the watch list it was cut from, so the Published view reads it
-//!   only when the publication carries that list.
-//!
-//! # Conditions
-//!
-//! A [`Cond`] is true or false. Every comparison against a value of the wrong shape is
-//! false, never an error, so a clause that does not apply is a clause that does not match.
-//!
-//! - `all` is true when every member is (and for an empty list); `any` when at least one
-//!   is (false for an empty list); `none-of` when no member is. Members are evaluated in
-//!   order and evaluation stops at the first member that settles the answer, so a read
-//!   the answer did not need is never made.
-//! - `defined T` is true when `T` is not `Undefined`; `missing T` when it is.
-//! - `truth T` is true for `Bool(true)`, for an `Int` other than zero, and for `Text`
-//!   whose integer reading (below) is other than zero. It is false otherwise.
-//! - `eq [T, s]` is true when `T` renders as exactly `s`: `Text` verbatim, `Int` in base
-//!   10, `Bool` as `true` or `false`. `Undefined` and `List` never equal anything.
-//! - `int [T, cmp, n]` compares `T`'s integer reading with `n` under `eq`, `ne`, `lt`,
-//!   `le`, `gt` or `ge`. The integer reading of `Int` is itself and of `Text` is
-//!   trim, then a base-10 `i64`. Any other value, and text that does not parse, has no
-//!   integer reading and the condition is false.
-//! - `any-starts-with [T, s]` and `any-contains [T, s]` are true when some item of a
-//!   `List` starts with or contains `s`. They are false for every other shape.
-//! - `non-empty T` is true for a `List` with an item and for non-empty `Text`.
-//!
-//! # Evaluation
-//!
-//! [`evaluate`] applies three steps in order and stops at the first that concludes.
-//!
-//! 1. **No source.** A predicate needs the macro source when any term it contains reads a
-//!    macro, and the ELF source when any term reads the artifact or `tables` is non-empty.
-//!    A needed source the view does not have concludes `indeterminate`, clause
-//!    `@no-source:macros` (checked first) or `@no-source:elf`. No read is recorded.
-//! 2. **Truncation.** When `tables` names a table that `truncations` records as `unread`,
-//!    the conclusion is `indeterminate`, clause `@truncated`. `ignored` entries never
-//!    match, which is `ElfFacts::unread`'s rule: the loader's view was measured whole.
-//!    The truncation list is a read whenever `tables` is non-empty.
-//! 3. **Clauses.** The first clause whose `when` holds concludes with its `then`, under
-//!    its `id`. When none holds, `otherwise` concludes, under the clause `@otherwise`.
-//!
-//! A conclusion is `present` with a level, `absent`, or `indeterminate`. A `present`
-//! level is none, a fixed word, or the value of a term. A term's value renders as its
-//! integer reading in base 10 when it has one, as its text otherwise, and `Bool` as
-//! `true` or `false`. A level term that is `Undefined`, a `List`, or empty `Text` has no
-//! rendering; the conclusion is then `indeterminate` under the same clause, since a level
-//! that cannot be read is not one chard may claim. That demotion is the one case where an
-//! evaluation's outcome differs from what its clause's `then` (or `otherwise`) states: an
-//! `indeterminate` outcome under a conclusion that is `present` with a `value` level is a
-//! level that failed to render, and [`render_observed`] says so.
-//!
-//! Clause ids are unique within a predicate, never empty, and never begin with `@`, which
-//! the reserved clauses above use, every `because` holds a character outside
-//! ECMA-262's `\s`, and a fixed `word` level is never empty, since an empty rendering is
-//! not a level chard may claim. [`validate`] checks these; a reader re-evaluating a
-//! published predicate validates it first, since an ambiguous clause id names no clause.
-//!
-//! # Views
-//!
-//! The evaluator reads through a [`FactView`] and records each distinct read, in the order
-//! first made, with the value it returned. Two views exist.
-//!
-//! - [`Live`] reads the macro map and `ElfFacts` a measurement produced.
-//! - [`Published`] reads the same facts as they were serialized into a report: a macro
-//!   object, the filter the report says it was trimmed to, an `ElfFacts` object, and the
-//!   watch list the report says its reader looked for symbols from. A key
-//!   the view does not hold is `Incomplete(key)`, and the evaluation stops there rather
-//!   than reading it as absent. A macro name outside the published filter is
-//!   `Incomplete`, never `Undefined`: the trimmed map says nothing about a name it was
-//!   not asked to keep, and reading silence as "undefined" is how an unearned `off` would
-//!   be derived from a report. A name inside the filter and absent from the map is
-//!   `Undefined`, because the filter says the map would have carried it. A value of the
-//!   wrong JSON shape for its field is `Incomplete` too.
-//!
-//!   The watch list is read the same way. A `symbol NAME` whose name is outside the
-//!   published list is `Incomplete("elf.watched_symbols.NAME")`, and a name inside it
-//!   that `watched_symbols` does not hold is `Undefined`. A publication with no watch
-//!   list answers no symbol read: `symbol NAME` and `symbol-names` are both
-//!   `Incomplete("symbols_filter")`. The reading binary's own `elf::WATCHED_SYMBOLS` is
-//!   never substituted for the publication's list, because a name the publishing chard
-//!   did not watch would then read as undefined, and a `missing` or `none-of` clause over
-//!   it would conclude `absent` from silence.
-//!
-//!   No absence reads as a value, `truncations` included. An absence read as empty could
-//!   not tell "no truncation" from a publication that lost a non-empty list, which would
-//!   turn a `@truncated` reading into whatever the clauses conclude. A publication a
-//!   predicate is re-evaluated over therefore carries `truncations` explicitly, `[]` when
-//!   nothing was cut, and this view reads its absence as `Incomplete`. `ElfFacts` on its
-//!   own omits the empty list (`skip_serializing_if`), and a report's `elf` store entries
-//!   state it, `report::serialize_stored_elf` being the serializer that does.
-//!
-//! Incomplete keys are spelt `macros.NAME`, `elf.FIELD`, `elf.watched_symbols`,
-//! `elf.watched_symbols.NAME`, `elf.truncations` and `symbols_filter`, and `macros` or
-//! `elf` for a source whose publication is not an object.
-//!
-//! # Rendering
-//!
-//! [`render_observed`] turns an evaluation into the `observed` sentence: each read in
-//! order, macros as a `CHARD-REPORT-V2` self-report spells them (`NAME=value`, which is
-//! `NAME=` for empty text, and `NAME undefined` when undefined: a defined macro's text
-//! follows the `=`, and an undefined one has no `=`, so no two reads of one macro with
-//! different values render alike, and no `-D` writes the undefined form), ELF fields as
-//! `field=value` (`null` when undefined), symbols as `NAME=present(defined=BOOL)` or
-//! `NAME=absent`, the watched names as `watched_symbols=LIST` and the truncation read as
-//! `unread_tables=LIST`, then the deciding clause's `because` in parentheses. `@otherwise`
-//! carries no reason, so its sentence is the reads alone. Reads are separated by one space.
-//!
-//! The sentence is for a reader, and the evaluation's reads (`reads` in a publication) are
-//! its exact form: each macro read renders apart from every other value of that macro, and
-//! the sentence as a whole does not. A value holding a space can spell a later read: a
-//! macro `A` defined as `1 B undefined` renders `A=1 B undefined`, which is also the
-//! sentence of `A` defined as `1` and an undefined `B`. A macro name is not always an
-//! identifier: `c-int` looks up a macro's text as a name, so `_LIBCPP_HARDENING_MODE`
-//! defined as `B=1` reads a macro named `B=1`, which renders `B=1 undefined`, as a macro
-//! `B` defined as `1 undefined` does. No verdict reads the sentence;
-//! `tests::the_sentence_is_distinct_per_read_and_not_as_a_whole` holds both examples.
-//!
-//! A `LIST` (the watched names, the unread tables, and any `List` field) renders as a JSON
-//! array of strings in compact form: `[`, the items in order separated by `,` with no
-//! whitespace, `]`. Each item is a JSON string: `"` and `\` are escaped with a backslash,
-//! the control characters U+0008, U+0009, U+000A, U+000C and U+000D as `\b`, `\t`, `\n`,
-//! `\f` and `\r`, every other character below U+0020 as `\u00` and two lowercase hex
-//! digits, and every other character, non-ASCII included, as itself in UTF-8. This is
-//! `serde_json`'s compact writer, and a vector pins it.
-//!
-//! When a `value` level has no rendering (Evaluation), the sentence ends in
-//! `the level TERM has no rendering, so the reading is indeterminate`, after the clause's
-//! `because` and a `; ` inside the same parentheses, or alone in parentheses under
-//! `@otherwise`. `TERM` is spelt as this document spells terms: `macro NAME`,
-//! `c-int NAME`, `cxx-stdlib`, `elf FIELD`, `symbol NAME` or `symbol-names`.
-//!
-//! [`canonical`] is compact `serde_json` of the predicate, the form a digest is taken
-//! over; it never passes through `Debug`.
+//! `chard-predicate/2`: a decoder written as data, and the one evaluator that runs it.
 
 pub mod elf_static;
 pub mod macro_channel;
@@ -209,12 +15,13 @@ use crate::probe::Outcome;
 
 /// The language version. A change to any rule in the module documentation, or to an
 /// expected result in `schema/chard-predicate-vectors.json`, is a new version once a
-/// publication has carried the version: `tests/predicate_language.rs` pins the vectors'
-/// digest per version. Before the first publication the pin moves under the same name and
-/// that test's note says what changed; a report written before such a change replays its
-/// predicates under the rules after it, and `run.decoders_sha256`, which folds this
-/// module's source in, is what tells the two apart.
-pub const LANGUAGE: &str = "chard-predicate/1";
+/// publication has carried the version: the vectors are the part of its meaning a reader
+/// can check, and `tests/predicate_language.rs` runs them and holds the schemas' `language`
+/// to this name. The new name arrives with the release that carries the change; between the
+/// two, a report names the
+/// published version over rules that have moved, and `run.decoders_sha256`, which folds
+/// this module's source in, tells it from a report of the publication.
+pub const LANGUAGE: &str = "chard-predicate/2";
 
 /// The reserved clause for a predicate whose macro source the view lacks.
 pub const NO_SOURCE_MACROS: &str = "@no-source:macros";
@@ -347,28 +154,6 @@ pub enum FieldShape {
 }
 
 /// The `ElfFacts` fields a predicate may read, spelt as their serialized JSON keys.
-///
-/// The map-valued fields are reached through [`Term::Symbol`] and [`Term::SymbolNames`]
-/// (`watched_symbols`) or not at all (`gnu_property_notes`), and `truncations` through the
-/// truncation step. `self_report` is the macro channel's source, read as macros. The two
-/// omitted-when-empty lists, `symbol_tables` and `comment`, are left out so that no
-/// readable field's absence has to be read as empty; `report` and `toolchain` read them,
-/// and no decoder does. `openbsd_nobtcfi` is left out because `composite::cfi` is its one
-/// reader, and a recorded row without it reads `false`, so a predicate over it would read
-/// a defaulted `false` on every row recorded without the field. `data_in_code_pages` is
-/// omitted when `null` and readable all the same: its default is `null`, which reads as
-/// `Undefined`, so a row mined before the field existed reads as no measurement rather than
-/// as either answer, and a report's `facts` store states the `null` the struct omits.
-/// `code_relocations` is read on the same terms.
-/// `function_references` is read the same way and for the same reason.
-///
-/// `code_scanned`, `code_matches` and `function_entries` are omitted when empty and
-/// readable all the same. A report's store states each, `[]` included
-/// (`report::serialize_stored_elf`), as it states `truncations`, so the Published view
-/// meets them; a publication that omits one is `Incomplete` there rather than empty, which
-/// is the rule above applied to them. A recorded row without any of the three reads as empty
-/// there, serde's default for an absent list; the Published view, not the record, is where an
-/// omission is told apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElfField {
@@ -388,6 +173,7 @@ pub enum ElfField {
     BindNow,
     GnuStackPresent,
     GnuStackExecutable,
+    RwxSegment,
     #[serde(rename = "df_1_noopen")]
     Df1Noopen,
     Textrel,
@@ -417,7 +203,7 @@ pub enum ElfField {
 
 impl ElfField {
     /// Every field, in declaration order.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::ElfClass,
         Self::ElfType,
         Self::Machine,
@@ -433,6 +219,7 @@ impl ElfField {
         Self::BindNow,
         Self::GnuStackPresent,
         Self::GnuStackExecutable,
+        Self::RwxSegment,
         Self::Df1Noopen,
         Self::Textrel,
         Self::DtRelr,
@@ -478,6 +265,7 @@ impl ElfField {
             Self::BindNow => "bind_now",
             Self::GnuStackPresent => "gnu_stack_present",
             Self::GnuStackExecutable => "gnu_stack_executable",
+            Self::RwxSegment => "rwx_segment",
             Self::Df1Noopen => "df_1_noopen",
             Self::Textrel => "textrel",
             Self::DtRelr => "dt_relr",
@@ -519,7 +307,8 @@ impl ElfField {
             | Self::GnuRelro
             | Self::BindNow
             | Self::GnuStackPresent
-            | Self::GnuStackExecutable => FieldShape::NullableBool,
+            | Self::GnuStackExecutable
+            | Self::RwxSegment => FieldShape::NullableBool,
             Self::HasInterp
             | Self::HasDynamic
             | Self::Df1Pie
@@ -559,15 +348,26 @@ pub enum Fact {
     List(Vec<String>),
 }
 
+/// A decimal, the module documentation's rule: `str::parse` of `T`, except that two or
+/// more digits whose first is `0`, after any sign, do not read: C reads `010` as octal 8
+/// and refuses `08`, so the predicates' `unreadable` clauses withhold over such text.
+fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
 impl Fact {
     /// The integer reading, the module documentation's rule: an `Int` itself, `Text`
-    /// trimmed and parsed as a base-10 `i64`, and nothing else. Public so that a test
+    /// trimmed and read as a `decimal` `i64`, and nothing else. Public so that a test
     /// holding another reader to this one calls it rather than restating it.
     #[must_use]
     pub fn integer(&self) -> Option<i64> {
         match self {
             Self::Int(value) => Some(*value),
-            Self::Text(text) => text.trim().parse::<i64>().ok(),
+            Self::Text(text) => decimal(text.trim()),
             Self::Undefined | Self::Bool(_) | Self::List(_) => None,
         }
     }
@@ -601,10 +401,65 @@ impl Fact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Incomplete(pub String);
 
+pub use name::MacroName;
+
+/// A module of its own so that the field is private to it: nothing else in this crate,
+/// this module's other code and its child modules included, can build a [`MacroName`]
+/// but through [`MacroName::new`].
+mod name {
+    /// A macro's name as the language reads one: one or more pieces, each an ASCII letter,
+    /// an ASCII digit, `_`, `$`, a character outside ASCII without the Unicode
+    /// `White_Space` property, or a universal character name (`\u` and four hexadecimal
+    /// digits, or `\U` and eight), the first not an ASCII digit.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct MacroName(String);
+
+    impl MacroName {
+        /// `text` as a macro's name, or `None` where it is not one.
+        #[must_use]
+        pub fn new(text: &str) -> Option<Self> {
+            if text.is_empty() || text.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                let piece = if c == '\\' {
+                    // A universal character name: its digits are counted, never read.
+                    let digits = match chars.next() {
+                        Some('u') => 4,
+                        Some('U') => 8,
+                        _ => return None,
+                    };
+                    (0..digits).all(|_| chars.next().is_some_and(|d| d.is_ascii_hexdigit()))
+                } else if c.is_ascii() {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+                } else {
+                    !c.is_whitespace()
+                };
+                if !piece {
+                    return None;
+                }
+            }
+            Some(Self(text.to_owned()))
+        }
+
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Display for MacroName {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+}
+
 /// What was read, as distinct keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadKey {
-    Macro(String),
+    Macro(MacroName),
     Elf(ElfField),
     Symbol(String),
     SymbolNames,
@@ -643,8 +498,6 @@ pub struct Evaluation {
 }
 
 /// A source of facts. Each method answers one key, or names the key it cannot answer.
-///
-/// The evaluator records reads, not the view, so the two views record identically.
 pub trait FactView {
     fn has_macros(&self) -> bool;
     fn has_elf(&self) -> bool;
@@ -653,7 +506,7 @@ pub trait FactView {
     /// # Errors
     ///
     /// The name's key, when the view cannot say.
-    fn macro_value(&self, name: &str) -> Result<Option<String>, Incomplete>;
+    fn macro_value(&self, name: &MacroName) -> Result<Option<String>, Incomplete>;
     /// A field's value.
     ///
     /// # Errors
@@ -721,8 +574,12 @@ impl FactView for Live<'_> {
         self.elf.is_some()
     }
 
-    fn macro_value(&self, name: &str) -> Result<Option<String>, Incomplete> {
-        Ok(self.macros.ok_or_else(no_macros)?.get(name).cloned())
+    fn macro_value(&self, name: &MacroName) -> Result<Option<String>, Incomplete> {
+        Ok(self
+            .macros
+            .ok_or_else(no_macros)?
+            .get(name.as_str())
+            .cloned())
     }
 
     fn elf_field(&self, field: ElfField) -> Result<Fact, Incomplete> {
@@ -743,6 +600,7 @@ impl FactView for Live<'_> {
             ElfField::BindNow => nullable(e.bind_now, Fact::Bool),
             ElfField::GnuStackPresent => nullable(e.gnu_stack_present, Fact::Bool),
             ElfField::GnuStackExecutable => nullable(e.gnu_stack_executable, Fact::Bool),
+            ElfField::RwxSegment => nullable(e.rwx_segment, Fact::Bool),
             ElfField::Df1Noopen => Fact::Bool(e.df_1_noopen),
             ElfField::Textrel => Fact::Bool(e.textrel),
             ElfField::DtRelr => Fact::Bool(e.dt_relr),
@@ -865,7 +723,8 @@ impl FactView for Published<'_> {
         self.elf.is_some()
     }
 
-    fn macro_value(&self, name: &str) -> Result<Option<String>, Incomplete> {
+    fn macro_value(&self, name: &MacroName) -> Result<Option<String>, Incomplete> {
+        let name = name.as_str();
         let map = self.macros.ok_or_else(no_macros)?;
         let key = || Incomplete(format!("macros.{name}"));
         if let Some(filter) = &self.filter
@@ -951,27 +810,19 @@ impl<V: FactView + ?Sized> Reader<'_, V> {
         }
     }
 
+    /// The one place a macro is read. Text that is not a macro's name is undefined
+    /// before the view is asked, and a view takes a [`MacroName`], so no view answers for
+    /// such text and no read is keyed by it.
     fn macro_text(&mut self, name: &str) -> Result<Option<String>, Incomplete> {
-        let value = self.view.macro_value(name)?;
-        self.record(
-            ReadKey::Macro(name.to_owned()),
-            nullable(value.clone(), Fact::Text),
-        );
+        let Some(key) = MacroName::new(name) else {
+            return Ok(None);
+        };
+        let value = self.view.macro_value(&key)?;
+        self.record(ReadKey::Macro(key), nullable(value.clone(), Fact::Text));
         Ok(value)
     }
 
     /// The `c-int` rule, step for step, with every lookup a read.
-    ///
-    /// libc++ defines its modes as `(1 << n)`, so the macro arrives as that shift or as
-    /// the value it computes to, depending on whether the command line passed the named
-    /// constant or the header supplied its own default. It can also arrive as another
-    /// macro's name: a preprocessor dump prints replacement text rather than the expansion,
-    /// so a mode the headers set for themselves comes through as the constant it was
-    /// spelled with (measured on Darwin, `_LIBCPP_HARDENING_MODE` read back as the token
-    /// `_LIBCPP_HARDENING_MODE_DEFAULT`). The names it forwards to are in the same map, so
-    /// resolution is a lookup rather than a table kept in step with libc++. Bounded,
-    /// because a macro map is arbitrary input: `-D_LIBCPP_HARDENING_MODE=X -DX=X` is a
-    /// cycle a caller could hand in, and the bound is what makes it terminate.
     fn c_int(&mut self, name: &str) -> Result<Fact, Incomplete> {
         let Some(start) = self.macro_text(name)? else {
             return Ok(Fact::Undefined);
@@ -985,7 +836,8 @@ impl<V: FactView + ?Sized> Reader<'_, V> {
                 .trim()
                 .to_owned();
             if let Some((lhs, rhs)) = t.split_once("<<") {
-                let (Ok(base), Ok(shift)) = (lhs.trim().parse::<u32>(), rhs.trim().parse::<u32>())
+                let (Some(base), Some(shift)) =
+                    (decimal::<u32>(lhs.trim()), decimal::<u32>(rhs.trim()))
                 else {
                     return Ok(Fact::Undefined);
                 };
@@ -994,7 +846,7 @@ impl<V: FactView + ?Sized> Reader<'_, V> {
                 let shifted = base.checked_shl(shift).filter(|v| v >> shift == base);
                 return Ok(nullable(shifted, |v| Fact::Int(i64::from(v))));
             }
-            if let Ok(value) = t.parse::<u32>() {
+            if let Some(value) = decimal::<u32>(&t) {
                 return Ok(Fact::Int(i64::from(value)));
             }
             let Some(next) = self.macro_text(&t)? else {
@@ -1172,9 +1024,6 @@ const CXX_STDLIB_LADDER: [(&str, Option<&str>); 3] = [
 /// Whether a read of macro `name` in an evaluation of `p` can only have been made by a
 /// `c-int` term following a value to a macro name: `p` holds a `c-int` term, and no term
 /// names `name` itself (`macro`, `c-int`, or a rung of the `cxx-stdlib` ladder).
-///
-/// A re-derivation over a trimmed map reads an `Incomplete` at such a name as not
-/// replayable rather than as a contradiction; see `report::NotReplayable`.
 #[must_use]
 pub fn reached_only_by_following(p: &Predicate, name: &str) -> bool {
     let all = terms(p);
@@ -1240,8 +1089,8 @@ pub fn evaluate<V: FactView + ?Sized>(p: &Predicate, view: &V) -> Result<Evaluat
 }
 
 /// Hold a predicate to the rules evaluation cannot check: unique clause ids, none
-/// reserved, none empty, a reason on every clause, and every symbol it names on the watch
-/// list.
+/// reserved, none empty, a reason on every clause, every symbol it names on the watch
+/// list, and every macro it names a macro's name ([`MacroName`]).
 ///
 /// # Errors
 ///
@@ -1271,19 +1120,24 @@ pub fn validate(p: &Predicate) -> Result<(), String> {
         if let Conclusion::Present(LevelOf::Word(word)) = conclusion
             && word.is_empty()
         {
-            return Err(format!(
-                "clause {id:?} concludes an empty word level, which is no level"
-            ));
+            return Err(format!("clause {id:?} concludes an empty word level"));
         }
     }
     for term in terms(p) {
         if let Term::Symbol(name) = term
             && !WATCHED_SYMBOLS.contains(&name.as_str())
         {
-            return Err(format!(
-                "symbol {name:?} is not on elf::WATCHED_SYMBOLS, so no reading can say it is \
-                 absent"
-            ));
+            return Err(format!("symbol {name:?} is not on elf::WATCHED_SYMBOLS"));
+        }
+        let named = match term {
+            Term::Macro(name) => Some(("macro", name)),
+            Term::CInt(name) => Some(("c-int", name)),
+            Term::CxxStdlib | Term::Elf(_) | Term::Symbol(_) | Term::SymbolNames => None,
+        };
+        if let Some((kind, name)) = named
+            && MacroName::new(name).is_none()
+        {
+            return Err(format!("the {kind} term's {name:?} is not a macro's name"));
         }
     }
     Ok(())
@@ -1345,12 +1199,8 @@ pub fn render_observed(p: &Predicate, eval: &Evaluation) -> String {
             .find(|c| c.id == id)
             .map(|c| c.because.as_str()),
     };
-    let unrendered = demoted_level(p, eval).map(|term| {
-        format!(
-            "the level {} has no rendering, so the reading is indeterminate",
-            term_spelling(term)
-        )
-    });
+    let unrendered = demoted_level(p, eval)
+        .map(|term| format!("the level {} has no rendering", term_spelling(term)));
     let reason = match (because, unrendered) {
         (Some(because), Some(note)) => Some(format!("{because}; {note}")),
         (Some(because), None) => Some(because.to_owned()),
@@ -1422,10 +1272,6 @@ mod tests {
             .collect()
     }
 
-    /// `c-int` over libc++'s mode shapes: this holds it to the values those shapes compute
-    /// to, and to the rule that a shift that carries a bit past bit 31 is no value, where
-    /// `u32::checked_shl` alone would keep the bits that fit and read `(268435457 << 4)` as
-    /// 16, libc++'s `extensive`.
     #[test]
     fn c_int_follows_libcpp_mode_value() {
         let cases: &[(&[(&str, &str)], Fact)] = &[
@@ -1457,9 +1303,6 @@ mod tests {
         }
     }
 
-    /// The shift rule over its whole domain against an independent oracle: a shift
-    /// below 32 whose widened result fits in 32 bits is that result, and everything else
-    /// is no value.
     #[test]
     fn c_int_keeps_exactly_the_shifts_that_fit() {
         let bases: [u32; 15] = [
@@ -1505,10 +1348,6 @@ mod tests {
         assert_eq!(fed, 41 * bases.len());
     }
 
-    /// A macro read renders apart from every other value of the same macro: undefined,
-    /// defined empty, defined as `?`, as `<defined>` and ` undefined`, as the word
-    /// `undefined`, as text and as a number. The undefined form is the self-report's,
-    /// and holds no `=`, which every defined form follows the name with.
     #[test]
     fn no_two_macro_values_render_alike() {
         let values: &[Option<&str>] = &[
@@ -1551,11 +1390,6 @@ mod tests {
         assert_eq!(rendered.len(), values.len());
     }
 
-    /// The Published view, a publication's `macros` object, reads a macro to the same two
-    /// shapes and so renders it as Live does: an absent key is undefined, a string is that
-    /// text, `"?"` included. Any other value, `null` among them, is no reading of the
-    /// macro (`Incomplete`), never undefined: a `null` read as undefined would read
-    /// `absent` from a publication that says nothing.
     #[test]
     fn the_published_view_reads_a_macro_as_live_does() {
         let values: &[Option<&str>] = &[
@@ -1611,9 +1445,6 @@ mod tests {
         }
     }
 
-    /// The Rendering section's two examples of a sentence that two evaluations share, each
-    /// with reads that differ. Named there as a limit: a change that closes one fails this,
-    /// and the section's sentence goes with it.
     #[test]
     fn the_sentence_is_distinct_per_read_and_not_as_a_whole() {
         let sentence = |pairs: &[(&str, &str)], names: &[&str]| {
@@ -1640,23 +1471,359 @@ mod tests {
         assert_eq!(joined, "A=1 B undefined");
         assert_eq!(joined, split);
         assert_ne!(one, two);
+    }
 
-        let map = macros(&[("_LIBCPP_HARDENING_MODE", "B=1")]);
-        let view = Live {
-            macros: Some(&map),
+    /// Text that is a macro's name, and text that is not. The test's oracle restates the
+    /// rule, so a change to `MacroName::new` that moves one answer fails against it.
+    const NAMES: &[&str] = &[
+        "B",
+        "_",
+        "_x1",
+        "X9",
+        "a",
+        "M$",
+        "$",
+        "$1",
+        "__has_builtin",
+        // Outside ASCII: letters, and a character that is no letter and no space.
+        "\u{e9}",
+        "M\u{e9}",
+        "\u{ff21}",
+        "M\u{2014}B",
+        // Led by a digit outside ASCII (FULLWIDTH DIGIT ONE): only an ASCII one is refused.
+        "\u{ff11}B",
+        // A universal character name, as gcc's macro dump spells a letter outside ASCII.
+        "M\\U000000e9",
+        "\\u00e9t\\u00E9",
+        "\\u0041",
+    ];
+    const NOT_NAMES: &[&str] = &[
+        // A `-D` value holding `=`, and one holding a space: each spells a second read.
+        "B=1",
+        "a b",
+        // Suffixed and signed numbers, which no `u32` parse takes and a build does pass.
+        "3L",
+        "2UL",
+        "-1",
+        "0x4",
+        "1x",
+        // A function-like macro's key, and what `c-int` leaves of it.
+        "f(x)",
+        "f(x",
+        // Empty, blank, and punctuation a name never holds.
+        "",
+        " ",
+        " B",
+        "B ",
+        "A.B",
+        "A-B",
+        "A,B",
+        "A\tB",
+        "B undefined",
+        // A backslash that opens no universal character name, or one cut short.
+        "M\\",
+        "M\\x41",
+        "M\\u00e",
+        "M\\u00eg",
+        "M\\U0000e9",
+        "M\\U0000e9zz",
+        "\\",
+        // White space outside ASCII, first to last of the property's characters there.
+        "A\u{85}B",
+        "A\u{a0}B",
+        "A\u{1680}B",
+        "A\u{2000}B",
+        "A\u{200a}B",
+        "A\u{2028}B",
+        "A\u{2029}B",
+        "A\u{202f}B",
+        "A\u{205f}B",
+        "A\u{3000}B",
+    ];
+
+    /// The characters outside ASCII with the Unicode `White_Space` property, written out so
+    /// the oracle does not ask the standard library what a space is.
+    const WHITE_SPACE: &[char] = &[
+        '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+        '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
+        '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+    ];
+
+    #[test]
+    fn a_macro_name_is_an_identifier_with_dollar_and_no_space() {
+        let oracle = |text: &str| {
+            let word = |c: char| {
+                matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$')
+                    || (u32::from(c) > 0x7f && !WHITE_SPACE.contains(&c))
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let hex = |run: &[char]| run.iter().all(|c| "0123456789abcdefABCDEF".contains(*c));
+            let (mut at, mut rest) = (0usize, Vec::new());
+            while at < chars.len() {
+                if chars[at] != '\\' {
+                    rest.push(chars[at]);
+                    at += 1;
+                    continue;
+                }
+                let len = match chars.get(at + 1) {
+                    Some('u') => 4,
+                    Some('U') => 8,
+                    _ => return false,
+                };
+                match chars.get(at + 2..at + 2 + len) {
+                    Some(run) if hex(run) => at += 2 + len,
+                    _ => return false,
+                }
+            }
+            chars.first().is_some_and(|c| !c.is_ascii_digit()) && rest.into_iter().all(word)
+        };
+        let mut fed = 0usize;
+        for text in NAMES {
+            assert!(
+                oracle(text),
+                "{text:?} is in NAMES and the oracle refuses it"
+            );
+            let name = MacroName::new(text).unwrap_or_else(|| panic!("{text:?} is a name"));
+            assert_eq!(name.as_str(), *text);
+            assert_eq!(name.to_string(), *text);
+            fed += 1;
+        }
+        for text in NOT_NAMES {
+            assert!(
+                !oracle(text),
+                "{text:?} is in NOT_NAMES and the oracle takes it"
+            );
+            assert_eq!(MacroName::new(text), None, "{text:?}");
+            fed += 1;
+        }
+        // Every one-character text through U+3100, past the last white-space character.
+        let mut swept = 0usize;
+        for c in (0u32..0x3100).filter_map(char::from_u32) {
+            swept += 1;
+            let text = c.to_string();
+            assert_eq!(MacroName::new(&text).is_some(), oracle(&text), "{text:?}");
+            let second = format!("A{c}");
+            assert_eq!(
+                MacroName::new(&second).is_some(),
+                oracle(&second),
+                "{second:?}"
+            );
+            fed += 2;
+        }
+        assert_eq!(swept, 0x3100);
+        assert_eq!(fed, NAMES.len() + NOT_NAMES.len() + 2 * swept);
+    }
+
+    /// What one view made of `c-int M` and of `macro TEXT`, each with a reader of its own.
+    struct Seen {
+        view: &'static str,
+        followed: Result<Fact, Incomplete>,
+        followed_reads: Vec<Read>,
+        named: Result<Fact, Incomplete>,
+        named_reads: Vec<Read>,
+        /// `c-int TEXT`: the text as the term's own name, where `followed` meets it as a value.
+        started: Result<Fact, Incomplete>,
+        started_reads: Vec<Read>,
+    }
+
+    /// `c-int M` and `macro TEXT` through the three views a mode's value is read through:
+    /// Live, Published untrimmed, and Published trimmed to `filter`.
+    fn through_each_view(
+        map: &BTreeMap<String, String>,
+        filter: &[String],
+        text: &str,
+    ) -> Vec<Seen> {
+        let object = serde_json::to_value(map).expect("a string map serializes");
+        let live = Live {
+            macros: Some(map),
             elf: None,
         };
-        let mut reader = Reader {
-            view: &view,
-            reads: Vec::new(),
+        let whole = Published::new(Some(&object), None, None, None).expect("an object");
+        let trimmed = Published::new(Some(&object), Some(filter), None, None).expect("an object");
+        let views: [(&'static str, &dyn FactView); 3] = [
+            ("live", &live),
+            ("published", &whole),
+            ("published, filtered", &trimmed),
+        ];
+        views
+            .into_iter()
+            .map(|(view, facts)| {
+                let mut follow = Reader {
+                    view: facts,
+                    reads: Vec::new(),
+                };
+                let followed = follow.c_int("M");
+                let mut name = Reader {
+                    view: facts,
+                    reads: Vec::new(),
+                };
+                let named = name.term(&Term::Macro(text.to_owned()));
+                let mut start = Reader {
+                    view: facts,
+                    reads: Vec::new(),
+                };
+                let started = start.term(&Term::CInt(text.to_owned()));
+                Seen {
+                    view,
+                    followed,
+                    followed_reads: follow.reads,
+                    named,
+                    named_reads: name.reads,
+                    started,
+                    started_reads: start.reads,
+                }
+            })
+            .collect()
+    }
+
+    /// What `c-int` makes of a value before it looks anything up.
+    fn stripped(text: &str) -> &str {
+        text.trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim()
+    }
+
+    #[test]
+    fn no_macro_read_is_keyed_by_text_that_is_not_a_name() {
+        let (mut fed, mut held, mut become_names) = (0usize, 0usize, BTreeSet::new());
+        for text in NOT_NAMES {
+            for (planted, kept) in [(false, false), (true, false), (true, true), (false, true)] {
+                let mut map = macros(&[("M", text)]);
+                if planted {
+                    map.insert((*text).to_owned(), "4".to_owned());
+                    map.insert(stripped(text).to_owned(), "4".to_owned());
+                }
+                let mut filter = vec!["M".to_owned()];
+                if kept {
+                    filter.push((*text).to_owned());
+                    filter.push(stripped(text).to_owned());
+                }
+                for seen in through_each_view(&map, &filter, text) {
+                    let at = format!("{text:?} planted={planted} kept={kept}, {}", seen.view);
+                    fed += 1;
+                    assert_eq!(seen.named, Ok(Fact::Undefined), "macro {at}");
+                    assert!(
+                        seen.named_reads.is_empty(),
+                        "macro {at}: {:?}",
+                        seen.named_reads
+                    );
+                    assert_eq!(seen.started, Ok(Fact::Undefined), "c-int {at}");
+                    assert!(seen.started_reads.is_empty(), "c-int {at}");
+                    if MacroName::new(stripped(text)).is_some() {
+                        // Trimmed, the text is the name `B`, and that name is what is read:
+                        // found where the map holds it, and outside the filter a stop at it.
+                        become_names.insert(*text);
+                        let keys: Vec<String> = seen
+                            .followed_reads
+                            .iter()
+                            .map(|r| r.key.published_key())
+                            .collect();
+                        let stop = seen.view == "published, filtered" && !kept;
+                        let want = match (stop, planted) {
+                            (true, _) => Err(Incomplete("macros.B".to_owned())),
+                            (false, true) => Ok(Fact::Int(4)),
+                            (false, false) => Ok(Fact::Undefined),
+                        };
+                        assert_eq!(seen.followed, want, "c-int over {at}");
+                        let read: &[&str] = if stop {
+                            &["macros.M"]
+                        } else {
+                            &["macros.M", "macros.B"]
+                        };
+                        assert_eq!(keys, read, "{at}");
+                        continue;
+                    }
+                    assert_eq!(seen.followed, Ok(Fact::Undefined), "c-int over {at}");
+                    let [read] = seen.followed_reads.as_slice() else {
+                        panic!("c-int over {at}: {:?}", seen.followed_reads);
+                    };
+                    assert_eq!(read.key.published_key(), "macros.M", "{at}");
+                    assert_eq!(read.value, Fact::Text((*text).to_owned()), "{at}");
+                    held += 1;
+                }
+            }
+        }
+        assert_eq!(fed, NOT_NAMES.len() * 4 * 3);
+        assert_eq!(become_names, BTreeSet::from([" B", "B "]));
+        assert_eq!(held, (NOT_NAMES.len() - become_names.len()) * 4 * 3);
+    }
+
+    #[test]
+    fn a_name_is_still_followed_and_read() {
+        let mut fed = 0usize;
+        for text in NAMES {
+            for kept in [false, true] {
+                let map = macros(&[("M", text), (text, "(1 << 2)")]);
+                let mut filter = vec!["M".to_owned()];
+                if kept {
+                    filter.push((*text).to_owned());
+                }
+                for seen in through_each_view(&map, &filter, text) {
+                    let at = format!("{text:?} kept={kept}, {}", seen.view);
+                    let keys = |reads: &[Read]| -> Vec<String> {
+                        reads.iter().map(|r| r.key.published_key()).collect()
+                    };
+                    if seen.view == "published, filtered" && !kept {
+                        let key = Incomplete(format!("macros.{text}"));
+                        assert_eq!(seen.followed, Err(key.clone()), "c-int over {at}");
+                        assert_eq!(keys(&seen.followed_reads), ["macros.M"], "{at}");
+                        assert_eq!(seen.named, Err(key), "macro {at}");
+                        assert!(seen.named_reads.is_empty(), "{at}");
+                    } else {
+                        assert_eq!(seen.followed, Ok(Fact::Int(4)), "c-int over {at}");
+                        assert_eq!(
+                            keys(&seen.followed_reads),
+                            ["macros.M".to_owned(), format!("macros.{text}")],
+                            "{at}"
+                        );
+                        let value = Fact::Text("(1 << 2)".to_owned());
+                        assert_eq!(seen.named, Ok(value), "macro {at}");
+                        assert_eq!(keys(&seen.named_reads), [format!("macros.{text}")], "{at}");
+                    }
+                    fed += 1;
+                }
+            }
+        }
+        assert_eq!(fed, NAMES.len() * 2 * 3);
+    }
+
+    #[test]
+    fn validate_refuses_a_term_naming_text_that_is_not_a_name() {
+        let over = |when: Term, level: Term| Predicate {
+            tables: Vec::new(),
+            clauses: vec![Clause {
+                id: "defined".to_owned(),
+                when: Cond::Defined(when),
+                then: Conclusion::Present(LevelOf::Value(level)),
+                because: "the macro is defined".to_owned(),
+            }],
+            otherwise: Conclusion::Indeterminate,
         };
-        assert_eq!(reader.c_int("_LIBCPP_HARDENING_MODE"), Ok(Fact::Undefined));
-        let followed = reader.reads.last().expect("the followed name is a read");
-        assert_eq!(followed.key, ReadKey::Macro("B=1".to_owned()));
-        let (other, other_reads) = sentence(&[("B", "1 undefined")], &["B"]);
-        assert_eq!(render_read(followed), "B=1 undefined");
-        assert_eq!(render_read(followed), other);
-        assert_ne!(std::slice::from_ref(followed), other_reads.as_slice());
+        let name = || Term::Macro("M".to_owned());
+        assert_eq!(validate(&over(name(), name())), Ok(()));
+        assert_eq!(validate(&over(Term::CInt("M$".to_owned()), name())), Ok(()));
+        let mut fed = 0usize;
+        for text in NOT_NAMES {
+            for (label, p) in [
+                ("macro, when", over(Term::Macro((*text).to_owned()), name())),
+                ("c-int, when", over(Term::CInt((*text).to_owned()), name())),
+                (
+                    "macro, level",
+                    over(name(), Term::Macro((*text).to_owned())),
+                ),
+                ("c-int, level", over(name(), Term::CInt((*text).to_owned()))),
+            ] {
+                let refused = validate(&p).expect_err("a term naming no macro validated");
+                assert!(
+                    refused.contains("is not a macro's name")
+                        && refused.contains(&format!("the {} term's {text:?}", &label[..5])),
+                    "{label} {text:?}: {refused}"
+                );
+                fed += 1;
+            }
+        }
+        assert_eq!(fed, NOT_NAMES.len() * 4);
     }
 
     #[test]

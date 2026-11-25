@@ -1,6 +1,6 @@
 {
-  "language": "chard-predicate/1",
-  "description": "Conformance vectors for the predicate language named by `language`. Each vector evaluates `predicate` over the Published view of `facts` (`macros` and `elf` null for a source the reading says was unavailable, `macros_filter` the list a trimmed macro map was cut to, `symbols_filter` the watch list the publication's reader looked for symbols from, absent when the publication carries none) and expects either the clause, outcome, level and, where given, the observed sentence, or `incomplete:<key>`. A publication carries `elf.truncations` explicitly, `[]` included, since its absence is `incomplete:elf.truncations`. A vector with `\"refused_by_validate\": true` holds a predicate `validate` refuses, and its expected result is what the evaluator does with it regardless. tests/predicate_language.rs runs every vector and pins this file's sha256 per language version, so an expected result changes only with a new version once a publication has carried one; before the first publication the pin moves under the same name, and that test's note says what changed.",
+  "language": "chard-predicate/2",
+  "description": "Conformance vectors for the predicate language named by `language`. Each vector evaluates `predicate` over the Published view of `facts` (`macros` and `elf` null for a source the reading says was unavailable, `macros_filter` the list a trimmed macro map was cut to, `symbols_filter` the watch list the publication's reader looked for symbols from, absent when the publication carries none) and expects either the clause, outcome, level and, where given, the observed sentence, or `incomplete:<key>`. A publication carries `elf.truncations` explicitly, `[]` included, since its absence is `incomplete:elf.truncations`. A vector with `\"refused_by_validate\": true` holds a predicate `validate` refuses, and its expected result is what the evaluator does with it regardless. tests/predicate_language.rs runs every vector. The vectors a version was published with are the part of its meaning a reader can check: a change to an expected result is a new version of the language once a release has carried it.",
   "vectors": [
     {
       "name": "ssp-first-match-wins",
@@ -1334,7 +1334,7 @@
         "clause": "relro",
         "outcome": "indeterminate",
         "level": null,
-        "observed": "unread_tables=[] gnu_relro=true relro=null (PT_GNU_RELRO is present; the level elf relro has no rendering, so the reading is indeterminate)"
+        "observed": "unread_tables=[] gnu_relro=true relro=null (PT_GNU_RELRO is present; the level elf relro has no rendering)"
       }
     },
     {
@@ -1697,7 +1697,7 @@
         "clause": "@otherwise",
         "outcome": "indeterminate",
         "level": null,
-        "observed": "X undefined (the level macro X has no rendering, so the reading is indeterminate)"
+        "observed": "X undefined (the level macro X has no rendering)"
       }
     },
     {
@@ -3259,6 +3259,2029 @@
         "outcome": "indeterminate",
         "level": null,
         "observed": "_FORTIFY_SOURCE=-9223372036854775808 (the text has no integer reading, so the level requested cannot be read from it)"
+      }
+    },
+    {
+      "name": "c-int-text-holding-an-equals-sign-is-not-followed",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "B=1"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=B=1 (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-text-that-is-no-name-is-undefined-under-a-filter",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "B=1"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=B=1 (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-text-holding-a-space-is-not-followed",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "a b"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=a b (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-text-that-is-no-name-is-not-looked-up-in-the-map",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "B=1",
+          "B=1": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=B=1 (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-suffixed-number-is-not-followed",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "3L",
+          "3L": "4"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=3L (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-follows-a-name-holding-a-dollar",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "M$",
+          "M$": "(1 << 2)"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "four",
+        "outcome": "present",
+        "level": "4",
+        "observed": "M=M$ M$=(1 << 2) (M reads 4)"
+      }
+    },
+    {
+      "name": "c-int-name-holding-a-dollar-outside-the-filter-is-incomplete",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "M$",
+          "M$": "(1 << 2)"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": "incomplete:macros.M$"
+    },
+    {
+      "name": "c-int-follows-a-name-outside-ascii",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "Mé",
+          "Mé": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "four",
+        "outcome": "present",
+        "level": "4",
+        "observed": "M=Mé Mé=4 (M reads 4)"
+      }
+    },
+    {
+      "name": "macro-term-naming-no-macro-is-undefined-without-a-read",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "missing",
+            "when": {
+              "missing": {
+                "macro": "B=1"
+              }
+            },
+            "then": "absent",
+            "because": "the term names no macro"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "B=1": "1"
+        },
+        "elf": null,
+        "macros_filter": []
+      },
+      "expect": {
+        "clause": "missing",
+        "outcome": "absent",
+        "level": null,
+        "observed": "(the term names no macro)"
+      },
+      "refused_by_validate": true
+    },
+    {
+      "name": "c-int-text-holding-a-no-break-space-is-not-followed",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "A B",
+          "A B": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=A B (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-follows-a-name-spelt-as-a-universal-character-name",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "M\\U000000e9",
+          "M\\U000000e9": "(1 << 2)"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "four",
+        "outcome": "present",
+        "level": "4",
+        "observed": "M=M\\U000000e9 M\\U000000e9=(1 << 2) (M reads 4)"
+      }
+    },
+    {
+      "name": "c-int-text-holding-a-backslash-is-not-followed",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "M\\x41",
+          "M\\x41": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=M\\x41 (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-short-universal-character-name-is-not-followed",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "M\\U0000e9",
+          "M\\U0000e9": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=M\\U0000e9 (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-looks-a-name-up-as-it-is-spelt",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "Mé",
+          "M\\U000000e9": "4"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=Mé Mé undefined (M has no integer value)"
+      }
+    },
+    {
+      "name": "integer-reading-refuses-a-leading-zero",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "010"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-reading",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "M=010 (M has no integer reading)"
+      }
+    },
+    {
+      "name": "integer-reading-refuses-a-leading-zero-c-refuses",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "08"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-reading",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "M=08 (M has no integer reading)"
+      }
+    },
+    {
+      "name": "integer-reading-refuses-a-signed-leading-zero",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "-07"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-reading",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "M=-07 (M has no integer reading)"
+      }
+    },
+    {
+      "name": "integer-reading-refuses-a-run-of-zeros",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "00"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-reading",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "M=00 (M has no integer reading)"
+      }
+    },
+    {
+      "name": "integer-reading-takes-a-lone-zero",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": " +0 "
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "zero",
+        "outcome": "present",
+        "level": "0",
+        "observed": "M= +0  (M reads 0)"
+      }
+    },
+    {
+      "name": "c-int-leading-zero-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "fourteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                14
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 14"
+          },
+          {
+            "id": "sixteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                16
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 16"
+          },
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "016",
+          "016": "14"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=016 (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-shift-side-with-a-leading-zero-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "fourteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                14
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 14"
+          },
+          {
+            "id": "sixteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                16
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 16"
+          },
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "(01 << 2)"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=(01 << 2) (M has no integer value)"
+      }
+    },
+    {
+      "name": "c-int-shift-count-with-a-leading-zero-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "fourteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                14
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 14"
+          },
+          {
+            "id": "sixteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                16
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 16"
+          },
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "1 << 02"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=1 << 02 (M has no integer value)"
+      }
+    },
+    {
+      "name": "value-level-of-leading-zero-text-renders-the-text",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "set",
+            "when": {
+              "defined": {
+                "macro": "M"
+              }
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M is defined"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "010"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "set",
+        "outcome": "present",
+        "level": "010",
+        "observed": "M=010 (M is defined)"
+      }
+    },
+    {
+      "name": "integer-reading-refuses-a-plus-signed-leading-zero",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "+07"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "no-reading",
+        "outcome": "indeterminate",
+        "level": null,
+        "observed": "M=+07 (M has no integer reading)"
+      }
+    },
+    {
+      "name": "integer-reading-takes-a-minus-signed-lone-zero",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "ten",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                10
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 10"
+          },
+          {
+            "id": "eight",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                8
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 8"
+          },
+          {
+            "id": "zero",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                0
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads 0"
+          },
+          {
+            "id": "seven",
+            "when": {
+              "int": [
+                {
+                  "macro": "M"
+                },
+                "eq",
+                -7
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "macro": "M"
+                }
+              }
+            },
+            "because": "M reads -7"
+          },
+          {
+            "id": "no-reading",
+            "when": {
+              "all": [
+                {
+                  "defined": {
+                    "macro": "M"
+                  }
+                },
+                {
+                  "none-of": [
+                    {
+                      "int": [
+                        {
+                          "macro": "M"
+                        },
+                        "gt",
+                        -9223372036854775808
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "then": "indeterminate",
+            "because": "M has no integer reading"
+          }
+        ],
+        "otherwise": "absent"
+      },
+      "facts": {
+        "macros": {
+          "M": "-0"
+        },
+        "elf": null
+      },
+      "expect": {
+        "clause": "zero",
+        "outcome": "present",
+        "level": "0",
+        "observed": "M=-0 (M reads 0)"
+      }
+    },
+    {
+      "name": "c-int-plus-signed-shift-side-with-a-leading-zero-is-undefined",
+      "predicate": {
+        "tables": [],
+        "clauses": [
+          {
+            "id": "fourteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                14
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 14"
+          },
+          {
+            "id": "sixteen",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                16
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 16"
+          },
+          {
+            "id": "four",
+            "when": {
+              "int": [
+                {
+                  "c-int": "M"
+                },
+                "eq",
+                4
+              ]
+            },
+            "then": {
+              "present": {
+                "value": {
+                  "c-int": "M"
+                }
+              }
+            },
+            "because": "M reads 4"
+          },
+          {
+            "id": "no-value",
+            "when": {
+              "missing": {
+                "c-int": "M"
+              }
+            },
+            "then": "absent",
+            "because": "M has no integer value"
+          }
+        ],
+        "otherwise": "indeterminate"
+      },
+      "facts": {
+        "macros": {
+          "M": "+01 << 2"
+        },
+        "elf": null,
+        "macros_filter": [
+          "M"
+        ]
+      },
+      "expect": {
+        "clause": "no-value",
+        "outcome": "absent",
+        "level": null,
+        "observed": "M=+01 << 2 (M has no integer value)"
       }
     }
   ]

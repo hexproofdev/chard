@@ -2,26 +2,21 @@
 
 # 🥬 chard
 
-chard measures which hardening protections a C and C++ toolchain applies: it builds small probe
-programs with your gcc or clang, runs them, and reads the binaries it just built. It measures hosted
-userspace builds against a libc, not freestanding targets such as the Linux kernel.
+chard measures which hardening protections a C and C++ toolchain applies. It builds small probe
+programs with your gcc or clang, runs them, and reads the binaries it built. It measures hosted
+userspace builds against a libc, not freestanding targets such as a kernel.
 
 ## Install
 
-Building needs Rust, and the first build needs the network to fetch crates.
-
 ```sh
-make build     # leaves the binary at target/release/chard
-make doctor    # says what else is missing
-make musl      # a static binary, probes embedded, for an image with another libc; it needs
-               # rustup target add "$(uname -m)-unknown-linux-musl"
+make build     # target/release/chard; the first build fetches crates
+make doctor    # what else this host lacks
+make musl      # a static binary for an image with another libc
 ```
 
 ## Run
 
-Some probes crash on purpose. On Linux each probe that dies by its own crash makes itself
-non-dumpable first, so it leaves no core file. Off Linux, or where that call fails, a crash
-leaves a core file, so run chard under `ulimit -c 0` or with a `core_pattern` you control.
+Some probes crash on purpose, so turn core files off:
 
 ```sh
 ulimit -c 0
@@ -29,121 +24,85 @@ chard measure --execution host    # what a plain `cc foo.c` gives you
 chard table chard-cc-bare.json    # a row per protection
 ```
 
-`measure` writes `chard-<cc>-<profile>.json`, or the file `-o` names, and ends on a line naming its
-exit status, the file and the command to run next; `--cc` names the compiler. `bare` is the
-compiler's own defaults, `bare-optimized` adds only `-O2`, `openssf-tldr` builds with the TL;DR
-flags of the [OpenSSF guide][openssf], and `explicit` measures the `--flags`, `--cxxflags` and
-`--ldflags` you give.
+`measure` writes `chard-<cc>-<profile>.json`, or the file `-o` names; `--cc` names the compiler.
+The profiles: `bare` is the compiler's defaults, `bare-optimized` adds `-O2`, `openssf-tldr`
+uses the TL;DR flags of the [OpenSSF guide][openssf], and `explicit` measures the `--flags`,
+`--cxxflags` and `--ldflags` you give. The compiler runs in a cleared environment; `--env
+NAME=VALUE` passes a variable through.
 
-The compiler runs with a cleared environment, so a toolchain configured through environment
-variables (a Nix cc-wrapper's `NIX_*`, `GCC_SPECS`) is measured as it behaves without them. A
-protection only those variables add reads `off`, and the report gives no sign that one was needed.
-`--env NAME=VALUE` passes a variable to every toolchain invocation of the run;
-[THREAT_MODEL.md](THREAT_MODEL.md) has the measurement and the rules.
+In the table, `--` is off and `?` withheld; the letter says what a verdict rests on (`x` a run,
+`a` the artifact, `d` a diagnostic, `m` a macro). Without `--execution host` or `vm`, checks
+that depend on kernel policy are withheld.
 
-An excerpt of `chard table tests/fixtures/sample-report.json`: `bare` with GCC 16.2.0 and GNU ld
-2.44 as the gcc:16 container image ships them, on a system with no `os-release`:
+## Use it in CI
 
-```text
-protection                                        unknown unknown gcc 16.2.0 bare cc
-------------------------------------------------------------------------------------
-auto-var-init x                                   --
-cet a                                             --
-fortify x                                         --
--fstrict-flex-arrays                              ?
-implicit-decl-is-error d                          error
-noexecstack a                                     on
-pie a                                             --
-relro a                                           partial
-stack-clash x                                     --
-stack-protector a                                 --
--Wformat d                                        --
+chard has no hardening gate of its own; which checks a build must have is your decision. Read
+the digest:
+
+```sh
+chard digest mine.json > digest.json
+jq -r '.checks[] | select(.verdict == "off" and .polarity == "harden") | .check' digest.json
+jq -r '.reasons[] | [.check, .standing, .rule // "-"] | @tsv' digest.json
 ```
 
-`--` is off and `?` withheld; the full table prints each reason (here, an unoptimized build gives
-the probe no object size to read) and defines levels such as `partial`. The letter is what the
-verdict rests on: `x` the probe run and the mitigation seen to act or not, `a` the compiled
-artifact, `d` the compiler's diagnostic, `m` a macro, the compiler's own claim. A row with no
-check that reads `on`, `off` or `partial` carries no letter (`-fstrict-flex-arrays` here).
+These list the protections measured absent and the checks not measured, with the rule that
+withheld each. For a `weaken` check `off` is the protected state, and a script that looks only
+for `off` lets `partial` and withheld checks through.
 
-`--fail-on-missing` exits 1 when a check this system could reach went unattempted or chard withheld
-its answer (a C++ check with no C++ driver among them): it says whether every check ran, not whether
-the build is hardened. Without `--execution`, chard withholds the checks that depend on kernel
-policy (`noexecstack-enforced`, `shadow-stack-enforced`), since nothing it reads tells a system
-that owns its kernel from a container it does not recognise; `--execution host` or `vm` lets them
-be measured.
-
-chard has no hardening gate of its own; which checks a build must have is the reader's decision.
-A list of the `off` verdicts is not such a gate. For a `weaken` check, such as `rpath-absent`,
-`off` is the protected state. A `partial` or withheld verdict is neither `on` nor `off`.
-[QUICKSTART.md](QUICKSTART.md#use-it-in-ci) shows how to list the protections measured absent, the
-`weaken` checks and the checks not measured.
+`--fail-on-missing` asks whether the run was complete, not whether the build is hardened. On
+x86_64, x86 and aarch64 some check is one chard does not read, so pass `--allow
+no-check-on-target`; stderr and `coverage.gate.excused` name what it excused.
 
 ## Exit status
 
 | Status | Meaning |
 |---|---|
-| `0` | The document is written; from `detect`, every reading it replayed agrees. |
-| `1` | A gate tripped and the document is written: under `measure --fail-on-missing` a check did not settle, or under `detect` a reading disagrees with its replay. |
-| `2` | chard refused the invocation or failed, a usage error among them, or a `--execution` was contradicted by what chard observed; stdout carries a JSON error envelope. |
-| `3` | `measure` built a report that contradicts itself; it is written only to `<file>.contradicted`. |
+| `0` | The document is written, and any gate passed. |
+| `1` | A gate failed and the document is written. |
+| `2` | chard refused the invocation or failed; stdout carries a JSON error envelope. |
+| `3` | The report contradicts itself; it is written only to `<file>.contradicted`. |
+| `4` | `--fail-on-missing` failed only on checks this machine or target cannot answer. |
 
-A panic exits 101. What each command writes to stdout and stderr and the envelope's codes are in
-`chard --help` and [DESIGN.md](DESIGN.md#the-command-line-contract).
+Output is JSON except `table`; progress goes to stderr. A document other than `elf`'s carries
+`chard_schema`, its format's major version; ignore unknown fields.
+`chard --help` states the full contract.
 
 ## Platforms
 
-| Platform | Tier |
-|---|---|
-| Linux x86_64, glibc | supported |
-| Linux x86_64, musl | measured |
-| Linux i386, glibc | measured |
-| Linux aarch64, glibc | measured |
-| Linux aarch64, musl | measured |
-| Linux arm, glibc | measured |
-| FreeBSD amd64 | measured |
-| OpenBSD amd64 | measured |
-| OpenBSD arm64 | measured |
-| macOS arm64 | builds |
-
-[SUPPORT.md](SUPPORT.md) defines the tiers and lists the compiler versions held on each.
+Supported: Linux x86_64 with glibc, where CI builds and tests chard. Measured, where a check
+the platform cannot carry is withheld by rule: Linux x86_64 and aarch64 with musl, Linux i386,
+aarch64 and arm with glibc, FreeBSD amd64, OpenBSD amd64 and arm64. Builds: macOS arm64, where
+no ELF artifact is read.
 
 ## Why measure
 
-Hardening flags do not fix bugs; each adds a step an exploit has to route around. A stack canary
-turns a contiguous overwrite of the return address into an abort, and full RELRO makes the tables
-the loader fills in read-only before the program's own code runs.
+Hardening flags do not fix bugs; they make some exploits fail. A stack canary turns a contiguous
+overwrite of the return address into an abort, and full RELRO makes the tables the loader fills
+in read-only before the program's own code runs.
 
-Which of them a toolchain applies is not in its documentation. Upstream gcc leaves most of them off
-unless a distribution configured or patched it to (the sample's gcc was configured with none);
-upstream clang adds PIE on linux-gnu, little else.[^defaults] No ordinary build log shows clang's
-auto-loaded `<triple>.cfg`.
+Which of them a toolchain applies is not in its documentation. Upstream gcc leaves most of them
+off unless a distribution configured or patched it to; upstream clang adds PIE on linux-gnu,
+little else.[^defaults] No ordinary build log shows clang's auto-loaded `<triple>.cfg`.
 
-A command line is not the record either. `-D_FORTIFY_SOURCE=3` falls back to level 2 with an older
+The command line does not say either. `-D_FORTIFY_SOURCE=3` falls back to level 2 with an older
 glibc or compiler, silently before glibc 2.33, and without optimization gives no checks at
 all.[^fortify] A linked x86 program keeps its CET marking only where every input object carries it,
 so one unmarked startup object drops it, and by default the linker says nothing.[^cet] GCC 14's
 `-fhardened` skips any option already on the command line, so a weaker one stays in
-effect.[^hardened] Nor is a clean build: enabling `pac-ret` by default misbuilt libunwind, whose
-build completed and whose tests crashed, and the reporter could find no string in the build logs
-that told a misbuilt libunwind from a correct one.[^pacret]
+effect.[^hardened] A clean build does not say either: enabling `pac-ret` by default misbuilt
+libunwind, whose build completed and whose tests crashed, and the reporter could find no string in
+the build logs that told a misbuilt libunwind from a correct one.[^pacret]
 
-So chard reads what was built. Every check it attempts is built three ways: the flag forced on,
-forced off, and as configured; a rule that stops one first (an aarch64 flag on x86_64, no C++
-driver) gives its reason. A verdict is trusted only when the forced builds differ as expected,
-judged on what each build produced rather than on the flag being accepted. A probe that cannot tell
-them apart reads `probe-invalid`, never `off`; a mechanism the toolchain or target lacks is
-`unsupported`, and a flag the artifact cannot carry is `not-applicable`. A verdict describes the
-artifact, not a running process: where the CPU, the kernel or the libc also has to act, the report
-says what else has to hold. A report shows whether a toolchain applies a flag and catches the
-regression where one quietly stops arriving; it finds no miscompile and measures no cost. chard
-measures a toolchain, not your build: a Makefile, a vendored dependency or a submodule can still
-weaken the result.
+So chard reads what was built. Every check is built three ways: the flag forced on, forced off,
+and as configured. A verdict is trusted only when the forced builds differ as expected, judged on
+what each build produced rather than on the flag being accepted; a probe that cannot tell them
+apart reads `probe-invalid`, never `off`. A verdict describes the artifact, not a running process.
+chard finds no miscompile and measures no cost. It measures a toolchain, not your build: a
+Makefile, a vendored dependency or a submodule can still weaken the result.
 
 ## Further reading
 
-[QUICKSTART.md](QUICKSTART.md) goes from a checkout to a first reading: your own flags, every
-verdict, CI, and where each answer is documented. [DESIGN.md](DESIGN.md) has the mechanism,
+[DESIGN.md](DESIGN.md) has the mechanism,
 [THREAT_MODEL.md](THREAT_MODEL.md) the trust decision, [CHANGELOG.md](CHANGELOG.md) the changes to
 the output contract. [CONTRIBUTING.md](CONTRIBUTING.md) says where bugs and changes go.
 [jvoisin/compiler-flags-distro](https://github.com/jvoisin/compiler-flags-distro) is a curated

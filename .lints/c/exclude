@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Paths the house C and C++ lint gate does not read: one path prefix per line, then the reason.
+probes/ measurement code: a lint finding there is often what a check reads; a fix removes it
+tests/fault_classes.c provokes a fault on purpose for tests/fault_report.rs; a fix removes it

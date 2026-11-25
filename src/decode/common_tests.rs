@@ -15,14 +15,6 @@ fn cut_around(text: &str, needles: &[&str], keep: usize) -> String {
     )
 }
 
-/// A marker line is never read as a field, whatever it carries.
-///
-/// The self-report is spliced into `variant.macros` wholesale and verdicts are taken
-/// from it, so anything parsed out of it is load-bearing. The markers carry no `=` and
-/// would be skipped by the field split alone, but a line spelt like a marker with a value
-/// (`CHARD-REPORT-V2=1`) would be parsed as a macro named `CHARD-REPORT-V2` and
-/// injected into the map a verdict reads. The guard is what makes the marker namespace
-/// reserved rather than accidentally free.
 #[test]
 fn a_marker_line_is_never_parsed_as_a_macro() {
     let parsed = parse_self_report(
@@ -49,14 +41,6 @@ fn a_marker_line_is_never_parsed_as_a_macro() {
     );
 }
 
-/// A `CHARD-REPORT-V2` report spells an undefined macro `name undefined`, so its `name=?`
-/// is a macro defined as `?`, and a `CHARD-REPORT-V1` report keeps the reading it was
-/// written for, `name=?` undefined.
-///
-/// A V1 report writes `name=?` for both, so under it `-D__EXCEPTIONS=?` reads as undefined
-/// and the check `off`. The value of a defined field is read whatever it holds: `?`, an
-/// empty replacement list, a value holding `=`, the word `undefined`, and the end marker's
-/// own spelling, which does not end the report inside its field.
 #[test]
 fn the_current_report_tells_a_macro_defined_as_a_question_mark_from_an_undefined_one() {
     let current = "CHARD-REPORT-V2\n\
@@ -111,11 +95,6 @@ fn the_current_report_tells_a_macro_defined_as_a_question_mark_from_an_undefined
     assert!(region.ends_with("\nCHARD-REPORT-END"), "{region}");
 }
 
-/// A text this reader cannot read whole is no report, never a report missing a field: a
-/// field dropped would read as a macro undefined, the `off` the V2 spelling exists to stop.
-/// Under V2 that is any line that is neither `name=value` nor `name undefined`, a name
-/// holding whitespace or none, a name given twice, and a second marker; under V1 a second
-/// marker. A marker of a version this reader has no dialect for starts no report.
 #[test]
 fn a_report_the_reader_cannot_read_whole_is_no_report() {
     let v2 = |body: &str| format!("CHARD-REPORT-V2\n__SSP__=1\n{body}\nCHARD-REPORT-END\n");
@@ -146,7 +125,7 @@ fn a_report_the_reader_cannot_read_whole_is_no_report() {
         self_report_malformed(stray),
         "a closed report with a second marker"
     );
-    // A V2 report is read only closed and without a blank line; a V1 one as it was.
+    // A V2 report is read only closed and without a blank line; a V1 one either way.
     let open = "CHARD-REPORT-V2\n__SSP__=1\n__PIE__ undefined\n";
     assert_eq!(self_report_fields(open), None, "no end line");
     assert!(
@@ -192,7 +171,6 @@ fn a_report_the_reader_cannot_read_whole_is_no_report() {
         self_report_account(endx).and_then(|m| m.get("__PIE__").cloned()),
         Some("2".to_owned())
     );
-    // The V1 reading of a line that is not a field stays what it was.
     let v1 = "CHARD-REPORT-V1\nnoise\nCHARD-REPORT-V2=1\n__SSP__=1\nCHARD-REPORT-END\n";
     assert_eq!(
         self_report_account(v1).map(|m| m.len()),
@@ -201,15 +179,6 @@ fn a_report_the_reader_cannot_read_whole_is_no_report() {
     );
 }
 
-/// A quoted stream keeps its end, and says how much of its start is gone.
-///
-/// The head-cut this replaced kept the path and lost the diagnostic, silently: with a
-/// long work directory the `observed` for `implicit-function-declaration-is-error`
-/// ended inside the second path and the words `error: implicit declaration` never
-/// appeared, in a control arm whose detail was the only evidence for it. Each property
-/// is pinned separately, because a helper that kept the tail without the marker would
-/// still read as the whole stream, and one that marked without counting in characters
-/// would split gcc's U+2018 quote.
 #[test]
 fn a_cut_stream_keeps_its_informative_end_and_says_how_much_is_gone() {
     // Under the budget: verbatim, no marker.
@@ -244,14 +213,6 @@ fn a_cut_stream_keeps_its_informative_end_and_says_how_much_is_gone() {
     );
 }
 
-/// The cut around a matched line marks each side it removed, and a stream with no
-/// match keeps its end.
-///
-/// Each shape the cut can take is pinned on its own: an under-budget stream is
-/// verbatim; a match with lines removed on both sides carries two counts that add up
-/// to what is gone; a matched line longer than the whole budget is cut inside itself
-/// around the needle rather than dropped; and a stream carrying no needle, the shape
-/// of `absent`, is the tail cut with its single leading count.
 #[test]
 fn a_cut_around_a_matched_line_marks_each_side_and_a_stream_with_no_match_keeps_its_end() {
     let needles = &["the observable"];
@@ -295,15 +256,6 @@ fn a_cut_around_a_matched_line_marks_each_side_and_a_stream_with_no_match_keeps_
     );
 }
 
-/// What `self_report_account` takes as a report, over every sequence of up to four lines
-/// drawn from the two markers, the end marker, a defined field, a `?` field, an undefined
-/// field in V2's spelling, junk and an empty line, against an oracle written apart from it:
-/// the first marker line of either version, an end marker line after it, and a field
-/// strictly between them. Under V1 a field is a line holding `=`, the rest skipped; under
-/// V2 every line between them is `a=1`, `b=?` or `c undefined`, each name once, with no
-/// blank line, or there is no report. Under either, a second marker between them is no
-/// report. The map is the defined names between them: `a`, and `b` under V2 only, where `?`
-/// is a value. So a report whose fields all read undefined is an empty account.
 #[test]
 fn a_report_is_the_markers_with_a_field_between_them() {
     const TOKENS: [&str; 8] = [

@@ -1,49 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! The readers of what a compiler driver and a linker print about themselves, over arbitrary
-//! text: the two `-###` listing readers (`compile_inputs::parse`, the compile commands' header
-//! directories, macros, removals, targets and kin, and `link_inputs::parse`, the link's
-//! inputs), the linker-selection reader of the same listing (`toolchain::link_line`), the
-//! `-v` reader (`toolchain::parse_verbose`, the configure line and the configuration and specs
-//! files), the `--version` banner and `.comment` readers (`toolchain::linker_kind`,
-//! `toolchain::linker_line`), the `-fhardened` dump's diagnostic (`toolchain::
-//! fhardened_diagnostic`) and the `-dumpmachine` reader (`toolchain::arch_of_triple`). The
-//! text is the toolchain's (THREAT_MODEL.md, "The operator chose the toolchain"), so a
-//! failure here is a defect in chard's reader and not an attack; but a listing reader that
-//! reads a word from a line that is not a command, or from one command into another, compares
-//! the measured build's inputs with inputs neither build had.
-//!
-//! The input is the text: the bytes decoded as UTF-8 lossily, as chard reads a driver's
-//! output. Every reader reads all of it. Held for every input, without a model of the
-//! spellings:
-//!
-//! - each reader returns without a panic, and returns the same reading twice;
-//! - `compile_inputs::parse` reads each line alone: its reading of the text is the readings of
-//!   the text's lines, each parsed alone, joined field by field in order, and it refuses the
-//!   text with the first line's refusal that is not "no compile command", or with "no compile
-//!   command" where every line refuses so. A line that is not a command (`link_inputs`' rule:
-//!   one space, then a word) is refused alone as holding no compile command. What it reads
-//!   is in its own vocabulary: every removal is a `REMOVALS` word, every header option a
-//!   `HEADER_OPTIONS` word, every macro a `-D` or `-U` operation;
-//! - `link_inputs::parse` reads command lines alone: the text and its command lines alone
-//!   read the same, so driver chatter between them is never an input;
-//! - `link_line` reads the last line that begins with a space and a quote or a slash, and no
-//!   other: the text and that line alone read the same. What it hands `collect2` is
-//!   `-fuse-ld=` and `--ld-path=` words, and the program a line runs is a path, never a bare
-//!   name and never `collect2`;
-//! - `parse_verbose` reads line by line: over two texts joined by a line feed its configure
-//!   line is the second's where it has one and the first's otherwise, and its files are the
-//!   first's then the second's; every file it names is non-empty and trimmed, and the
-//!   configure line is trimmed;
-//! - `linker_kind` names one of `gold`, `lld`, `mold`, `bfd` and `unknown`, the same for an
-//!   ASCII banner in upper case; `linker_line`, asked of each line, names `lld` or `mold`
-//!   with a version that is a word of that line, holding no white space;
-//! - `fhardened_diagnostic` names a line exactly when one carries `-fhardened` or
-//!   `-Whardened`, and the line it names is the first such, trimmed;
-//! - `arch_of_triple` reads a triple's first component alone (the triple and the component
-//!   alone read the same), and what it returns reads to itself.
-//!
-//! The seeds under `seeds/driver_text/` are the listings, banners and lines of the unit
-//! tests beside each reader, which name no host.
+//! text: the `-###` listing readers (`compile_inputs::parse`, `link_inputs::parse` and the
+//! linker-selection reader `toolchain::link_line`), the `-v` reader
+//! (`toolchain::parse_verbose`), the `--version` banner and `.comment` readers
+//! (`toolchain::linker_kind`, `toolchain::linker_line`), the `-fhardened` dump's diagnostic
+//! (`toolchain::fhardened_diagnostic`) and the `-dumpmachine` reader
+//! (`toolchain::arch_of_triple`). The text is the toolchain's (`THREAT_MODEL.md`, "The
+//! operator chose the toolchain"), so a failure here is a defect in chard's reader and not an
+//! attack; but a listing reader that reads a word from a line that is not a command, or from
+//! one command into another, compares the measured build's inputs with inputs neither build
+//! had.
 
 #![no_main]
 
@@ -167,8 +133,7 @@ fn check_link_line(text: &str) {
     assert_eq!(link_line(text), read, "a second reading differs");
     let last = text
         .lines()
-        .filter(|l| l.starts_with(" \"") || l.starts_with(" /"))
-        .next_back();
+        .rfind(|l| l.starts_with(" \"") || l.starts_with(" /"));
     assert_eq!(
         last.and_then(link_line),
         read,
@@ -186,7 +151,8 @@ fn check_link_line(text: &str) {
         Some(LinkLine::Runs(program)) => {
             assert!(
                 program.components().count() > 1,
-                "the line runs {program:?}"
+                "the line runs {}",
+                program.display()
             );
             assert_ne!(
                 program.file_name().and_then(|n| n.to_str()),
@@ -213,6 +179,10 @@ fn check_verbose(text: &str) {
     let splits: Vec<usize> = text.match_indices('\n').map(|(at, _)| at).collect();
     let last = splits.last().copied();
     for at in splits.into_iter().take(16).chain(last) {
+        #[expect(
+            clippy::string_slice,
+            reason = "at is where match_indices found a line feed, so at and at + 1 are character boundaries"
+        )]
         let (first, second) = (&text[..at], &text[at + 1..]);
         let (c1, f1) = parse_verbose(first);
         let (c2, f2) = parse_verbose(second);

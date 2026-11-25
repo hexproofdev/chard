@@ -1,38 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! The digest over arbitrary JSON: `report::digest::derive`, the one derivation of the block
-//! every report leads with, and `report::digest::of_read`, which is what `chard digest`
-//! prints of a report it read. A report someone else hands you is an input chard reads
-//! (THREAT_MODEL.md, "Whoever hands you the report"), and the digest is the part of it a
-//! reader with a budget reads instead of the rest, so a digest printed that is not the one
-//! the report's own fields give is a verdict the observations under it do not state.
-//!
-//! The input is one JSON value, mutated structurally by `json_mutator.rs`. Held for every
-//! input:
-//!
-//! - `derive` returns without a panic, and returns the same digest or the same refusal twice,
-//!   under each `consistency.status` word and under one no report writes;
-//! - the status is passed through and nothing else reads it: the digest's `consistency` is
-//!   the word given, and the digests under two words differ in that field alone;
-//! - the digest reads seven fields and no other: over an object, the object cut to
-//!   `chard_schema`, `run`, `toolchain`, `profile`, `environment`, `coverage` and
-//!   `observations` reads to the same digest or the same refusal, so the `digest` the report
-//!   carries, and anything else in it, decides nothing in the derivation;
-//! - a derived digest serializes and closes: its verdict counts are the observations' verdicts
-//!   counted, its rows are the observations' checks in order, each with its observation's verdict,
-//!   level, polarity, channel and gating rule, its copied coverage fields are the report's own, its
-//!   reasons are rows of those checks in the rows' order with the rows' verdicts, and its profile's
-//!   sentence is `meaning`'s for the profile's `flags_source`;
-//! - `of_read` returns without a panic, and where it returns a digest, that digest is the
-//!   one `derive` gives over the same report under its own `consistency.status`, as JSON:
-//!   `chard digest` prints only a digest its report's own fields give. On a report as
-//!   `measure` wrote it the two are the same, and on one edited apart from its observations
-//!   the read refuses;
-//! - `meaning` gives a sentence for every `flags_source` chard writes, under each of its two
-//!   clauses, and refuses any other word, the input's `profile.flags_source` among them.
-//!
-//! The seeds are reports: `make fuzz-seed`'s, under `corpus/detect_evidence/`, and the
-//! tracked `tests/fixtures/sample-report.json`, which `make fuzz` and `make fuzz-replay`
-//! name by its directory.
+//! every report leads with, and `report::digest::of_read`, what `chard digest` prints of a
+//! report it read. A report someone else hands you is an input chard reads (`THREAT_MODEL.md`,
+//! "Against whom, and under what assumptions"), and a reader with a budget reads the digest
+//! instead of the rest, so a digest its report's own fields do not give states a verdict the
+//! observations under it do not.
 
 #![no_main]
 
@@ -45,7 +17,7 @@ use serde_json::{Map, Value};
 mod json_mutator;
 
 fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
-    json_mutator::mutate(data, size, max_size, seed)
+    json_mutator::mutate(data, size, max_size, seed, &[])
 });
 
 /// The fields `derive` is documented to read.
@@ -61,6 +33,10 @@ const READ: [&str; 7] = [
 /// A status word no report writes.
 const FOREIGN_STATUS: &str = "unchecked";
 
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the assert is the law that a second derivation agrees, and a fuzz target reports a broken law by panicking"
+)]
 fn derived(report: &Value, status: &str) -> Result<Digest, String> {
     let first = derive(report, status);
     assert_eq!(derive(report, status), first, "a second derivation differs");
@@ -68,6 +44,15 @@ fn derived(report: &Value, status: &str) -> Result<Digest, String> {
 }
 
 /// A derived digest's own arithmetic, against the report it came from.
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the laws the module documentation lists for a derived digest that closes, held in one pass over its report"
+)]
 fn check_closes(digest: &Digest, report: &Value) {
     let as_json = serde_json::to_value(digest).expect("a derived digest serializes");
     let rows = &digest.checks;
@@ -94,7 +79,7 @@ fn check_closes(digest: &Digest, report: &Value) {
     );
     // Each row says what its observation says, and the counts are the observations' own.
     let observations = report["observations"].as_array().expect("read above");
-    let mut recounted: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut recounted = std::collections::BTreeMap::<String, usize>::new();
     for (row, obs) in rows.iter().zip(observations) {
         let verdict = serde_json::to_value(row.verdict).expect("a verdict serializes");
         assert_eq!(verdict, obs["verdict"], "{}: the row's verdict", row.check);
@@ -125,26 +110,30 @@ fn check_closes(digest: &Digest, report: &Value) {
     );
     let mut at = 0usize;
     for reason in &digest.reasons {
-        let found = rows[at..]
+        let (found, row) = rows
             .iter()
-            .position(|r| r.check == reason.check)
+            .enumerate()
+            .skip(at)
+            .find(|(_, r)| r.check == reason.check)
             .unwrap_or_else(|| panic!("the reason for {} is not a later row", reason.check));
-        let row = &rows[at + found];
         assert_eq!(
             row.verdict, reason.verdict,
             "{}: the reason's verdict",
             reason.check
         );
-        at += found + 1;
+        at = found + 1;
     }
-    let source = report["profile"]["flags_source"]
-        .as_str()
+    let source = report
+        .pointer("/profile/flags_source")
+        .and_then(Value::as_str)
         .expect("a derived profile names its source");
-    let config = report["toolchain"]["config_files"]
-        .as_array()
+    let config = report
+        .pointer("/toolchain/config_files")
+        .and_then(Value::as_array)
         .is_some_and(|files| !files.is_empty());
-    let env = report["profile"]["id"]
-        .as_str()
+    let env = report
+        .pointer("/profile/id")
+        .and_then(Value::as_str)
         .is_some_and(|id| id.contains("+env:"));
     assert_eq!(
         meaning(source, config, env).as_ref(),
@@ -166,19 +155,23 @@ fn check_closes(digest: &Digest, report: &Value) {
     let copied = &digest.coverage;
     assert_eq!(
         Some(copied.checks_expected as u64),
-        coverage["checks_expected"].as_u64()
+        coverage["checks_expected"].as_u64(),
+        "checks_expected"
     );
     assert_eq!(
         Some(copied.checks_attempted as u64),
-        coverage["checks_attempted"].as_u64()
+        coverage["checks_attempted"].as_u64(),
+        "checks_attempted"
     );
     assert_eq!(
         Some(copied.all_checks_attempted),
-        coverage["all_checks_attempted"].as_bool()
+        coverage["all_checks_attempted"].as_bool(),
+        "all_checks_attempted"
     );
     assert_eq!(
         Some(copied.all_verdicts_published),
-        coverage["all_verdicts_published"].as_bool()
+        coverage["all_verdicts_published"].as_bool(),
+        "all_verdicts_published"
     );
     for (field, list) in [
         ("checks_missing", &copied.checks_missing),
@@ -187,17 +180,24 @@ fn check_closes(digest: &Digest, report: &Value) {
         let written: Vec<&str> = coverage
             .get(field)
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+            .map_or_default(|a| a.iter().filter_map(Value::as_str).collect());
         assert_eq!(
             list.iter().map(String::as_str).collect::<Vec<_>>(),
             written,
             "{field}"
         );
     }
-    assert_eq!(as_json["consistency"], digest.consistency.as_str());
+    assert_eq!(
+        as_json.get("consistency"),
+        Some(&Value::from(digest.consistency.as_str())),
+        "the digest's consistency, as JSON"
+    );
 }
 
+#[expect(
+    clippy::panic,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn check_meaning(report: &Value) {
     for source in flags_source::ALL {
         for config in [false, true] {
@@ -222,6 +222,10 @@ fn check_meaning(report: &Value) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    #![expect(
+        clippy::expect_used,
+        reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+    )]
     let Ok(report) = serde_json::from_slice::<Value>(data) else {
         return;
     };
@@ -232,12 +236,16 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     let readings: Vec<Result<Digest, String>> =
         statuses.iter().map(|s| derived(&report, s)).collect();
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "statuses holds every ConsistencyStatus and FOREIGN_STATUS, and readings one per status, so the first of each is there"
+    )]
+    let (first_status, first) = (statuses[0], &readings[0]);
     for (status, reading) in statuses.iter().zip(&readings) {
         assert_eq!(
             reading.is_ok(),
-            readings[0].is_ok(),
-            "derive under {status} and under {} part ways",
-            statuses[0]
+            first.is_ok(),
+            "derive under {status} and under {first_status} part ways"
         );
         if let Ok(digest) = reading {
             assert_eq!(
@@ -245,10 +253,10 @@ fuzz_target!(|data: &[u8]| {
                 "the status is not passed through"
             );
             let mut same = digest.clone();
-            same.consistency = statuses[0].to_owned();
+            first_status.clone_into(&mut same.consistency);
             assert_eq!(
                 Ok(&same),
-                readings[0].as_ref(),
+                first.as_ref(),
                 "the digest under {status} differs beyond its status"
             );
             check_closes(digest, &report);
@@ -262,16 +270,17 @@ fuzz_target!(|data: &[u8]| {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(
-            derive(&Value::Object(cut), statuses[0]),
-            readings[0],
+            derive(&Value::Object(cut), first_status),
+            *first,
             "a field derive does not read changed the digest"
         );
     }
 
     let read = ("r0.json".to_owned(), report.clone());
     if let Ok(printed) = of_read(&read) {
-        let status = report["consistency"]["status"]
-            .as_str()
+        let status = report
+            .pointer("/consistency/status")
+            .and_then(Value::as_str)
             .expect("a digest printed carries its status");
         let own = derive(&report, status)
             .map(|d| serde_json::to_value(d).expect("a derived digest serializes"));

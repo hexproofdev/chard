@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! SHA-256, implemented here rather than pulled in as a dependency.
-//!
-//! chard hashes two things: each probe artifact (so a verdict can be tied to the
-//! exact binary that produced it) and the whole embedded probe corpus (so a
-//! report states which corpus revision measured it). Both are identity, not
-//! secrecy — but they end up in published comparison tables, so a standard
-//! digest anyone can reproduce with `sha256sum` beats an ad-hoc hash.
 
 /// FIPS 180-4 round constants.
 const K: [u32; 64] = [
@@ -76,14 +70,31 @@ const K: [u32; 64] = [
     0xc671_78f2,
 ];
 
-/// Hash `data`, returning lowercase hex.
-#[allow(
+/// The message schedule of one block (FIPS 180-4, 6.2.2 step 1): the block's sixteen
+/// big-endian words, then 48 more, each from four earlier ones.
+#[expect(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    reason = "fixed-size state arrays indexed by bounded loop counters; all additions are \
-              explicitly wrapping per FIPS 180-4, and the length/offset arithmetic is bounded \
-              by the input slice"
+    reason = "`i` runs over 16..64, so `i - 16` to `i - 2` are in 0..62 and every index is inside the 64 words"
 )]
+fn schedule(block: &[u8; 64]) -> [u32; 64] {
+    let mut w = [0u32; 64];
+    let (words, _) = block.as_chunks::<4>();
+    for (slot, word) in w.iter_mut().zip(words) {
+        *slot = u32::from_be_bytes(*word);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    w
+}
+
+/// Hash `data`, returning lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h: [u32; 8] = [
         0x6a09_e667,
@@ -107,42 +118,23 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     message.extend_from_slice(&bit_len.to_be_bytes());
 
-    // The padding above makes the length an exact multiple of 64, so both
-    // remainders are empty by construction and `as_chunks` hands back fixed-size
-    // arrays rather than slices that would need re-checking.
+    // The padding makes the length a multiple of 64, so the remainder is empty.
     let (blocks, _) = message.as_chunks::<64>();
     for block in blocks {
-        let mut w = [0u32; 64];
-        let (words, _) = block.as_chunks::<4>();
-        for (i, word) in words.iter().enumerate() {
-            w[i] = u32::from_be_bytes(*word);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
+        let w = schedule(block);
 
-        // `ch` and `maj` are written as FIPS 180-4 writes them, with `^`. Both are
-        // equivalent to the same expressions with `|`, and provably so: `ch`'s two terms
-        // are disjoint — one is masked by `x`, the other by `!x` — and `maj` is the
-        // majority function, which is 1 for two set inputs (one term) and for three (three
-        // terms, and `1^1^1 == 1`). Mutation testing reports three surviving mutants here
-        // for that reason, and no test can kill them: the truth tables are identical over
-        // all eight assignments. Kept in the spec's spelling rather than the cheaper one,
-        // because a reader checking this against FIPS should find what FIPS says.
+        // `ch` and `maj` are written with `^`, as FIPS 180-4 writes them; with `|` their
+        // truth tables are identical over all eight assignments, so the three surviving
+        // mutants mutation testing reports here cannot be killed by any test.
         let mut v = h;
-        for i in 0..64 {
+        for (k, wi) in K.iter().zip(w) {
             let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
             let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
             let t1 = v[7]
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
+                .wrapping_add(*k)
+                .wrapping_add(wi);
             let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
             let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
             let t2 = s0.wrapping_add(maj);
@@ -156,14 +148,13 @@ pub fn sha256_hex(data: &[u8]) -> String {
             v[1] = v[0];
             v[0] = t1.wrapping_add(t2);
         }
-        for i in 0..8 {
-            h[i] = h[i].wrapping_add(v[i]);
+        for (word, add) in h.iter_mut().zip(v) {
+            *word = word.wrapping_add(add);
         }
     }
 
     // Two lowercase hex digits per byte, with no path into the rest of the crate: `build.rs`
     // includes this file to digest the rustflags it was built under.
-    // A nibble is at most 15, so each arm names its digit and neither has a fallback.
     let hex = |nibble: u8| {
         char::from(if nibble < 10 {
             b'0'.wrapping_add(nibble)
@@ -181,8 +172,8 @@ pub fn sha256_hex(data: &[u8]) -> String {
     out
 }
 
-/// Hash a file, returning `None` when it cannot be read — a missing artifact is
-/// reported as absent evidence rather than aborting a sweep.
+/// Hash a file, returning `None` when it cannot be read, so a missing artifact is reported
+/// as absent evidence rather than aborting a sweep.
 pub fn sha256_file(path: &std::path::Path) -> Option<String> {
     std::fs::read(path).ok().map(|bytes| sha256_hex(&bytes))
 }
@@ -207,15 +198,6 @@ mod tests {
         );
     }
 
-    /// Exercises the extra padding block: 56 bytes is the boundary at which the
-    /// length no longer fits in the final chunk.
-    ///
-    /// The cases assert values, not `.len() == 64`, which `sha256_hex` satisfies by
-    /// construction for every input: it formats 32 bytes as hex and cannot return anything
-    /// else, so a length check lets a mutation of the padding path survive. The values are
-    /// from FIPS 180-4's own construction, and 55 is alongside 56: 55 is the last length that needs
-    /// *no* extra block, so the pair straddles the branch rather than landing on one
-    /// side of it.
     #[test]
     fn handles_the_padding_boundary() {
         assert_eq!(

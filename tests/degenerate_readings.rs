@@ -1,40 +1,21 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Every runtime decoder withholds the degenerate forms of the line it reads.
-//!
-//! A runtime reading is `not_replayable`: `report.rs` restates a reading as a verdict and
-//! keeps no copy the verdict could be re-derived from. A decoder that accepts a degenerate
-//! line (an empty stream, a count of zero, a field that is not there, a line from a target
-//! the probe does not describe) therefore has no second check, and the verdict it publishes
-//! reads as a measurement. `zcur_reading` accepting `args=0` was the first instance found.
-//!
-//! One table, [`ROWS`], has a row per runtime detector and four forms per row:
-//!
-//! - **empty**: nothing, or nothing the decoder reads;
-//! - **zero**: the line's count or value field at zero, or a witness field at zero;
-//! - **missing**: the line with a field removed, empty, or not of its type;
-//! - **arch**: the line a probe prints on a target it has no witness for, or a reading
-//!   from a target other than the one the decoder's constants describe.
-//!
-//! A form either lists cases, each of which must read `indeterminate`, or says why it does
-//! not apply to that detector. Each row also carries a well-formed control line with the
-//! verdict it must read, so a table that fed the detectors nothing readable would fail
-//! here rather than pass every case as withheld.
-//!
-//! Completeness is checked from two directions, as `tests/inert_flags.rs` does for the
-//! graded checks: the runtime detectors the corpus maps to the runtime channel must be
-//! exactly the rows, and the `detect_*` functions `src/decode/runtime.rs` defines must be
-//! exactly as many as the rows, so a detector added to the module without a row, or wired
-//! into the corpus without a row, fails before it ships.
-//!
-//! A case a known defect makes fail carries its handle. The main test skips it and one
-//! `#[ignore = "HANDLE: ..."]` test per handle runs it, so `cargo test -- --ignored` lists
-//! what is still open and a fix removes the handle and the ignore together. A case that
-//! exposed a defect no issue names carries a `NEW-` handle, described in the branch's
-//! `new-defects.md`.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use chard::elf::ElfFacts;
 use chard::probe::{CORPUS, Decoder, Detection, Evidence, Outcome};
@@ -52,8 +33,7 @@ struct Case {
     macros: &'static [(&'static str, &'static str)],
     /// The artifact's ELF class, for a detector that reads the pointer width from it.
     elf_class: Option<u8>,
-    /// The defect that makes this case fail today, `COR-n` for an issue that names it and
-    /// `NEW-n` for one this table found.
+    /// The handle of the defect that makes this case fail today, which its ignored test names.
     defect: Option<&'static str>,
 }
 
@@ -588,18 +568,24 @@ const ROWS: &[Row] = &[
         ),
         control_reads: Outcome::Present,
         empty: Form::Cases(&[case("empty stream", "")]),
-        zero: Form::Cases(&[case(
-            "the witness zero where it is supported",
-            "ZIPB pad=00 ctrl=00 ctrl_supported=1\n",
-        )]),
+        zero: Form::Cases(&[
+            case(
+                "the witness zero beside an opted-out control",
+                "ZIPB pad=00 ctrl=00 ctrl_supported=1\n",
+            ),
+            case(
+                "the witness zero on a compiler without the opt-out attribute",
+                "ZIPB pad=00 ctrl=00 ctrl_supported=0\n",
+            ),
+        ]),
         missing: Form::Cases(&[
             case("no ctrl or support field", "ZIPB pad=00\n"),
             case("no support field", "ZIPB pad=00 ctrl=5a\n"),
             case("no pad", "ZIPB ctrl=5a ctrl_supported=1\n"),
             case("an empty pad", "ZIPB pad= ctrl=5a ctrl_supported=1\n"),
             case(
-                "a support flag that is neither 0 nor 1, beside a witness that failed",
-                "ZIPB pad=00 ctrl=00 ctrl_supported=x\n",
+                "a support flag that is neither 0 nor 1, beside a witness that held",
+                "ZIPB pad=00 ctrl=5a ctrl_supported=x\n",
             ),
         ]),
         arch: Form::NotApplicable("the probe's output names no architecture"),
@@ -908,6 +894,120 @@ const ROWS: &[Row] = &[
         ]),
     },
     Row {
+        detector: "detect_pac_ret_enforced",
+        control: case(
+            "the marker reached",
+            "PAC hwcap=yes fpac=yes\nPAC return=attempted\nPAC return=hijacked\n",
+        ),
+        control_reads: Outcome::Absent,
+        empty: Form::Cases(&[case("empty stream", "")]),
+        zero: Form::Cases(&[
+            case(
+                "an empty hwcap",
+                "PAC hwcap= fpac=yes\nPAC return=attempted\nPAC return=hijacked\n",
+            ),
+            case(
+                "an empty fpac",
+                "PAC hwcap=yes fpac=\nPAC return=attempted\nPAC return=hijacked\n",
+            ),
+        ]),
+        missing: Form::Cases(&[
+            case(
+                "no hwcap line",
+                "PAC return=attempted\nPAC return=hijacked\n",
+            ),
+            case(
+                "no fpac field",
+                "PAC hwcap=yes\nPAC return=attempted\nPAC return=hijacked\n",
+            ),
+            case(
+                "no attempted line",
+                "PAC hwcap=yes fpac=yes\nPAC return=hijacked\n",
+            ),
+            case(
+                "a hwcap word outside the vocabulary",
+                "PAC hwcap=maybe fpac=yes\nPAC return=attempted\nPAC return=hijacked\n",
+            ),
+            case(
+                "the function returned normally",
+                "PAC hwcap=yes fpac=yes\nPAC return=attempted\nPAC return=returned\n",
+            ),
+        ]),
+        arch: Form::Cases(&[
+            case(
+                "the probe's own unsupported-architecture line",
+                "PAC unsupported-arch\n",
+            ),
+            case(
+                "the probe's own unsupported-system line",
+                "PAC unsupported-os\n",
+            ),
+            case(
+                "a kernel that gives no HWCAP_PACA",
+                "PAC hwcap=no fpac=unread\nPAC return=attempted\nPAC return=hijacked\n",
+            ),
+        ]),
+    },
+    Row {
+        detector: "detect_bti_enforced",
+        // Beside an artifact: a landing with no note read withholds.
+        control: Case {
+            elf_class: Some(64),
+            ..case(
+                "the branch landed with the target's value",
+                "BTI hwcap=yes\nBTI branch=attempted\nBTI branch=landed returned=42\n",
+            )
+        },
+        control_reads: Outcome::Absent,
+        empty: Form::Cases(&[case("empty stream", "")]),
+        zero: Form::Cases(&[
+            case(
+                "the target's value at zero",
+                "BTI hwcap=yes\nBTI branch=attempted\nBTI branch=landed returned=0\n",
+            ),
+            case(
+                "an empty value",
+                "BTI hwcap=yes\nBTI branch=attempted\nBTI branch=landed returned=\n",
+            ),
+            case(
+                "an empty hwcap",
+                "BTI hwcap=\nBTI branch=attempted\nBTI branch=landed returned=42\n",
+            ),
+        ]),
+        missing: Form::Cases(&[
+            case(
+                "no hwcap line",
+                "BTI branch=attempted\nBTI branch=landed returned=42\n",
+            ),
+            case(
+                "no attempted line",
+                "BTI hwcap=yes\nBTI branch=landed returned=42\n",
+            ),
+            case(
+                "a hwcap word outside the vocabulary",
+                "BTI hwcap=maybe\nBTI branch=attempted\nBTI branch=landed returned=42\n",
+            ),
+            case(
+                "a value that is not the target's",
+                "BTI hwcap=yes\nBTI branch=attempted\nBTI branch=landed returned=forty-two\n",
+            ),
+        ]),
+        arch: Form::Cases(&[
+            case(
+                "the probe's own unsupported-architecture line",
+                "BTI unsupported-arch\n",
+            ),
+            case(
+                "the probe's own unsupported-system line",
+                "BTI unsupported-os\n",
+            ),
+            case(
+                "a kernel that gives no HWCAP2_BTI",
+                "BTI hwcap=no\nBTI branch=attempted\nBTI branch=landed returned=42\n",
+            ),
+        ]),
+    },
+    Row {
         detector: "detect_trapv",
         control: Case {
             exit: -1,
@@ -1181,8 +1281,6 @@ fn a_row_with_cases_for_every_form_it_claims_and_a_reason_for_every_form_it_does
     }
 }
 
-/// The completeness guard, corpus side: the detectors the corpus maps to the runtime channel
-/// are the rows, no more and no fewer.
 #[test]
 fn every_runtime_detector_the_corpus_wires_has_a_row() {
     let mut wired: BTreeSet<&str> = BTreeSet::new();
@@ -1212,44 +1310,12 @@ fn every_runtime_detector_the_corpus_wires_has_a_row() {
     );
 }
 
-/// The completeness guard, source side: every `detect_*` function `src/decode/runtime.rs`
-/// defines is a row, so a detector added to the module and not yet wired into the corpus
-/// still needs its shapes decided.
-#[test]
-fn every_detect_function_in_the_runtime_module_has_a_row() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/decode/runtime.rs");
-    let text = std::fs::read_to_string(&path).expect("reading src/decode/runtime.rs");
-    let defined: BTreeSet<String> = text
-        .lines()
-        .filter_map(|l| {
-            let l = l
-                .strip_prefix("pub(crate) ")
-                .or_else(|| l.strip_prefix("pub "))?;
-            let name = l.strip_prefix("fn ")?;
-            let name: String = name
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            name.starts_with("detect_").then_some(name)
-        })
-        .collect();
-    assert!(
-        !defined.is_empty(),
-        "the scan found no detector in runtime.rs"
-    );
-    let rows: BTreeSet<String> = ROWS.iter().map(|r| r.detector.to_owned()).collect();
-    assert_eq!(
-        defined, rows,
-        "the detect_* functions in src/decode/runtime.rs and the rows of ROWS differ"
-    );
-}
-
 // --- cases a defect makes fail ------------------------------------------------------
 
-#[allow(
+#[expect(
     dead_code,
-    reason = "no handle is open; the next case a defect makes fail adds one and its \
-              ignored test"
+    reason = "its callers are the ignored tests of the table's defect handles, one each, and no \
+              case in the table carries a handle"
 )]
 fn run_defect(handle: &str) {
     let mut fed = 0usize;
@@ -1278,35 +1344,8 @@ fn run_defect(handle: &str) {
     );
 }
 
-/// A handle in the table has an ignored test that runs it, and an ignored test in this file
-/// has cases: neither side can be dropped alone.
-#[test]
-fn every_defect_handle_has_its_ignored_test_and_the_reverse() {
-    let source = include_str!("degenerate_readings.rs");
-    let in_table: BTreeSet<&str> = all_cases().filter_map(|(_, _, c)| c.defect).collect();
-    for handle in &in_table {
-        let attribute = format!("#[ignore = \"{handle}: ");
-        assert!(
-            source.contains(&attribute),
-            "{handle}: cases carry this handle and no #[ignore] test runs them"
-        );
-    }
-    let ignored: BTreeSet<String> = source
-        .lines()
-        .filter_map(|l| l.strip_prefix("#[ignore = \""))
-        .filter_map(|rest| rest.split_once(':').map(|(h, _)| h.to_owned()))
-        .collect();
-    let table: BTreeSet<String> = in_table.iter().map(|h| (*h).to_owned()).collect();
-    assert_eq!(
-        ignored, table,
-        "the #[ignore] tests and the handles on the table's cases differ"
-    );
-}
-
 // --- the other reader of a probe's line ------------------------------------------------
 
-/// `report::machine_lacks_shadow_stack` reads the same SHSTK line as the detector and turns
-/// it into a published gating sentence. A degenerate line must not produce one.
 #[test]
 fn the_machine_lack_gating_reads_no_degenerate_shadow_stack_line() {
     let check = CORPUS

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier service: daemons and network services (selected with std).
+clippy.print_stdout = "deny"
+clippy.print_stderr = "deny"
+clippy.use_debug = "deny"                      # {:?} in a service log can leak tokens and keys
+clippy.clone_on_ref_ptr = "deny"
+clippy.unchecked_time_subtraction = "deny"     # pedantic today; named so it survives a group change
+clippy.mutex_integer = "warn"
+rust.let_underscore_drop = "warn"              # an early-dropped guard or handle

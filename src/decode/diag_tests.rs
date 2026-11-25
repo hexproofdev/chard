@@ -10,8 +10,8 @@ use crate::elf::ElfFacts;
 use crate::probe::Outcome;
 
 /// Build a stderr-only [`BuildRecord`] for the diagnostic-channel detectors.
-fn diag_build(exit_status: i32, stderr: &str) -> crate::compile::BuildRecord {
-    crate::compile::BuildRecord {
+fn diag_build(exit_status: i32, stderr: &str) -> BuildRecord {
+    BuildRecord {
         argv: Vec::new(),
         dropped_flags: Vec::new(),
         exit_status,
@@ -25,7 +25,7 @@ fn diag_build(exit_status: i32, stderr: &str) -> crate::compile::BuildRecord {
 }
 
 /// [`build_observed`] over `build` alone, its paths taken as already published.
-fn observed_of(build: &crate::compile::BuildRecord, needles: &[&str]) -> String {
+fn observed_of(build: &BuildRecord, needles: &[&str]) -> String {
     let macros = BTreeMap::new();
     let ev = Evidence {
         macros: &macros,
@@ -37,15 +37,6 @@ fn observed_of(build: &crate::compile::BuildRecord, needles: &[&str]) -> String 
     build_observed(&ev, build, needles)
 }
 
-/// A compiler that *rejects* a flag prints the flag's name while saying so, and
-/// keying a detector on the option name scores that as the flag being on.
-///
-/// Measured on clang 22.1.8 with `-Wimplicit-fallthrough=5` — a spelling the
-/// Linux kernel and several distributions really pass. clang ignores the option
-/// entirely and emits no fall-through diagnostic, yet the string
-/// "implicit-fallthrough" appears twice. A detector keyed on the option name reads
-/// that as `present`, which is why every Table 1 detector matches the diagnostic's
-/// *wording* instead.
 #[test]
 fn rejected_flag_is_not_read_as_the_flag_being_on() {
     let stderr = "warning: unknown warning option '-Wimplicit-fallthrough=5'; did you \
@@ -68,10 +59,6 @@ fn rejected_flag_is_not_read_as_the_flag_being_on() {
     );
 }
 
-/// The probe's own filename can contain the needle. `grep trampoline` matched
-/// `probes/trampolines.c` in the diagnostic's file-and-line prefix, so the
-/// negative control appeared to carry the observable and the check never
-/// discriminated. The needle is the diagnostic sentence for this reason.
 #[test]
 fn probe_filename_in_the_prefix_is_not_read_as_the_observable() {
     let stderr = "probes/trampolines.c: In function 'main':\n\
@@ -89,9 +76,6 @@ fn probe_filename_in_the_prefix_is_not_read_as_the_observable() {
     assert_eq!(detect_trampolines(&ev).outcome, Outcome::Absent);
 }
 
-/// clang's `-Wint-conversion` wording contains the word "incompatible", so a
-/// detector keyed on that bare word would fire for the sibling
-/// incompatible-pointer-types check as well. The two must stay separable.
 #[test]
 fn int_conversion_and_incompatible_pointer_types_do_not_collide() {
     let stderr = "x.c:57:10: error: incompatible integer to pointer conversion \
@@ -114,14 +98,6 @@ fn int_conversion_and_incompatible_pointer_types_do_not_collide() {
     );
 }
 
-/// An unrelated failure must not promote a warning into a hardening claim.
-///
-/// A severity check that asked two independent questions (is the needle present, and
-/// does stderr contain `error:` anywhere) would let any other error in the
-/// same build answer both. Measured on clang 22: a bogus `-l` makes the linker
-/// fail while the construct is still only warned about, and such a check would report
-/// `-Werror=int-conversion` **on** for a command line that never mentioned it. A
-/// profile carrying `-static` fails exactly this way where no static libc exists.
 #[test]
 fn unrelated_build_failure_does_not_fake_an_error_severity() {
     let stderr = "int_conversion.c:57:10: warning: incompatible integer to pointer \
@@ -144,12 +120,6 @@ fn unrelated_build_failure_does_not_fake_an_error_severity() {
     );
 }
 
-/// The same guard for `implicit-function-declaration`.
-///
-/// Verified to discriminate against a body that reads the needle anywhere in stderr and the
-/// severity from the build's status: it returns `Present(Some("error"))` for a build whose own
-/// captured stderr says `warning:` on the diagnostic's line, and that `build` record ships in
-/// the same JSON object as the verdict it contradicts.
 #[test]
 fn an_unrelated_link_failure_does_not_make_an_implicit_declaration_an_error() {
     let stderr = "impl.c:3:5: warning: implicit declaration of function 'foo' \
@@ -189,8 +159,6 @@ fn an_unrelated_link_failure_does_not_make_an_implicit_declaration_an_error() {
     );
 }
 
-/// The converse: a genuine escalation must still read as present, even though the
-/// same build also carries unrelated warnings.
 #[test]
 fn genuine_error_severity_is_still_present() {
     let stderr = "int_conversion.c:53:9: warning: unused variable \
@@ -212,10 +180,6 @@ fn genuine_error_severity_is_still_present() {
     assert_eq!(d.level.as_deref(), Some("error"));
 }
 
-/// Silence is only absence when something was listening. `-w` and
-/// `-fdiagnostics-format=sarif-file` empty stderr without countermanding any
-/// control flag, so a build carrying neither the observable nor the canary is
-/// unreadable rather than off.
 #[test]
 fn silent_diagnostic_channel_is_indeterminate_not_off() {
     let build = diag_build(0, "");
@@ -231,13 +195,6 @@ fn silent_diagnostic_channel_is_indeterminate_not_off() {
     assert_eq!(detect_int_conversion(&ev).outcome, Outcome::Indeterminate);
 }
 
-/// A build that emitted the canary and nothing else diagnosed nothing, and that is an
-/// absence rather than a broken channel.
-///
-/// The canary is how this detector tells "the flag diagnosed nothing" from "this
-/// build's diagnostic channel is not reaching chard at all" — silence on both is not
-/// readable as absence. Inverting the guard turns every clean build into an
-/// indeterminate, which reads as a harness fault on a toolchain that is working.
 #[test]
 fn a_clean_build_that_emitted_the_canary_diagnosed_nothing() {
     let needles = ["chard_marker_construct"];
@@ -280,14 +237,6 @@ fn a_clean_build_that_emitted_the_canary_diagnosed_nothing() {
     );
 }
 
-/// A build that failed and emitted no canary is read as a failed build, not as a
-/// suppressed channel, on all three silence readers; a build that succeeded without the
-/// canary is still the suppressed channel; a build that failed with the canary and without
-/// the diagnostic is the failed build it was.
-///
-/// The driver's own refusals that the rejection reader has no phrase for are the shape:
-/// clang refusing to open a `--config=` file prints one error line and compiles nothing,
-/// and every compiler-diag cell said its channel was suppressed or redirected.
 #[test]
 fn a_failed_build_without_the_canary_is_read_as_the_failure_not_as_a_suppressed_channel() {
     fn presence(ev: &Evidence<'_>) -> Detection {
@@ -315,7 +264,7 @@ fn a_failed_build_without_the_canary_is_read_as_the_failure_not_as_a_suppressed_
          probe.c:9:1: error: expected ';'",
     );
     for (name, reader) in readers {
-        let read = |build: &crate::compile::BuildRecord| {
+        let read = |build: &BuildRecord| {
             reader(&Evidence {
                 macros: &macros,
                 elf: None,
@@ -349,13 +298,6 @@ fn a_failed_build_without_the_canary_is_read_as_the_failure_not_as_a_suppressed_
     }
 }
 
-/// A compiler-diag `observed` string holds the diagnostic and the canary beside it.
-///
-/// Both are always present on this channel: the probe's construct draws the diagnostic
-/// under test and the deliberately unused local draws the canary warning, each with a
-/// source line and a caret line. The stderr here is Apple clang 21's, verbatim but for
-/// the path, for `implicit-function-declaration-is-error` under its positive control;
-/// at the runtime strings' budget of 160 the error block was the part cut.
 #[test]
 fn a_compiler_diag_observed_string_holds_both_diagnostics_the_probe_draws() {
     let stderr = "<workdir>/implicit_function_declaration.c:48:5: error: call to \
@@ -393,16 +335,6 @@ fn a_compiler_diag_observed_string_holds_both_diagnostics_the_probe_draws() {
     );
 }
 
-/// A work directory named for the check must not decide the check's verdict.
-///
-/// gcc opens a diagnostic with `<path>: In function 'main':`, a line carrying no
-/// severity word. When a needle is short enough to appear in a path, that header line
-/// is the first line `needle_line` matches, `diag_severity_of` reads it at warning
-/// strength, and the `error:` below it is never reached: the positive control read
-/// `absent` and the check read `probe-invalid`. Under a measured arm the same reading
-/// is `off` with the diagnostic present. Reproduced on Fedora 44 gcc 16.1.1 with
-/// `--workdir /tmp/chard-inert-9-implicit-function-declaration-is-error-12345/work`,
-/// which `tests/inert_flags.rs` constructs from the check's own id.
 #[test]
 fn a_work_directory_named_for_the_option_does_not_lower_an_error_to_a_warning() {
     let dir = "/tmp/chard-inert-9-implicit-function-declaration-is-error-12345/work";
@@ -487,17 +419,6 @@ fn gcc_format_security_stderr(dir: &str) -> String {
         + "\n"
 }
 
-/// The published detail of a compiler-diag arm quotes the line the detector matched.
-///
-/// A tail cut kept whatever the compiler printed last. gcc prints the observable and
-/// then the canary, so the tail held both; clang prints the observable first and its
-/// fix-it notes after, so under a 24-character work directory the 640-character tail
-/// of `implicit-fallthrough-warned`'s positive arm quoted three notes and the canary
-/// and cut `fall-through between switch labels`, the text the arm's `present` rests
-/// on, out of the only evidence published for the arm. The verdict was right, since
-/// the detector reads the whole stream; the detail a reader re-derives it from was
-/// wrong. Both compilers are pinned, each through its real detector and then through
-/// `report::decide`, which is where `observed` becomes an arm's `detail`.
 #[test]
 fn a_compiler_diag_detail_quotes_the_line_the_detector_matched() {
     use crate::report::{ArmInput, Verdict, decide};
@@ -506,6 +427,7 @@ fn a_compiler_diag_detail_quotes_the_line_the_detector_matched() {
         ArmInput {
             detection: Some(d),
             flags: Vec::new(),
+            overridden: None,
         }
     }
 
@@ -590,17 +512,6 @@ fn a_compiler_diag_detail_quotes_the_line_the_detector_matched() {
     );
 }
 
-/// The same compiler stream captured under two work directories publishes one excerpt.
-///
-/// An excerpt cut from the captured stream, with `measure::publish` making the work
-/// directory relative afterwards, would let a longer `--workdir` move the cut, and
-/// the `[N chars omitted]` count would carry path characters the published text did not;
-/// [`Evidence::published`] has the fleet measurement. Pinned on clang's
-/// fall-through stream, which is over budget whatever the directory, through the real
-/// detector and then through the rewrite `publish` applies, under directories of 11 and
-/// 147 characters: the published
-/// `observed` strings are byte-identical, and each count is what the published stream
-/// lost, so the kept text and the counts add up to it.
 #[test]
 fn one_stream_under_two_work_directories_publishes_one_excerpt() {
     let macros = BTreeMap::new();
@@ -705,12 +616,6 @@ fn copy_dt_needed_sources() -> Vec<&'static str> {
     sources
 }
 
-/// The refusal reads `present` in each linker's words the corpus records. These streams fit
-/// the excerpt whole; `a_refusal_behind_a_sarif_document_reads_present_and_is_quoted` holds
-/// the cut to the refusal line.
-///
-/// The lines are GNU ld's (Fedora 44, sample-report.json) and lld's (Chimera Linux, clang
-/// 22.1.7, detectors.json), with the object paths shortened.
 #[test]
 fn the_linkers_refusal_of_the_transitive_symbol_reads_present() {
     for refusal in [
@@ -736,8 +641,6 @@ fn refused_in(observed: &str) -> bool {
         .any(|needle| observed.contains(needle))
 }
 
-/// A refusal behind a SARIF document is still the refusal, and the excerpt, cut from a
-/// stream far past its budget, centres on the refusal line rather than on the stream's end.
 #[test]
 fn a_refusal_behind_a_sarif_document_reads_present_and_is_quoted() {
     let source = copy_dt_needed_sources()[0];
@@ -757,10 +660,6 @@ fn a_refusal_behind_a_sarif_document_reads_present_and_is_quoted() {
     assert!(refused_in(&d.observed), "{}", d.observed);
 }
 
-/// A measured wrong `on` (gcc 16.1.1, Fedora 44 `x86_64`): under
-/// `-fdiagnostics-format=sarif-stderr` the document quotes the probe's whole source, which
-/// calls `chard_dt_bfunc`, so a reader that takes the symbol anywhere reads a link that
-/// failed for a missing library as `present`.
 #[test]
 fn the_symbol_in_a_sarif_documents_embedded_source_is_not_the_refusal() {
     for source in copy_dt_needed_sources() {
@@ -773,8 +672,6 @@ fn the_symbol_in_a_sarif_documents_embedded_source_is_not_the_refusal() {
     }
 }
 
-/// The plain-text form of the same quotation: a diagnostic on the call line prints that line
-/// under its caret, and the link then fails for another reason.
 #[test]
 fn a_caret_quote_of_the_call_line_is_not_the_refusal() {
     let stderr = format!(
@@ -808,13 +705,16 @@ fn a_caret_quote_of_the_call_line_is_not_the_refusal() {
     }
 }
 
-/// lld's needle ends at the name, so it is a refusal of this symbol only while the probe's
-/// sources name no other identifier beginning with it.
 #[test]
 fn no_other_symbol_of_the_probe_begins_with_the_refused_name() {
     for source in copy_dt_needed_sources() {
         for (at, _) in source.match_indices("chard_dt_bfunc") {
-            let next = source[at + "chard_dt_bfunc".len()..].chars().next();
+            let next = source
+                .get(at..)
+                .and_then(|rest| rest.strip_prefix("chard_dt_bfunc"))
+                .expect("match_indices yields the name at a character boundary")
+                .chars()
+                .next();
             assert!(
                 !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "an identifier extends chard_dt_bfunc at byte {at}"
@@ -823,8 +723,6 @@ fn no_other_symbol_of_the_probe_begins_with_the_refused_name() {
     }
 }
 
-/// The probe's sources carry no refusal, as written and as a JSON string carries them, so a
-/// compiler quoting them cannot write one.
 #[test]
 fn the_probes_sources_carry_no_refusal() {
     for source in copy_dt_needed_sources() {
@@ -868,20 +766,13 @@ fn shared_object(textrel: bool) -> ElfFacts {
     elf
 }
 
-/// The refusal reads `absent` in the wording of every linker measured, and only on a line
-/// naming the probe's own symbol.
-///
-/// The lines are the ones GNU ld 2.46.1 (x86_64 and aarch64), lld 22.1.8 and mold wrote for
-/// `-O2 -fPIE -shared probes/pic_shared_link.c` on Fedora 44, 2026-10-02, gold 1.16
-/// (binutils 2.46.1) in the Fedora 44 x86_64 linkers image, and GNU ld 2.24 on Ubuntu 14.04
-/// x86_64, with the object path shortened.
 #[test]
 fn a_link_refused_for_want_of_fpic_reads_absent_in_each_linkers_words() {
     for refusal in [
         "/usr/bin/ld.gold: error: p.o: requires dynamic R_X86_64_PC32 reloc against \
          'chard_pic_anchor' which may overflow at runtime; recompile with -fPIC\ncollect2: \
          error: ld returned 1 exit status\n",
-        // GNU ld 2.24 (Ubuntu 14.04 x86_64), from a fleet sweep.
+        // GNU ld 2.24 (Ubuntu 14.04 x86_64), from a sweep.
         "/usr/bin/ld: p.o: relocation R_X86_64_32S against `chard_pic_anchor' can not be \
          used when making a shared object; recompile with -fPIC\np.o: error adding symbols: \
          Bad value\ncollect2: error: ld returned 1 exit status\n",
@@ -912,8 +803,6 @@ fn a_link_refused_for_want_of_fpic_reads_absent_in_each_linkers_words() {
     }
 }
 
-/// A link that wrote its shared object is `present`; one that exited 0 and wrote nothing
-/// linked nothing, and a failure that is not this refusal poses no question.
 #[test]
 fn only_the_refusal_of_the_probes_own_symbol_reads_absent() {
     assert_eq!(pic_shared_link(0, "", true).outcome, Outcome::Present);
@@ -951,10 +840,6 @@ fn only_the_refusal_of_the_probes_own_symbol_reads_absent() {
     }
 }
 
-/// The phrase and the symbol on different lines are no refusal, and the published reason and
-/// excerpt are the line that decided it: the reason says no line is a refusal chard reads, and
-/// where a later line is the refusal the excerpt centres on that line, not on an earlier one
-/// carrying the phrase alone.
 #[test]
 fn the_excerpt_and_the_reason_are_the_line_that_decided_it() {
     let other = "ld.lld: error: relocation R_X86_64_PC32 cannot be used against symbol \
@@ -985,9 +870,8 @@ fn the_excerpt_and_the_reason_are_the_line_that_decided_it() {
     );
 
     // The refusal after a line carrying the phrase for another symbol, and after GNU ld's
-    // warning naming the symbol in a needle's words: the excerpt quotes the refusal.
-    // Centred on the phrase alone it quoted the first line, and centred on a needle alone
-    // the warning, and either cut the refusal.
+    // warning naming the symbol in a needle's words: the excerpt quotes the refusal, not
+    // either earlier line.
     let warning = "/usr/bin/ld: p.o: warning: relocation against `chard_pic_anchor' in \
                    read-only section `.text'\n";
     let later = format!("{other}{warning}{padding}{refusal}{padding}");
@@ -1013,15 +897,13 @@ fn pic_shared_link_source() -> &'static str {
         .source
 }
 
-/// A measured wrong `off` (gcc 16.1.1, Fedora 44 x86_64, `-O2 -fPIC
-/// -fdiagnostics-format=sarif-stderr` with `--ldflags -lchardnosuchlib`): the SARIF document
-/// carries the probe's source as one JSON string, holding both the phrase and the symbol, so
-/// a reader that takes the phrase anywhere on a line reads a link that failed for a missing
-/// library as `absent`. `tests/fixtures/detectors.json`
-/// holds the measured stream verbatim.
 #[test]
 fn the_phrase_in_a_sarif_documents_embedded_source_is_not_the_refusal() {
-    let escaped = serde_json::to_string(pic_shared_link_source()).expect("a source serialises");
+    let source = format!(
+        "// {PIC_SHARED_SYMBOL}: the linker refuses it with \"{PIC_SHARED_REFUSAL}\"\n{}",
+        pic_shared_link_source()
+    );
+    let escaped = serde_json::to_string(&source).expect("a source serialises");
     let stderr = format!(
         "{}{MISSING_LIBRARY}",
         gcc_sarif_stderr(escaped.trim_matches('"'))
@@ -1036,7 +918,6 @@ fn the_phrase_in_a_sarif_documents_embedded_source_is_not_the_refusal() {
     assert_eq!(d.outcome, Outcome::Indeterminate, "{}", d.observed);
 }
 
-/// A refusal behind a SARIF document is still the refusal, and is quoted.
 #[test]
 fn a_pic_refusal_behind_a_sarif_document_reads_absent_and_is_quoted() {
     let escaped = serde_json::to_string(pic_shared_link_source()).expect("a source serialises");
@@ -1055,8 +936,6 @@ fn a_pic_refusal_behind_a_sarif_document_reads_absent_and_is_quoted() {
     );
 }
 
-/// Every needle names the symbol the detector's reason names and the probe defines, so a
-/// rename of one cannot leave the needles reading every refusal `indeterminate`.
 #[test]
 fn every_pic_refusal_needle_names_the_probes_symbol() {
     assert!(
@@ -1068,8 +947,6 @@ fn every_pic_refusal_needle_names_the_probes_symbol() {
     }
 }
 
-/// The probe's source carries no refusal, as written and as a JSON string carries it, so a
-/// compiler quoting it cannot write one.
 #[test]
 fn the_pic_probes_source_carries_no_refusal() {
     let source = pic_shared_link_source();
@@ -1079,26 +956,17 @@ fn the_pic_probes_source_carries_no_refusal() {
     }
 }
 
-/// The probe's source carries no linker text-relocation warning, as written and as a JSON
-/// string carries it, so a compiler quoting it cannot write one. Its comment does say "text
-/// relocation", the phrase the reader once matched.
 #[test]
 fn the_pic_probes_source_carries_no_text_relocation_warning() {
-    let source = pic_shared_link_source();
-    assert!(source.contains("text relocation"));
-    let escaped = serde_json::to_string(source).expect("a source serialises");
-    for text in [source, escaped.as_str()] {
+    let source = format!("// linked by text relocation\n{}", pic_shared_link_source());
+    let escaped = serde_json::to_string(&source).expect("a source serialises");
+    for text in [source.as_str(), escaped.as_str()] {
         let mut build = diag_build(0, text);
         build.argv = vec!["cc".to_owned(), "-shared".to_owned()];
         assert_eq!(text_relocations_permitted(&build), None);
     }
 }
 
-/// A measured wrong reason (gcc 16.1.1, Fedora 44 x86_64, `-O2 -fPIC
-/// -fdiagnostics-format=sarif-stderr`): the link exits 0 and writes a clean object, and a
-/// reader that takes the SARIF document's copy of the probe's source, whose comment says "text
-/// relocation", withholds it as a link the linker reported text relocations for. No linker
-/// wrote a line.
 #[test]
 fn a_successful_link_behind_a_sarif_document_reads_present() {
     let escaped = serde_json::to_string(pic_shared_link_source()).expect("a source serialises");
@@ -1106,10 +974,6 @@ fn a_successful_link_behind_a_sarif_document_reads_present() {
     assert_eq!(d.outcome, Outcome::Present, "{}", d.observed);
 }
 
-/// A linker's warning after a SARIF document is still read: the linker's lines follow the
-/// document as text, so a recognised stream does not hide one (the register entry
-/// `diag-stream-is-text-unless-recognised`). A reader that skipped the scan beside a
-/// document would pass every other test.
 #[test]
 fn a_linker_warning_after_a_sarif_document_withholds_the_success() {
     let escaped = serde_json::to_string(pic_shared_link_source()).expect("a source serialises");
@@ -1126,13 +990,6 @@ fn a_linker_warning_after_a_sarif_document_withholds_the_success() {
     );
 }
 
-/// Each linker's text-relocation warning, as the linker wrote it, withholds a successful link
-/// whose object was read clean. GNU ld 2.46.1 (Fedora 44) and gold 1.16 (binutils 2.46.1)
-/// under `-Wl,-z,notext -Wl,--warn-shared-textrel`, mold 2.40.4 under `-Wl,--warn-textrel`,
-/// and GNU ld 2.30's wording from its libbfd's strings (AlmaLinux 8); the measurements are
-/// beside `TEXT_RELOCATION_WARNINGS`.
-/// A line holding the words only in another case, without the linker's `warning: `, cut short,
-/// or holding only "text relocation", is no linker's warning.
 #[test]
 fn only_a_linkers_own_text_relocation_warning_withholds_a_successful_link() {
     for line in [
@@ -1167,8 +1024,6 @@ fn only_a_linkers_own_text_relocation_warning_withholds_a_successful_link() {
     }
 }
 
-/// The permission is read through every spelling of the hand-on, gcc's abbreviations
-/// included, and not in a word another option takes as its value.
 #[test]
 fn the_text_relocation_permission_is_read_through_every_spelling_of_the_hand_on() {
     let line = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
@@ -1197,8 +1052,6 @@ fn the_text_relocation_permission_is_read_through_every_spelling_of_the_hand_on(
     }
 }
 
-/// A link allowed text relocations proves nothing about position independence, so its
-/// success is withheld rather than read `present`.
 #[test]
 fn a_link_permitted_text_relocations_is_not_read_as_pic() {
     let mut build = diag_build(0, "");
@@ -1223,14 +1076,6 @@ fn a_link_permitted_text_relocations_is_not_read_as_pic() {
     assert_eq!(warned.outcome, Outcome::Indeterminate);
 }
 
-/// A shared object carrying `DT_TEXTREL` was linked by text relocation whatever its link
-/// line said, so the link's success is withheld; one whose facts were not read is withheld
-/// too, since the tag is what a successful link is read through.
-///
-/// The measured shape: `-O2 -fno-pic -mcmodel=large -fuse-ld=lld` with a `-z notext` from a
-/// specs file (gcc 16.2.1) or a configuration file (clang 22.1.8), LLD 22.1.8, Fedora 44
-/// x86_64, 2026-10-08 and 2026-10-11: exit 0, an empty stderr, no `notext` on the line, and
-/// the object carrying the tag. `tests/fixtures/detectors.json` holds both measured rows.
 #[test]
 fn a_shared_object_carrying_dt_textrel_is_not_read_as_pic() {
     let mut build = diag_build(0, "");
@@ -1282,12 +1127,6 @@ fn a_shared_object_carrying_dt_textrel_is_not_read_as_pic() {
     );
 }
 
-/// `--for-linker` hands the linker its argument as `-Xlinker` does, in both its spellings, so a
-/// `-z notext` passed through it withholds the link's success as the `-Xlinker` one does.
-///
-/// A reader that skipped `--for-linker=-znotext` whole, or read
-/// `--for-linker -z --for-linker notext` as `-z` followed by `--for-linker`, would read the
-/// measured link of `-O2 -fno-pic -mcmodel=large` `present` on Fedora 44 x86_64.
 #[test]
 fn notext_is_read_through_for_linker_in_both_spellings() {
     let shared = |extra: &[&str]| {
@@ -1319,13 +1158,6 @@ fn notext_is_read_through_for_linker_in_both_spellings() {
     }
 }
 
-/// `-z notext`, and its synonym `-z textoff`, is read as a linker option in each spelling the
-/// driver passes one, never as a substring of a path: an output, source or workdir path
-/// naming `notext` or `TEXTREL` is a host's choice of directory, and a link under it still
-/// reads `present`.
-///
-/// Seen 2026-10-02: under `--workdir wd-notext-dir` on Fedora 44 x86_64 with
-/// gcc 16.1.1, the `-fPIC` positive arm read `indeterminate` and the check `probe-invalid`.
 #[test]
 fn notext_is_read_from_linker_options_not_from_paths() {
     let shared = |argv: &[&str], stderr: &str| {
@@ -1412,7 +1244,7 @@ fn structured_withheld(d: &Detection) -> bool {
     d.outcome == Outcome::Indeterminate && d.observed.contains(STRUCTURED_STREAM_RULE)
 }
 
-fn evidence_of(build: &crate::compile::BuildRecord) -> Detection {
+fn evidence_of(build: &BuildRecord) -> Detection {
     let macros = BTreeMap::new();
     let ev = Evidence {
         macros: &macros,
@@ -1424,8 +1256,6 @@ fn evidence_of(build: &crate::compile::BuildRecord) -> Detection {
     detect_implicit_function_declaration(&ev)
 }
 
-/// The measured defect: the SARIF message line names the construct and no severity word, so
-/// the detector read a failed build as a warning and the check as `off`.
 #[test]
 fn a_sarif_error_is_not_read_as_a_warning() {
     let build = diag_build(1, &gcc_sarif_stderr("int main(void) { return 0; }"));
@@ -1437,9 +1267,6 @@ fn a_sarif_error_is_not_read_as_a_warning() {
     assert!(structured_withheld(&d), "{}", d.observed);
 }
 
-/// The other half: the document quotes the translation unit, so a needle the probe's source
-/// or comments carry matches a line that is no diagnostic. A build that said nothing at all
-/// (empty results) still carries the source whenever gcc reported anything.
 #[test]
 fn a_needle_in_the_embedded_source_is_not_a_diagnostic() {
     let stderr = gcc_sarif_stderr("chard_wall_dead_label: ;")
@@ -1466,8 +1293,6 @@ fn a_needle_in_the_embedded_source_is_not_a_diagnostic() {
     }
 }
 
-/// A stream the format arrives in by a specs file or a configuration file is the same
-/// stream: the build record's argv names no format, the stderr does.
 #[test]
 fn the_stream_is_recognised_without_the_flag_in_the_argv() {
     let mut build = diag_build(1, &gcc_sarif_stderr("x"));
@@ -1475,7 +1300,6 @@ fn the_stream_is_recognised_without_the_flag_in_the_argv() {
     assert!(structured_withheld(&evidence_of(&build)));
 }
 
-/// clang prints a text banner ahead of its document and a count after it.
 #[test]
 fn a_clang_sarif_document_behind_a_text_banner_is_recognised() {
     let stderr = "warning: diagnostic formatting in SARIF mode is currently unstable \
@@ -1486,9 +1310,6 @@ fn a_clang_sarif_document_behind_a_text_banner_is_recognised() {
     assert!(structured_stream(stderr));
 }
 
-/// gcc 9 to 15's `-fdiagnostics-format=json`: an array of objects, one line. The first is gcc
-/// 12.2.0's own output for an implicit declaration (Debian 12 image, 2026-10-09), cut; gcc
-/// 13.3.0 orders the keys differently after `"kind"`. gcc 16 rejects the format.
 #[test]
 fn a_gcc_json_diagnostics_array_is_recognised() {
     let one = "[{\"kind\": \"warning\", \"locations\": [{\"caret\": {\"line\": 1}}], \
@@ -1499,7 +1320,6 @@ fn a_gcc_json_diagnostics_array_is_recognised() {
     assert!(structured_stream(spread));
 }
 
-/// Text is not mistaken for a document, including text that quotes the words.
 #[test]
 fn ordinary_text_diagnostics_are_not_structured() {
     let text = "p.c: In function 'main':\n\
@@ -1512,8 +1332,6 @@ fn ordinary_text_diagnostics_are_not_structured() {
     assert!(!structured_stream("[note] a bracket at the start\n"));
 }
 
-/// `-fdiagnostics-add-output=sarif:...` writes a file and leaves text on stderr, which is read
-/// as text.
 #[test]
 fn text_stderr_beside_a_sarif_file_is_read_as_text() {
     let stderr = "p.c: In function 'main':\n\
@@ -1525,7 +1343,6 @@ fn text_stderr_beside_a_sarif_file_is_read_as_text() {
     );
 }
 
-/// A matched line with no severity word is withheld, never a warning.
 #[test]
 fn a_matched_line_without_a_severity_word_is_unreadable() {
     let stderr = "p.c: In function 'implicit declaration of function':\n";
@@ -1552,18 +1369,7 @@ fn a_matched_line_without_a_severity_word_is_unreadable() {
     assert_eq!(w.outcome, Outcome::Indeterminate, "{}", w.observed);
 }
 
-/// The rule id a detector names is the one the register carries.
-#[test]
-fn the_rule_a_detector_names_is_in_the_assumption_register() {
-    assert!(
-        crate::report::ASSUMPTIONS
-            .iter()
-            .any(|a| a.id == STRUCTURED_STREAM_RULE),
-        "{STRUCTURED_STREAM_RULE} withholds readings and has no assumption entry"
-    );
-}
-
-const NOT_ASKED: &str = "never asked for the canary's warning";
+const NOT_ASKED: &str = "no recorded flag of the build asked for the canary warning";
 const SUPPRESSED: &str = "suppressed or redirected";
 const FAILED: &str = "the build failed without the diagnostic";
 
@@ -1700,13 +1506,6 @@ const SILENCE_ROWS: &[(Canary, i32, &[&str], &str)] = &[
     (Canary::Pinned, 1, &[], FAILED),
 ];
 
-/// `diag_silence` over its inputs, for a probe whose canary is not pinned and for one whose
-/// canary is. The unpinned probe's build that succeeded silently with no flag asking for
-/// `-Wunused-variable` (the measured build under `bare`, whose argv is the shape below) says
-/// the warning was not asked for; the same build with `-Wall`, or with `-Wall` taken back by
-/// `-w`, is the suppressed channel; a pinned probe's silent build is the suppressed channel
-/// whatever its flags; and a failed build is the failure under both. No outcome differs
-/// between the sentences.
 #[test]
 fn a_silent_build_that_never_asked_for_the_canary_says_so() {
     let argv = |flags: &[&str]| -> Vec<String> {
@@ -1722,9 +1521,7 @@ fn a_silent_build_that_never_asked_for_the_canary_says_so() {
         b.argv = argv(flags);
         b
     };
-    // Every enabler, in each spelling that carries it, keeps the other sentence. The names are
-    // written out here rather than read from the list, so a word dropped from the list fails
-    // this loop instead of leaving it.
+    // Every enabler, in each spelling that carries it, keeps the other sentence.
     for name in ["all", "unused", "unused-variable", "most", "everything"] {
         for word in [
             format!("-W{name}"),
@@ -1752,6 +1549,11 @@ fn a_silent_build_that_never_asked_for_the_canary_says_so() {
                 d.observed
             );
         }
+        assert_eq!(
+            d.rule.map(|r| r.rule().id),
+            (*says == NOT_ASKED).then_some(gating_rule::CANARY_NOT_ASKED_FOR.id),
+            "{canary:?} exit {exit_status} {flags:?}: the rule named"
+        );
     }
 
     // And through the detector, as the bare and bare-optimized cells read it.

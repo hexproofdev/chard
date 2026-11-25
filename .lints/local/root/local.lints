@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# chard's own lint settings, beside the house standard's tiers (.lints/standard names them).
+# assemble.sh merges these lines into the generated [workspace.lints] block in Cargo.toml; a
+# comment line here stays here. A key a tier also sets is kept only with the tier's value, so
+# the two keys below that tiers `all` and `kani` set are repeated with the tiers' values: the
+# reason is chard's, and the setting stays if a tier drops it.
+
+# `cfg(kani)` is set by the model checker, not by cargo, so it is not a known cfg and
+# trips this lint under `-D warnings` in an ordinary build. Declaring it keeps the
+# proofs in `proofs/` invisible to normal builds without silencing the lint for
+# genuine typos elsewhere.
+rust.unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }
+
+# The gate denies every clippy warning, `pedantic` below included, under one pinned clippy
+# (`make clippy-gate`, `CLIPPY_TOOLCHAIN` in the Makefile, in `check`), so a
+# change that adds a warning fails its merge, while a new clippy's new lint does not fail the
+# gate until the commit that moves the pin. On your default toolchain, `make clippy` and any
+# build still fail a deny-level lint (`clippy::all`, rustc's `unused`), which a newer
+# toolchain can widen; the warn-level `pedantic` lints are only shown there. rustc's own
+# `unused` family is denied here, so `dead_code`, `unused_imports` and `unused_variables`
+# fail every build, not only the gate's clippy run.
+rust.unused = { level = "deny", priority = -1 }
+
+# Pedantic lints turned off deliberately, with the reason recorded so the choice
+# is auditable rather than inherited.
+#
+# `must_use_candidate` fires on ~30 pure accessors (`succeeded()`, `aborted()`,
+# `needs_build()`). Every one is already used in expression position at its only
+# call sites; annotating them adds noise without excluding a class of bug.
+clippy.must_use_candidate = "allow"
+# `struct_field_names` objects to the `sh_`/`p_`/`e_` prefixes in elf.rs. Those
+# names are the ELF specification's own, and matching the spec verbatim is what
+# makes the parser reviewable against it.
+clippy.struct_field_names = "allow"
+# `struct_excessive_bools` fires on the CLI args struct, where the bools are
+# independent user-facing flags rather than a state machine that wants an enum.
+clippy.struct_excessive_bools = "allow"
+# `similar_names` objects to `e_phoff`/`e_shoff` and `args`/`argv`. The first pair
+# are the ELF specification's own field names, the second is the conventional
+# distinction between a flag list and a full command line; renaming either to
+# please the lint would make both harder to check against their references.
+clippy.similar_names = "allow"
+
+# Three pedantic lints raised to deny. A cast that drops bits, drops a sign or widens where
+# `From` would say so is a number read wrong without an error, and a reading taken from a foreign
+# artifact must fail typed instead (src/lib.rs, "Why the lint wall"). At the pedantic group's
+# warn they fail only the gate's clippy, under -D warnings; at deny they fail every clippy run
+# over the package that brings no lint flags of its own.
+clippy.cast_possible_truncation = "deny"
+clippy.cast_sign_loss = "deny"
+clippy.cast_lossless = "deny"
+
+# A restriction lint, which no selected tier sets. A `println!` is a panic when stdout is a
+# closed pipe, so chard writes its output through `write_stdout` in src/main.rs. Test code may
+# print: clippy.toml's `allow-print-in-tests`, from the standard's `all` tier, exempts it.
+clippy.print_stdout = "deny"

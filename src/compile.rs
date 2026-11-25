@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Invoking the toolchain under test.
-//!
-//! Two operations, because two channels need different things from the compiler:
-//! [`build`] produces an artifact for the `elf-static` and `runtime` channels,
-//! and [`macro_dump`] preprocesses for the `macro` channel. Both record the full
-//! argv verbatim so any verdict in a report can be re-derived by hand.
-//!
-//! For the `compiler-diag` channel the [`BuildRecord`] *is* the observable —
-//! whether the compiler warned, errored, or said nothing at all leaves no trace
-//! in any binary.
 
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,29 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest;
 
-/// Headers preprocessed for the with-libc macro dump. `__GLIBC__` and
-/// `__USE_FORTIFY_LEVEL` are defined by libc headers, not by the compiler, so a
-/// bare `-dM -E` on empty input cannot see them — and `__USE_FORTIFY_LEVEL` is
-/// the single most useful macro chard reads, because it is the level glibc
-/// *actually settled on* rather than the one the command line asked for.
-/// The synthetic translation unit whose macro dump identifies the C library.
-///
-/// `<features.h>` is glibc's and exists nowhere else, so including it unconditionally made
-/// this file a **fatal error** on Darwin — `fatal error: 'features.h' file not found`, exit
-/// 1 — and the macro channel there worked only because clang keeps preprocessing and dumps
-/// its macros anyway. Measured on Apple clang 21: 3047 `#define` lines on stdout beside a
-/// fatal error on stderr. Every macro-channel check on that platform rested on the driver
-/// choosing to continue past an error it called fatal, and a future clang that stops
-/// instead would have taken all of them down at once, silently.
-///
-/// The guard is nested rather than `defined(__has_include) && __has_include(...)`, because
-/// a preprocessor without `__has_include` would expand the second operand of the `&&`
-/// before short-circuiting and fail on the syntax.
-///
-/// Costs nothing where it is present: the dump is byte-identical with and without the
-/// explicit include on gcc 16 / glibc, clang 22 / glibc and musl-gcc, because every glibc
-/// header pulls `<features.h>` in for itself. The include earns its place by making the
-/// dependency explicit, not by being the only path to `__GLIBC__`.
+/// The synthetic translation unit whose macro dump identifies the C library. `__GLIBC__` and
+/// `__USE_FORTIFY_LEVEL` are defined by libc headers, not by the compiler, so a bare `-dM -E`
+/// on empty input cannot see them; `__USE_FORTIFY_LEVEL` is the level glibc settled on, not
+/// the one the command line asked for.
 const LIBC_PROBE_HEADERS: &str = "#if defined(__has_include)\n\
                                   #  if __has_include(<features.h>)\n\
                                   #    include <features.h>\n\
@@ -57,18 +32,8 @@ const LIBC_PROBE_HEADERS: &str = "#if defined(__has_include)\n\
 pub struct BuildRecord {
     pub argv: Vec<String>,
     /// Profile flags the harness removed before invoking the driver, because they cannot
-    /// coexist with this probe's output kind — `-pie` against `-shared`, and the rest of
+    /// coexist with this probe's output kind: `-pie` against `-shared`, and the rest of
     /// [`crate::probe::LinkMode::conflicts_with`].
-    ///
-    /// Empty for almost every build, and serialized only when it is not, but it must exist:
-    /// without it `profile.cflags` names a flag list that some builds did not use, and a
-    /// reader comparing the two has no way to tell a deliberate resolution from a harness
-    /// bug. That is the same defect as appending a flag over a stated one (a report naming
-    /// a flag list it did not measure), in the half that removes rather than adds.
-    ///
-    /// Recorded per build rather than on the profile because the conflict is a property of
-    /// the probe's link mode: the same profile drops `-pie` for a shared-object probe and
-    /// keeps it for every executable one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub dropped_flags: Vec<String>,
@@ -82,36 +47,21 @@ pub struct BuildRecord {
     pub artifact_sha256: Option<String>,
     /// SHA-256 of the job's standard output with its lines sorted ([`dump_digest`]), set on a
     /// `-dM -E` dump record as the report publishes it, where `stdout` itself is replaced by a
-    /// count of the defines.
-    ///
-    /// The digest is the key of the dump's `macro-dump` entry in the report's `facts` store,
-    /// so the filtered macros a verdict was read from are named by the lines they were parsed
-    /// out of. `None` on every other record, and on the record a detector reads, which still
-    /// carries the dump itself.
+    /// count of the defines. It keys the dump's `macro-dump` entry in the report's `facts`
+    /// store, so the macros a verdict was read from are named by the lines they were parsed
+    /// out of. `None` on every other record, and on the record a detector reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout_sha256: Option<String>,
     /// Whether the job's standard output ended partway through a line: text other than
     /// whitespace followed its last newline, or made up the whole output where it printed
-    /// none. Set by [`invoke`] from the text it read, before `stdout` is stored with its
-    /// trailing whitespace trimmed, which leaves no other trace of it. Serialized only where
-    /// it is true.
-    ///
-    /// A `-dM -E` listing ends each define with a newline (measured over an empty unit and
-    /// `<stdio.h>` with gcc 11, 12, 13, 14, 15 and 16 and clang 14, 18, 22 and 23 on Linux and
-    /// Apple clang 21 on macOS), so a dump whose last line is unterminated was cut off, for
-    /// example by a closed pipe, a signal, or a filesystem that filled. A driver whose whole
-    /// listing lacked the final newline would have every dump read as failed (withheld,
-    /// refused or named as below), never `off`. Its last line may be a define cut short, `#define __GLIBC_MINOR__ 4` from
-    /// `43`, and the status says nothing of it: gcc 16.1.1's driver exits 0 when its `cc1` dies
-    /// of a closed pipe under `-wrapper` with its stdout cut mid-line, and 1 when a signal kills
-    /// the `cc1` (Fedora 44 x86_64). So [`Self::whole_stdout`] drops that line before a dump is
-    /// parsed, and [`Self::dump_failure`] reads such a dump as failed whatever its status.
+    /// none. Set by `invoke` from the text it read, before `stdout` is stored with its
+    /// trailing whitespace trimmed, which leaves no other trace of it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stdout_unterminated: bool,
 }
 
 /// How a job that recorded `exit_status` ended: `exited N`, or `was killed by a signal` for
-/// the `-1` [`invoke`] records where the child has no exit code (a real `exit(-1)` reads 255
+/// the `-1` `invoke` records where the child has no exit code (a real `exit(-1)` reads 255
 /// on Unix). [`BuildRecord::ended`] reads it, and so does a status kept apart from its record
 /// (`toolchain::ProfileDump`'s), so the sentinel has one spelling wherever it is published.
 #[must_use]
@@ -123,10 +73,6 @@ pub fn ended(exit_status: i32) -> String {
     }
 }
 
-/// No published sentence spells a job's status by hand: every "exited N" goes through
-/// [`ended`], so the `-1` sentinel is never "exited -1". A text scan, as
-/// `tests/discarded_failures.rs` is, for the two spellings that bypass [`ended`].
-/// `(exit {}` and not `exit {}`: chard's own exit code is a number, not a job's status.
 #[cfg(test)]
 #[test]
 fn every_exit_status_is_spelled_by_ended() {
@@ -189,15 +135,6 @@ impl BuildRecord {
     /// Why a `-dM -E` dump is not read as a whole listing: its [`Self::failure`], or, for one
     /// that exited 0, its output cut off partway through a line ([`Self::stdout_unterminated`]);
     /// `None` for a dump that exited 0 with its last line ended.
-    ///
-    /// The one reading of "did this `-dM -E` dump fail" and of the sentence that says so:
-    /// a variant's dump (`report::Variant::macro_dump_failure`) and the two `toolchain::detect`
-    /// takes (the intrinsic one, refused, and the with-headers one, published as
-    /// `libc_headers_error` and named in the libc's detection) all ask it, so the detection
-    /// and the measurement cannot disagree about whether a dump failed. The dumps under the
-    /// profile's flags publish their status and [`Self::stdout_unterminated`] whole, and
-    /// `toolchain::ProfileMacroWitness` reads either as `dump-failed`, so a listing cut under a
-    /// driver that exited on its own is never read as whole.
     #[must_use]
     pub fn dump_failure(&self, workdir: Option<&Path>) -> Option<String> {
         self.failure(workdir).or_else(|| {
@@ -209,12 +146,6 @@ impl BuildRecord {
     /// `stdout` without its last line where the job's output ended partway through it
     /// ([`Self::stdout_unterminated`]), and whole otherwise, whatever the status: what a dump
     /// is parsed from.
-    ///
-    /// Only the unterminated line goes. A reader that keyed on the status instead would go
-    /// wrong both ways: a line cut under a driver that exited on its own would read as a
-    /// define, and a whole last line a signal followed would be dropped. Dropping the last
-    /// line of every failed dump would drop whichever define gcc's identifier-table order
-    /// listed last, and a `__GLIBC__` listed last would read the library as `unknown`.
     #[must_use]
     pub fn whole_stdout(&self) -> &str {
         if self.stdout_unterminated {
@@ -226,14 +157,6 @@ impl BuildRecord {
 
     /// The first non-empty line of stderr as the report publishes it, trimmed and cut
     /// at 200 characters.
-    ///
-    /// What a one-line reason quotes when it names a failed job: the compiler's first
-    /// line is the fatal error, and a reader who needs more has the record itself. The
-    /// line is rewritten for publication (`measure::publish_text`, against `workdir`)
-    /// before it is cut, so the 200 characters are the same 200 under every `--workdir`.
-    /// Cut first, a long work directory would spend the budget on a prefix the published
-    /// reason does not carry. `None` for `workdir` is a
-    /// record whose paths are already published.
     #[must_use]
     pub fn first_stderr_line(&self, workdir: Option<&Path>) -> Option<String> {
         self.stderr
@@ -249,18 +172,6 @@ impl BuildRecord {
     }
 
     /// A copy for publication, with every path under `workdir` made relative to it.
-    ///
-    /// The driver is invoked with absolute paths, because the operator's own flags are
-    /// resolved against the operator's working directory and changing the child's
-    /// directory would change their meaning; `-include foo.h` in a `--flags` list is
-    /// the ordinary case. What is *recorded* is another matter. An absolute work
-    /// directory in every `argv` and every diagnostic is host detail a published report
-    /// has no use for, and it is what made two runs of one measurement differ in every
-    /// build line. Relative to the work directory, `argv` is re-runnable from inside it
-    /// and identical wherever it was produced.
-    ///
-    /// Applied to the copy the report carries and never to the record a detector reads,
-    /// which stays as captured: see `measure::publish`.
     #[must_use]
     pub fn relative_to(&self, workdir: &Path) -> Self {
         Self {
@@ -288,19 +199,6 @@ impl BuildRecord {
 }
 
 /// `text` with every path under `workdir` made relative to it.
-///
-/// `workdir/name` becomes `name` and a bare `workdir` becomes `.`, so `-o /work/probe`
-/// reads `-o probe`, `-L/work` reads `-L.`, and a diagnostic's `/work/probe.c:3:5:`
-/// reads `probe.c:3:5:`. Textual, and deliberately so: the callers hold argv entries,
-/// compiler stderr and detector summaries, and the one thing they share is that the
-/// work directory's absolute spelling appears in them verbatim.
-///
-/// Matched on whole path components. The spelling has to be followed by `/`, by the end
-/// of the text, or by a character that cannot continue a component (whitespace, or the
-/// punctuation a diagnostic or an option closes a path with), so a work directory
-/// `/tmp/wd` leaves `/tmp/wd2/x.c` and `/tmp/wd.bak` as written. As a substring
-/// replacement it rewrote the first to `.2/x.c`, in published argv and stderr alike,
-/// which is evidence corrupted rather than trimmed.
 #[must_use]
 pub fn relativize(text: &str, workdir: &Path) -> String {
     let root = workdir.display().to_string();
@@ -338,89 +236,31 @@ fn ends_component(c: char) -> bool {
     c.is_whitespace() || matches!(c, '/' | ':' | '\'' | '"' | ')' | ',' | ';' | '=' | '>')
 }
 
-/// How long any single toolchain or package-manager invocation may take.
-///
-/// `.output()` waits forever, and every measurement chard takes runs through here. A
-/// compiler that wedges (a bad `-specs` file, an NFS stall, a package manager holding a
-/// lock nobody will release) would hang the whole sweep with no diagnostic, and on an
-/// 18-guest run the symptom is one lane that never returns.
-///
-/// 120 seconds is set against measurement rather than taste. Across the 5,204 compiler
-/// and package-manager invocations of a sweep, the slowest was **451 ms**
-/// (`clang++`), the p99 was 144 ms and the median 22 ms. So this is 266x the observed
-/// maximum: far too loose to fire on a loaded box — which this one is, being shared —
-/// and still a bound.
+/// How long any single toolchain invocation may take.
 pub const INVOKE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long to wait for the output threads once the child itself has been reaped.
-///
-/// `try_wait` returning a status means the *child* is gone, not that its pipes are
-/// closed: anything that inherited the write end holds them open, and `join()` on a
-/// reader parked in `read` carries no deadline of its own. So `INVOKE_TIMEOUT` did not
-/// bound this function at all. Demonstrated, against this code: `sh -c 'sleep 30 & exit
-/// 0'` under a 400 ms bound returned after 30.0 s, because the backgrounded `sleep` still
-/// held stdout — 75x the bound the caller asked for. In the field the shape is a
-/// compiler wrapper that leaves a server behind, `sccache` and `distcc` being the ones
-/// that turn up as `CC` on a build host.
-///
-/// Charged separately rather than against what is left of `INVOKE_TIMEOUT`: a compile
-/// that legitimately finishes at 119.9 s must not fail because there was no budget left
-/// to read what it wrote. The call is then bounded by `INVOKE_TIMEOUT + DRAIN_GRACE`,
-/// which is still a bound.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
-/// Read a child's pipe to the end, on a thread of its own.
-///
-/// A read error leaves whatever arrived before it. Partial output is still evidence and the
-/// exit status is recorded separately, so there is nothing here to propagate.
-fn drain<R: std::io::Read>(mut pipe: R) -> Vec<u8> {
+/// The longest `invoke_with_timeout` waits between looks at its child while either of the
+/// child's pipes is open.
+const EXIT_WAKE_BOUND: Duration = Duration::from_millis(10);
+
+/// Read a child's pipe to the end, on a thread of its own, then say so on `ended`.
+fn drain<R: std::io::Read>(mut pipe: R, ended: &Sender<()>) -> Vec<u8> {
     let mut buf = Vec::new();
     crate::error::best_effort(pipe.read_to_end(&mut buf));
+    crate::error::best_effort(ended.send(()));
     buf
 }
 
 /// The variables of chard's own environment a toolchain invocation is handed, when chard has
 /// them: `PATH` alone.
-///
-/// Every toolchain invocation chard makes runs under a cleared environment holding these, the
-/// run's `--env` pairs and [`COMPILER_ENV_PINNED`], and nothing else
-/// ([`compiler_environment`], applied in [`invoke_with_timeout`], so probe builds, macro
-/// dumps and the driver, linker and loader
-/// probes all see the same environment). The probes run under a cleared environment too;
-/// `run::PROBE_ENVIRONMENT` says why. `PATH` is passed because the drivers need it:
-/// gcc finds `as` and `ld` through it (`gcc -print-prog-name=as` prints a bare `as`), clang
-/// finds the linker through it, and a `ccache` masquerade directory finds the compiler behind
-/// it through it. It is also the one variable chard reads itself, to resolve `--cc`.
-///
-/// Measured before the change, 2026-10-11: on Fedora 44 x86_64 `gcc` and `clang` (both
-/// through `ccache` 4.12.3's masquerade directory) compile under `env -i` with `PATH`,
-/// `LC_ALL=C` and `TERM=dumb`, `ccache` finding the same cache directory without `HOME`; on
-/// arm64 macOS, Apple clang 21.0.0 from the Command Line Tools compiles, links and runs a C
-/// program under `env -i` with `PATH` alone and compiles one with no variable at all, and
-/// `-###` names the same triple, SDK version and `-isysroot` as with the shell's environment. Apple's `xcrun` shim reads
-/// `DEVELOPER_DIR` (a value naming no directory fails the compile, exit 1); without it the
-/// shim uses the developer directory `xcode-select` names. A host that chose its Xcode with
-/// `DEVELOPER_DIR` names that Xcode's compiler as `--cc` instead.
-///
-/// The cost is a toolchain that cannot run without a variable: a compiler built against
-/// libraries it finds only through `LD_LIBRARY_PATH`, as some module systems arrange, fails
-/// every invocation. Measured 2026-10-11 on Fedora 44 x86_64 with a stand-in `gcc` that
-/// exits 1 with the loader's message when `LD_LIBRARY_PATH` is unset, run under `measure
-/// --profile bare` with it set: before the clear the report published as usual; after it
-/// chard refuses the measurement (exit 2, "produced no predefined macros") and publishes no
-/// report, and the refusal's hint spells this environment as an `env -i` command.
 pub const COMPILER_ENV_PASSED: &[&str] = &["PATH"];
 
 /// The environment every toolchain invocation receives, in the order it is applied:
-/// [`COMPILER_ENV_PASSED`] as chard has them, then the run's `--env` pairs ([`ADDED`]), then
+/// [`COMPILER_ENV_PASSED`] as chard has them, then the run's `--env` pairs (`ADDED`), then
 /// [`COMPILER_ENV_PINNED`].
-///
-/// A passed variable chard does not have is absent, not empty: an empty `PATH` and an unset
-/// one are searched differently. A pair can name neither a passed variable nor a pin
-/// ([`compiler_environment_additions`] refuses both), and the pins come last besides, so a
-/// later entry replacing an earlier one never decides what a driver receives.
-///
-/// Reading it fixes the run's pairs ([`RunEnvironment::get`]).
 pub fn compiler_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     compiler_environment_from(|name| std::env::var_os(name), ADDED.get())
 }
@@ -469,26 +309,9 @@ pub fn compiler_environment_from(
 /// The run's `--env` pairs: variables the operator wrote in the invocation, which every
 /// toolchain invocation of the run receives ([`compiler_environment`]) and
 /// `profile.compiler_environment` publishes with their values.
-///
-/// They are how a toolchain configured through its environment is measured as configured.
-/// nixpkgs' cc-wrapper applies its hardening from `NIX_HARDENING_ENABLE`, and only for a
-/// role nix-shell's setup hooks switch on (`NIX_CC_WRAPPER_TARGET_HOST_<triple>=1`, and
-/// `NIX_BINTOOLS_WRAPPER_TARGET_HOST_<triple>=1` for the linker wrapper's `bindnow` and
-/// `relro`); under the cleared environment alone it adds none. Measured 2026-10-12 on the
-/// 26.05 release of the Nix distribution, x86_64, gcc 15.3.0 and clang 21.1.8 wrappers:
-/// the `on` count under `bare` was 22 before the clear and 14 after; with those three pairs it is 22
-/// again, every verdict and level of the six cells equal to the run before the clear, and
-/// with `NIX_HARDENING_ENABLE` alone it stays 14. The value comes from the invocation and
-/// never from chard's own environment, so the report and the command line that made it say
-/// the same thing; chard still reads nothing of its environment but `PATH`.
-///
-/// `measure` sets them once, at the door, before the toolchain is first run. The first read
-/// fixes the value, the empty list when nothing was set, so a set after any invocation has
-/// read it is an error ([`RunEnvironment::set`]) rather than a run whose early invocations
-/// and report saw another environment than its later ones.
 static ADDED: RunEnvironment = RunEnvironment::new();
 
-/// A list of pairs set at most once and fixed by its first read. [`ADDED`] is the one chard
+/// A list of pairs set at most once and fixed by its first read. `ADDED` is the one chard
 /// uses; a test makes its own to show that a set after a read fails.
 #[derive(Debug, Default)]
 pub struct RunEnvironment(std::sync::OnceLock<EnvPairs>);
@@ -508,8 +331,7 @@ impl RunEnvironment {
     pub fn set(&self, pairs: EnvPairs) -> Result<()> {
         self.0.set(pairs).map_err(|_refused| {
             anyhow::anyhow!(
-                "the compiler environment's --env pairs were set after a toolchain invocation \
-                 had read them, or set twice"
+                "the compiler environment's --env pairs were set after a toolchain invocation had read them"
             )
         })
     }
@@ -532,18 +354,6 @@ pub fn add_to_compiler_environment(pairs: EnvPairs) -> Result<()> {
 /// Read `--env NAME=VALUE` arguments into the pairs [`add_to_compiler_environment`] takes,
 /// sorted by name, refusing what the compiler's environment cannot honour as written.
 ///
-/// Refused, every one named in a single error: an argument with no `=`; a name that is not
-/// a portable shell name (a letter or `_`, then letters, digits and `_`), which is also what
-/// keeps the published `env -i` spelling one word per name; a name chard passes
-/// ([`COMPILER_ENV_PASSED`]) or pins ([`COMPILER_ENV_PINNED`]), since `PATH` comes from
-/// chard's own environment and a pin is what the diagnostic channels read under; a name
-/// given twice, whose value would be whichever came last; a NUL in a value, which no
-/// environment can hold; and a value holding a relative path ([`relative_path_in_value`]),
-/// for [`relative_path_arguments`]' reason: chard runs the toolchain in its own directory
-/// for the interrogations and in the work directory for the builds, so one relative path
-/// names two directories and one report describes two toolchains. An empty value is a
-/// value, and is kept.
-///
 /// # Errors
 ///
 /// A [`crate::error::ConfigError`] naming each refused argument and why.
@@ -563,21 +373,29 @@ pub fn compiler_environment_additions(args: &[String]) -> Result<EnvPairs> {
             continue;
         };
         if !portable(name) {
-            refused.push(format!(
-                "{arg:?}: {name:?} is not a portable variable name (a letter or `_`, then \
-                 letters, digits and `_`)"
-            ));
+            refused.push(format!("{arg:?}: {name:?} is not a portable variable name"));
         } else if COMPILER_ENV_PASSED.contains(&name) {
             refused.push(format!(
                 "{arg:?}: {name} is passed to the compiler from chard's own environment"
             ));
-        } else if COMPILER_ENV_PINNED
+        } else if let Some((pinned, pinned_value)) = COMPILER_ENV_PINNED
             .iter()
-            .any(|(pinned, _)| *pinned == name)
+            .find(|(pinned, _)| *pinned == name)
         {
+            let why = pin_reason(pinned).unwrap_or("");
             refused.push(format!(
-                "{arg:?}: {name} is pinned for every compiler invocation, because the \
-                 compiler-diag channel reads its diagnostics under that value"
+                "{arg:?}: {name} is pinned to {pinned_value:?} for every compiler invocation, \
+                 {why}"
+            ));
+        } else if let Some(pinned) = countermanded_pin(name) {
+            let why = pin_reason(pinned).unwrap_or("");
+            let value = COMPILER_ENV_PINNED
+                .iter()
+                .find(|(pin, _)| *pin == pinned)
+                .map_or("", |(_, value)| *value);
+            refused.push(format!(
+                "{arg:?}: {name} would undo {pinned}: ccache reads {name} as {pinned} negated, \
+                 and every compiler invocation receives {pinned}={value} {why}"
             ));
         } else if value.contains('\0') {
             refused.push(format!("{arg:?}: the value holds a NUL"));
@@ -586,10 +404,7 @@ pub fn compiler_environment_additions(args: &[String]) -> Result<EnvPairs> {
             refused.push(match found.reading.note() {
                 Some(note) => format!("{arg:?}: {path:?}, {note}"),
                 None => format!(
-                    "{arg:?}: {path:?} is a relative path, which the toolchain would read \
-                     against chard's directory in some invocations and the work directory in \
-                     others; write it absolute (a word that is not a path but names a file in \
-                     chard's directory is read as one: run chard from another directory)"
+                    "{arg:?}: {path:?} is a relative path, which the toolchain would read against chard's directory in some invocations and the work directory in others"
                 ),
             });
         } else if pairs.iter().any(|(given, _)| given == name) {
@@ -608,19 +423,15 @@ pub fn compiler_environment_additions(args: &[String]) -> Result<EnvPairs> {
 }
 
 /// The first relative path in an `--env` value, with how it was read, or `None`.
-///
-/// A value is read as words (split on whitespace) for the flags a wrapper variable can carry,
-/// held to [`relative_path_readings`], and as entries (split on `:` and whitespace) for the
-/// path lists a search variable carries. An entry is a relative path where it is `.` or `..`,
-/// holds a `/` without starting with one, or names something that `exists` in chard's
-/// directory; an entry that begins with `-`, `=` or `$` is a flag, a sysroot path or a
-/// reference, and is left to the word reading. Which variables a toolchain reads as paths is
-/// the toolchain's own (`COMPILER_PATH`, `LIBRARY_PATH`, a wrapper's own), so the rule is on
-/// the shape of the value and not on its name; a bare word that happens to name a file in
-/// chard's directory is refused with it, and the refusal says so.
 pub fn relative_path_in_value(value: &str, exists: impl Fn(&Path) -> bool) -> Option<RelativePath> {
     let words: Vec<String> = value.split_ascii_whitespace().map(str::to_owned).collect();
-    if let Some(found) = relative_path_readings(&words).into_iter().next() {
+    // The entry reading below decides a word that is no option.
+    if let Some(found) = relative_path_readings(&words).into_iter().find(|found| {
+        !matches!(
+            found.reading,
+            PathReading::Input | PathReading::Divided { .. }
+        )
+    }) {
         return Some(found);
     }
     value
@@ -640,12 +451,6 @@ pub fn relative_path_in_value(value: &str, exists: impl Fn(&Path) -> bool) -> Op
 /// The environment the run's toolchain invocations received, as `profile.compiler_environment`
 /// publishes it: built from the list [`compiler_environment`] hands every spawn, so the report
 /// and the spawns read one value.
-///
-/// A passed variable is published by name, its value withheld: chard's `PATH` names the
-/// operator's directories, and the report says the driver was handed it. A variable chard set
-/// is published with its value: the pins are chard's, and the `--env` pairs are the operator's
-/// own words from the invocation, so a reader re-running a measurement has every value it
-/// needs except `PATH`. Every value is published as written, so none is a credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompilerEnvironment {
     /// The [`COMPILER_ENV_PASSED`] names chard had and handed over.
@@ -703,201 +508,47 @@ impl CompilerEnvironment {
 
 /// The variables named as moving a measurement were they passed to a toolchain, each with its
 /// measurement or its argument, which the cleared environment keeps from it like any other.
-///
-/// [`compiler_environment`] decides what reaches the driver, and this decides nothing at
-/// spawn. A list of variables to remove would pass through every variable nobody had found;
-/// a cleared environment does not. This is the record of why the clear matters, entry by
-/// entry, and the names `tests/fake_driver.rs` sets in chard's own environment and holds the
-/// driver to receiving none of. `THREAT_MODEL.md` names each entry
-/// and `tests/register.rs` holds the two together.
-///
-/// How the list was derived, so that a later toolchain can repeat it. The 2026-10-09 inventory read
-/// the environment-variable names out of the programs themselves, on Fedora 44 x86_64: `strings`
-/// over gcc 16.1.1's `gcc`, `cc1`, `cc1plus`, `collect2` and `lto-wrapper`, clang 22.1.8's
-/// `clang-22`, `libclang-cpp.so.22.1` and `libLLVM.so.22.1`, and GNU binutils 2.46.1's `ld.bfd` and
-/// `as`; plus a `getenv` logger preloaded under a compile and a link through each driver, which
-/// names what is read on a plain build; plus the "Environment Variables Affecting GCC" node of that
-/// gcc's manual. A name that was a candidate in any of the three was then set in front of the real
-/// drivers and the difference sought in the driver's output, in the `-###` listing, in the object,
-/// and in the report. Not done: no `ld.lld` or `ld.gold` was installed on that host, so neither was
-/// read, and Apple's clang and `ld` were not read at all. The Darwin driver code is in the Linux
-/// clang, so its variables were measured there under `--target=arm64-apple-darwin`, which says what
-/// upstream's driver reads and not what Apple's fork adds.
-///
-/// - Changes the target or the code generated: `MACOSX_DEPLOYMENT_TARGET` and the four
-///   other `*_DEPLOYMENT_TARGET` names, `RC_DEBUG_PREFIX_MAP`, `RC_DEBUG_OPTIONS`,
-///   `GCC_COMPARE_DEBUG`, `SOURCE_DATE_EPOCH`, `LDEMULATION`, `GNUTARGET`.
-/// - Changes diagnostic text or exit status, which the compiler-diag channel parses:
-///   `GCC_EXTRA_DIAGNOSTIC_OUTPUT`, `GCC_URLS`, `EXPERIMENTAL_SARIF_SOCKET`,
-///   `COLLECT_NO_DEMANGLE`, `FORCE_CLANG_DIAGNOSTICS_CRASH`, `CLANG_CRASH_DIAGNOSTICS_DIR`
-///   and clang's `CC_PRINT_*` and `CC_LOG_DIAGNOSTICS` family.
-/// - Changes where the driver looks or writes: `SDKROOT`, `LPATH`, `GCC_ROOT`,
-///   `BINUTILS_ROOT`, `DEPENDENCIES_OUTPUT`, `SUNPRO_DEPENDENCIES`, `GCC_DIAGNOSTICS_LOG`,
-///   `CLANG_MODULE_CACHE_PATH`.
-/// - Read and measured inert on that host, so not removed, and listed as the record of
-///   having looked: `NO_COLOR` (colour is off on a pipe), `MAKEFLAGS`, `GLIBCXX_TUNABLES`
-///   (the compiler's own libstdc++ at run time), `HIP_PATH` and `ROCM_PATH` (HIP mode
-///   only), `CLANG_TOOLCHAIN_PROGRAM_TIMEOUT`, `LLVM_OVERRIDE_PRODUCER`,
-///   `LLVM_IGNORED_ENV_VAR`, `LIBCTF_DEBUG`, `AS_SECURE_LOG_FILE`, `G++_ROOT`, and
-///   `COLLECT_GCC`, `COLLECT_GCC_OPTIONS`, `COLLECT_AS_OPTIONS` and `COLLECT_LTO_WRAPPER`,
-///   which gcc sets for its own children and which ignored an inherited value. An inert
-///   reading is a reading of one version: a later toolchain that honours one of these
-///   moves it into a class above.
-/// - Left to a neighbouring entry: `LD_STATS`, `LD_LIBRARY_PATH` and the other loader
-///   variables, `OBJC_INCLUDE_PATH` (see the comment on `CPLUS_INCLUDE_PATH`), `PWD`
-///   (a working directory is chard's own to set), and `DEVELOPER_DIR` and `TOOLCHAINS`,
-///   which Apple's `xcrun` shim is expected to read and which no binary on the inventory
-///   host contains, so they are unmeasured.
-///
-/// Every name in the last two classes is kept from the driver by the clear as well, as is
-/// every name nobody has read. (`DEVELOPER_DIR` was measured on 2026-10-11; see
-/// [`COMPILER_ENV_PASSED`].) The comments below say "removed" in the sense of the list's
-/// first form.
 pub const COMPILER_ENV_NAMED: &[&str] = &[
-    // Refuse to inherit build configuration. A CFLAGS or CPATH in the
-    // ambient environment silently changing what we measure is precisely the
-    // class of error chard exists to detect, so we must not be subject to it.
+    // Build configuration: a `CFLAGS` or `CPATH` in the ambient environment silently
+    // changing what is measured is the class of error chard exists to detect.
     "CFLAGS",
     "CXXFLAGS",
     "CPPFLAGS",
     "LDFLAGS",
     "CPATH",
     "C_INCLUDE_PATH",
-    // The C++ sibling of `C_INCLUDE_PATH`. Measured 2026-10-05 on Fedora 44 x86_64
-    // (gcc 16.1.1, clang 22.1.8): a C++ source including a header found only in a
-    // directory this names built under `g++` and `clang++` with it set and failed
-    // without it. `OBJC_INCLUDE_PATH` is left out, measured rather than forgotten: in the
-    // same run a C source including the same header failed under both drivers with it
-    // set, and only clang's Objective-C mode read it; chard compiles C and C++.
+    // The C++ sibling of `C_INCLUDE_PATH`.
     "CPLUS_INCLUDE_PATH",
     "LIBRARY_PATH",
-    // The linker reads this one and writes what it finds into the artifact as
-    // `DT_RPATH`. `rpath-absent` then sees an RPATH in every arm, including the
-    // negative control, so the triple cannot discriminate and the check publishes
-    // `probe-invalid` — chard reporting its own instrument as broken because the
-    // operator's shell had a variable set. Exported by module systems and by
-    // hand-rolled toolchain environment scripts, so this is an ordinary host, not a
-    // hostile one.
+    // The linker writes what this names into the artifact as `DT_RPATH`, so
+    // `rpath-absent` sees an RPATH in every arm, the negative control included, and
+    // publishes `probe-invalid` because the operator's shell had a variable set.
     "LD_RUN_PATH",
-    // gcc's diagnostic colour palette. `TERM=dumb` and a piped stderr already keep
-    // colour off; this removes the one variable that restyles it.
+    // gcc's diagnostic colour palette.
     "GCC_COLORS",
     // Both drivers put their temporary objects where this points, and a linker
     // warning names the object it is about, so the name reaches the captured stderr
-    // and from there a control arm's `detail`. `measure::scrub_compiler_temp_names`
-    // knows the roots the drivers use when nothing redirects them; an operator's
-    // `TMPDIR` put the object outside those roots, and two normalized runs of one
-    // measurement differed again on the one line the scrubber existed for. Removed
-    // on the same reasoning as `CFLAGS`: an ambient variable deciding what a
-    // published record says is the class of error this tool exists to detect.
-    //
-    // The three after it are the drivers' fallbacks when `TMPDIR` is unset, which
-    // removing `TMPDIR` makes the case. Measured 2026-10-05 on Fedora 44 x86_64
-    // (gcc 16.1.1, clang 22.1.8) with `TMPDIR` unset and each variable alone pointing
-    // at a scratch directory: `-###` of a compile-and-link named temporary files in it
-    // under `TMP` and `TEMP` for both drivers and under `TEMPDIR` for clang alone. With
-    // all four removed both drivers fall back to `/tmp`, the root the scrubber knows.
+    // and from there a control arm's `detail`.
     "TMPDIR",
     "TMP",
     "TEMP",
     "TEMPDIR",
-    // The driver's own search path for the programs it runs. gcc searches
-    // `COMPILER_PATH` for `cc1`, `as` and `collect2` before its installed directories,
-    // and clang searches it for the linker. `GCC_EXEC_PREFIX` relocates gcc: it stands
-    // in for the installed `/usr/lib/gcc/`, gcc derives its program directory from it
-    // (`GCC_EXEC_PREFIX../../libexec/gcc/<triple>/<version>/`), stops looking in the
-    // installed one, and passes `-iprefix GCC_EXEC_PREFIX<triple>/<version>/` to `cc1`.
-    // Measured 2026-09-28 on Fedora 44 x86_64 (gcc 16.1.1, clang 22.1.8) and Fedora 44
-    // aarch64 (gcc 16.2.1, clang 22.1.8) with planted stand-ins: under
-    // `COMPILER_PATH`, `gcc -###` named the planted `cc1`, `as` and `collect2` and
-    // `clang -###` the planted `ld`, and a real compile or link ran them. Under
-    // `GCC_EXEC_PREFIX` with `cc1` planted at the derived program directory,
-    // `gcc -###` and `-print-prog-name=cc1` named the planted `cc1` and a real compile
-    // ran it; with the stand-ins planted at `GCC_EXEC_PREFIX<triple>/<version>/`
-    // instead, `gcc -###` named a bare `cc1` and a real compile failed with `cannot
-    // execute 'cc1'`, and a link under the relocated prefix failed with
-    // `liblto_plugin.so not found`. clang 22.1.8 does not read `GCC_EXEC_PREFIX`:
-    // `-###` differed only in temporary file names and a real link succeeded, so it
-    // is here for gcc.
+    // The driver's own search path for the programs it runs.
     "COMPILER_PATH",
     "GCC_EXEC_PREFIX",
-    // clang skips its default configuration file when this is set. On both Fedora 44
-    // hosts above, `clang -###` announced `Configuration file:
-    // /etc/clang/<triple>-clang.cfg` without it and no configuration file with it, so
-    // `toolchain.config_files` reads empty and a `bare` column's `flags_source` reads
-    // `none` for a driver a file does configure. Fedora's file carries only
-    // `--gcc-triple`, and the macro dump was the same with and without it (405 lines on
-    // x86_64, 419 on aarch64); a distribution whose file carries a hardening flag would
-    // lose that flag from the measurement.
+    // clang skips its default configuration file when this is set.
     "CLANG_NO_DEFAULT_CONFIG",
-    // clang rewrites its own command line from this before doing anything else. With
-    // `+-fno-stack-protector` in it, clang 22.1.8 on both hosts printed `### Adding
-    // argument -fno-stack-protector at end` and passed the flag to `-cc1`: the
-    // `CFLAGS` argument at full strength, since it edits argv after chard wrote it.
-    //
-    // Not in this list, measured rather than forgotten: `CLANG_CONFIG_FILE_SYSTEM_DIR`
-    // and `CLANG_CONFIG_FILE_USER_DIR` are CMake options fixed when clang is built, and
-    // `CLANG_CONFIG_FILE` is not a name clang reads. None of the three strings is in
-    // `clang-22` or `libclang-cpp.so.22.1` on either host above; the only `CLANG_CONFIG`
-    // string there is `CLANG_CONFIG_PATH`. A directory of planted files named for
-    // clang's own triple (`clang -print-target-triple`, `<triple>-clang.cfg`,
-    // `<triple>.cfg` and `clang.cfg`, each defining a macro) did not load with any of
-    // the four variables pointing at it or at its `<triple>-clang.cfg`: `clang -###`
-    // announced only `/etc/clang/<triple>-clang.cfg` and the macro dump carried no
-    // planted define.
+    // clang rewrites its own command line from this before doing anything else.
     "CCC_OVERRIDE_OPTIONS",
     // The diagnostic language, pinned by `LC_ALL` in [`COMPILER_ENV_PINNED`]; these
     // three are removed so nothing outranks or supplements the pin.
     "LANG",
     "LANGUAGE",
     "LC_MESSAGES",
-    // `$HOME`, because a file in it must not decide a distribution's verdict.
-    //
-    // chard states that rule and enforces it twice: the abuild query deliberately
-    // sources `/etc/abuild.conf` and not `~/.abuild/abuild.conf`, the makepkg query
-    // `/etc/makepkg.conf` and not `~/.makepkg.conf`, each with a comment saying
-    // that a file in `$HOME` deciding a distro verdict is the failure this tool
-    // exists to detect, and each with a test holding it. The rpm query goes through
-    // this function and had no such guard: `rpm` reads `~/.rpmmacros` by itself, so
-    // redefining `%build_cflags` there replaces Fedora's twenty-token flag list
-    // with anything at all. Reproduced by planting one under a scratch `HOME` —
-    // the query returned the planted string, and three checks then published `on`
-    // with `discriminating: true` on a binary carrying none of those protections.
-    //
-    // Removed rather than redirected: `rpm --eval` and `gcc` both work without it
-    // here, and pointing it at a directory invites something to write there. It is
-    // scrubbed for probe compilation too, on the same reasoning as `CFLAGS` — an
-    // ambient file changing what gets measured is the class of error chard exists
-    // to detect, so chard must not be subject to it.
-    //
-    // No distribution query remains for this paragraph to describe, and `HOME` stays
-    // removed on the last paragraph's argument alone. clang's
-    // `CLANG_CONFIG_FILE_USER_DIR` build option names a per-user configuration
-    // directory, which is where a home directory can reach a driver. Fedora 44's clang
-    // 22.1.8 is built without one: `clang -v` names only the system directory
-    // `/etc/clang/`, and with `HOME` or `XDG_CONFIG_HOME` pointing at a scratch
-    // directory holding `.config/clang/` planted as in the "Not in this list"
-    // paragraph above, neither `clang -###` nor the macro dump showed a planted
-    // file on either Fedora 44 host.
+    // `$HOME`, because a file in it must not decide what chard measures: an ambient file
+    // changing what is measured is the class of error chard exists to detect.
     "HOME",
-    // The Darwin deployment target. The Darwin driver takes the minimum macOS version from
-    // this when no `-mmacosx-version-min=` and no versioned triple says otherwise, and the
-    // version is part of the triple the compiler compiles for. Reproduced on Fedora 44
-    // x86_64 with clang 22.1.8, whose Darwin driver is the upstream code Apple's is derived
-    // from: `--target=arm64-apple-darwin25.0.0 -### -c` names `-triple
-    // arm64-apple-macosx26.0.0` without the variable and `arm64-apple-macosx10.15.0` with
-    // `MACOSX_DEPLOYMENT_TARGET=10.15`, and the macro dump follows
-    // (`__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__` 260000 against 101500). The variable
-    // is not read for the versionless `arm64-apple-macosx` triple. On Apple clang 21 (arm64
-    // macOS) the same move was measured in the triple and in every
-    // macro-dump digest of a report with no verdict moving: digests that differ between
-    // two runs for a reason the report does not record. With the variable removed the target
-    // is the toolchain's own default, and the macro dump `--emit-macros` publishes states it.
-    //
-    // The same code reads the other four. Under `--target=arm64-apple-darwin`,
-    // `RC_DEBUG_PREFIX_MAP=a=b` added `-fdebug-prefix-map=a=b` to the `-cc1` line and
-    // `RC_DEBUG_OPTIONS=1` added `-dwarf-debug-flags` carrying the whole command line;
-    // rewriting debug info is code generation.
+    // The Darwin deployment target.
     "MACOSX_DEPLOYMENT_TARGET",
     "IPHONEOS_DEPLOYMENT_TARGET",
     "TVOS_DEPLOYMENT_TARGET",
@@ -906,70 +557,36 @@ pub const COMPILER_ENV_NAMED: &[&str] = &[
     "DRIVERKIT_DEPLOYMENT_TARGET",
     "RC_DEBUG_PREFIX_MAP",
     "RC_DEBUG_OPTIONS",
-    // The SDK, which `-isysroot` also names. The string is in `libclang-cpp`, and Apple's
-    // tools are expected to read it as well; it had no effect on the Linux driver, measured
-    // (`-###` identical with and without it, for a Linux and an Apple triple). Removed on
-    // the `CPATH` reasoning: an ambient path deciding which headers a measurement saw. The
-    // cost falls on a Darwin host that relies on it: with no SDK found the compile fails,
-    // which reads `build-failed` and not a verdict, and `--profile explicit --flags
-    // "-isysroot SDK"` puts the SDK in the report. Not measured on Darwin.
+    // The SDK, which `-isysroot` also names.
     "SDKROOT",
-    // gcc's `-fcompare-debug` through the environment. Measured: the `cc1` line gains
-    // `-fcompare-debug=...`, a random seed and a `-fdump-final-insns=` file; the object
-    // came out byte identical; a mismatch between the two compiles is a compile error.
+    // gcc's `-fcompare-debug` through the environment.
     "GCC_COMPARE_DEBUG",
     // `fixits-v1` and `fixits-v2` add a `fix-it:` line to gcc's stderr (12 lines against 11
     // for an implicit `printf`), and the compiler-diag channel matches stderr text.
     "GCC_EXTRA_DIAGNOSTIC_OUTPUT",
-    // gcc's hyperlinks in diagnostics. Measured to change nothing on a pipe, under
-    // `TERM=dumb` or `xterm`, for `yes`, `st` and `bel`; it is removed on the text
-    // argument above and not on an effect, since a gcc that honoured it on a pipe would
-    // put escape sequences inside the strings the channel matches.
+    // gcc's hyperlinks in diagnostics.
     "GCC_URLS",
-    // gcc writes a trace of its diagnostics machinery to the path named. stderr is
-    // unchanged; the effect is a file written where the operator pointed.
+    // gcc writes a trace of its diagnostics machinery to the path named.
     "GCC_DIAGNOSTICS_LOG",
-    // gcc 16 sends diagnostics to a SARIF socket. With a path that does not connect the
-    // result is `cc1: fatal error: unable to connect to ...` and exit 1: a build failure
-    // caused by the environment alone.
+    // gcc 16 sends diagnostics to a SARIF socket.
     "EXPERIMENTAL_SARIF_SOCKET",
     // GNU ld reads it, and `gcc` and `clang` both pass `-m` themselves, so a link through
-    // either driver is unchanged (measured). `ld.bfd` run directly with
-    // `LDEMULATION=elf_i386` refuses an x86_64 object: it selects the target. `GNUTARGET`
-    // is the same class for BFD's input format and was inert through both drivers.
+    // either driver is unchanged (measured).
     "LDEMULATION",
     "GNUTARGET",
     // `COLLECT_NO_DEMANGLE=1` turns the linker's symbol demangling off: `undefined
-    // reference to `f()'` becomes `undefined reference to `_Z1fv'`. Measured through `g++`.
+    // reference to `f()'` becomes `undefined reference to `_Z1fv'`.
     "COLLECT_NO_DEMANGLE",
-    // The embedded build time. `__DATE__` and `__TIME__` read it in both drivers
-    // (`Jan  1 1970 00:00:00` under `0`, measured). The intrinsic macro dump does not
-    // contain them, so no digest moved in the 72-cell report. Removed because a variable
-    // that changes what a compile embeds is configuration, whether or not a probe happens
-    // to embed it. Pinning it, to make the probe objects reproducible, is a different
-    // change and is not made here.
+    // The embedded build time.
     "SOURCE_DATE_EPOCH",
-    // gcc's driver reads these three as search roots. `GCC_ROOT` and `BINUTILS_ROOT`
-    // changed the `COMPILER_PATH` that the `-###` listing prints and `LPATH` the
-    // `LIBRARY_PATH` and the order in it: `COMPILER_PATH` and `LIBRARY_PATH` by other names.
+    // gcc's driver reads these three as search roots.
     "LPATH",
     "GCC_ROOT",
     "BINUTILS_ROOT",
     // gcc's older dependency-output variables behave as `-MM` and `-MD` for every compile.
-    // Measured on the 72-cell `bare` report with `DEPENDENCIES_OUTPUT` or
-    // `SUNPRO_DEPENDENCIES` naming a file, on both drivers: ten cells moved from `off` (or
-    // `unsupported`) to `build-failed`, and the file collected a dependency line for every
-    // compile. Loud and not silent, which is the one thing in its favour.
     "DEPENDENCIES_OUTPUT",
     "SUNPRO_DEPENDENCIES",
-    // clang's own reporting. The `CC_PRINT_*` and `CC_LOG_DIAGNOSTICS` family writes to
-    // stderr when its `_FILE` companion is unset. Measured: `CC_PRINT_OPTIONS=1` put the
-    // whole `-cc1` command line on stderr, `CC_LOG_DIAGNOSTICS=1` an XML plist,
-    // `CC_PRINT_PROC_STAT=1` a timing line and `CC_PRINT_INTERNAL_STAT=1` a JSON block; in
-    // a `measure` run `CC_PRINT_OPTIONS=1` changed 244 report fields and
-    // `CC_PRINT_HEADERS=1`, which lists every included header, 139 (build stderr and the
-    // details quoting it), with no verdict moving. The `_FILE`, `_FORMAT` and `_FILTERING`
-    // companions are here on the strength of the family, not of an effect seen.
+    // clang's own reporting.
     "CC_PRINT_OPTIONS",
     "CC_PRINT_HEADERS",
     "CC_PRINT_HEADERS_FILE",
@@ -981,37 +598,505 @@ pub const COMPILER_ENV_NAMED: &[&str] = &[
     "CC_PRINT_INTERNAL_STAT_FILE",
     "CC_PRINT_PROC_STAT",
     "CC_PRINT_PROC_STAT_FILE",
-    // clang's crash handling. `FORCE_CLANG_DIAGNOSTICS_CRASH=1` makes every compile crash
-    // and print the "PLEASE submit a bug report" text (measured). The directory names where
-    // the reproducer is written, and the path is printed on stderr (measured).
+    // clang's crash handling.
     "FORCE_CLANG_DIAGNOSTICS_CRASH",
     "CLANG_CRASH_DIAGNOSTICS_DIR",
-    // Where `-fmodules` keeps its cache, printed in the `-cc1` line (measured). No C probe
-    // compiles with modules, so this is location only today.
+    // Where `-fmodules` keeps its cache, printed in the `-cc1` line (measured).
     "CLANG_MODULE_CACHE_PATH",
 ];
 
 /// The variables every compiler invocation receives with a fixed value.
-///
-/// `LC_ALL=C` pins the diagnostic language. The compiler-diag channel matches on
-/// wording, and gcc ships translated diagnostics — `/usr/share/locale/*/LC_MESSAGES/gcc.mo`
-/// is present on this very host — so an operator whose locale is set would get a
-/// translated body and every wording match would silently fail, including the existing
-/// implicit-function-declaration check. That reasoning was written for the driver probes
-/// and applies with more force to probe builds, where the wording being matched is what
-/// decides a check's verdict.
-///
-/// Honest scope: the translated case could not be reproduced here, because no
-/// non-English locale is generated on this machine and gcc falls back to English. What
-/// *is* reproducible is that the quoting style changes — `LC_ALL=C` yields 'main' while
-/// `C.UTF-8` yields ‘main’ — which any matcher quoting an identifier would trip over.
-/// Both risks cost one line to remove, and parsing another program's human-readable
-/// output without pinning its language is a mistake regardless of whether this host can
-/// demonstrate it.
-///
-/// `TERM=dumb`: colour escapes in captured diagnostics would break substring matching
-/// for the compiler-diag channel.
-pub const COMPILER_ENV_PINNED: &[(&str, &str)] = &[("LC_ALL", "C"), ("TERM", "dumb")];
+pub const COMPILER_ENV_PINNED: &[(&str, &str)] = &[
+    ("LC_ALL", "C"),
+    ("TERM", "dumb"),
+    ("CCACHE_DISABLE", "1"),
+    ("CCACHE_CONFIGPATH", "/dev/null"),
+];
+
+/// Whether the pin `name` is one of ccache's boolean settings, which ccache negates as
+/// `CCACHE_NO<setting>` (its manual, "Boolean values"); `None` for a name that is not a pin.
+/// Every pin is named here, so a pin added without a class fails
+/// `every_pin_is_refused_with_its_own_reason`. Booleanness is the setting's, never inferred
+/// from the pin's value: ccache takes a boolean variable set to any value, the empty string
+/// included, as true.
+#[must_use]
+pub fn ccache_boolean_pin(name: &str) -> Option<bool> {
+    match name {
+        "CCACHE_DISABLE" => Some(true),
+        "LC_ALL" | "TERM" | "CCACHE_CONFIGPATH" => Some(false),
+        _ => None,
+    }
+}
+
+/// The pin a variable named `name` would undo, read the way the pin's reader reads it: ccache
+/// takes `CCACHE_NO<setting>` as a boolean `CCACHE_<setting>` negated, so `CCACHE_NODISABLE`
+/// undoes `CCACHE_DISABLE=1`. Measured with ccache 4.12.3 under `env -i`: with both set, the
+/// later in the environment decides. The child's environment chard builds is sorted by name
+/// (measured through a driver printing its `environ`), which puts `CCACHE_NODISABLE` after
+/// `CCACHE_DISABLE`, so the negation would win.
+#[must_use]
+pub fn countermanded_pin(name: &str) -> Option<&'static str> {
+    let setting = name.strip_prefix("CCACHE_NO")?;
+    COMPILER_ENV_PINNED
+        .iter()
+        .map(|(pinned, _)| *pinned)
+        .filter(|pinned| ccache_boolean_pin(pinned) == Some(true))
+        .find(|pinned| pinned.strip_prefix("CCACHE_") == Some(setting))
+}
+
+/// The reason a pin is pinned, as the `--env` refusal of its name gives it; `None` for a name
+/// that is not a pin. A test holds every pin to have one.
+fn pin_reason(name: &str) -> Option<&'static str> {
+    match name {
+        "LC_ALL" | "TERM" => {
+            Some("because the compiler-diag channel reads its diagnostics under that value")
+        }
+        "CCACHE_DISABLE" => Some(
+            "so that a ccache masquerade directory on PATH serves no object this run did not build",
+        ),
+        "CCACHE_CONFIGPATH" => Some("so that no ccache configuration file decides the compile"),
+        _ => None,
+    }
+}
+
+/// The file name of the run's generated header ([`RunWitness`]), written into the work
+/// directory and named on each build's command line as `-include` names it. A bare name:
+/// the driver runs in the work directory ([`build`]), where `-include` looks first, and a
+/// path would reach whatever the compiler records of the names it was given, as the source's
+/// would.
+pub const RUN_WITNESS_HEADER_NAME: &str = "chard_run_witness.h";
+
+/// Where [`RunWitness::random_in`] reads the nonce: the kernel's random device, present on
+/// every platform chard builds probes on.
+const RANDOM_DEVICE: &str = "/dev/urandom";
+
+/// Where a run's nonce came from, as `run.artifact_witness.source` publishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WitnessSource {
+    /// 128 bits read from the operating system for this run alone.
+    OsRandom,
+    /// The first 128 bits of a digest over what the run was asked ([`RunWitness::derived_in`]),
+    /// so that a second run of the same measurement builds the same bytes.
+    Derived,
+}
+
+impl WitnessSource {
+    /// Every source, which `tests/schema_conformance.rs` holds the schema's enumeration to.
+    pub const ALL: [Self; 2] = [Self::OsRandom, Self::Derived];
+
+    /// The source as `run.artifact_witness.source` spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OsRandom => "os-random",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+/// The run's witness: one nonce, written into every artifact the run builds and read back
+/// from each before anything else is read from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWitness {
+    /// The nonce as lowercase hex, two digits a byte: the spelling
+    /// `ElfFacts::run_witness` reads one back in.
+    nonce: String,
+    source: WitnessSource,
+}
+
+/// Why an artifact the ELF reader read is not read as this run's build by the compiler the
+/// report names, as the gating's reason and a withheld arm's `detail` say it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitnessAbsence {
+    /// The reader read no run witness from the artifact: it found no note of the witness's
+    /// owner, type and length, or found one only in a section of the witness's name that it
+    /// could not follow to its end.
+    Missing,
+    /// No run witness, as for [`Self::Missing`], in an artifact holding compiler IR
+    /// (`report::LTO_IR_SECTION_PREFIX`): an object compiled under `-flto` and not linked,
+    /// which cannot carry the note, since the compiler writes it with the code at the link.
+    /// Said apart from [`Self::Missing`] so the reason does not blame a cache where the
+    /// profile explains it.
+    MissingFromIr,
+    /// The artifact carries these run witnesses, and they are not this run's alone.
+    Foreign(Vec<String>),
+    /// The ELF reader refused the artifact, for this reason, so no witness could be read
+    /// from it: a file that is not an object at all (a script a wrapper left in the
+    /// executable's place) is as little this run's build as an object without the note.
+    Unread(String),
+    /// The artifact is LLVM bitcode (its first four bytes are the bitcode magic), which the
+    /// ELF reader does not read: clang's object under `-flto`, compiled and not linked. As
+    /// with [`Self::MissingFromIr`], the profile explains it and no cache need have.
+    Bitcode,
+    /// A library the probe's link takes, which this run builds first, is not this run's
+    /// for the `absence` given, so the probe was not linked against it.
+    Library {
+        /// The library's file name.
+        name: String,
+        absence: Box<WitnessAbsence>,
+    },
+    /// The artifact is a relocatable object whose `.comment` holds these compiler lines,
+    /// which name another family than the one the report names, or that family at another
+    /// release (`toolchain::object_compiler`). `named` is the compiler the report names, as
+    /// `toolchain.kind` and `toolchain.version` spell it. `witnessed` says the run had a
+    /// witness, which the object carries; a run with no witness (a macOS run reading an ELF
+    /// cross-compiler's objects) holds its objects to their line all the same.
+    OtherCompiler {
+        lines: Vec<String>,
+        named: String,
+        witnessed: bool,
+    },
+}
+
+impl std::fmt::Display for WitnessAbsence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let section = crate::elf::RUN_WITNESS_SECTION;
+        match self {
+            Self::Missing => write!(
+                f,
+                "carries no run witness: the reader read no `{}` note of type {} and {} bytes \
+                 from `{section}` or the note segments",
+                crate::elf::RUN_WITNESS_OWNER,
+                crate::elf::RUN_WITNESS_TYPE,
+                crate::elf::RUN_WITNESS_BYTES
+            ),
+            Self::MissingFromIr => write!(
+                f,
+                "carries no run witness and holds compiler IR (`{}` sections): under link-time optimization the compiler writes the `{section}` note with the code it generates",
+                crate::report::LTO_IR_SECTION_PREFIX
+            ),
+            Self::Foreign(found) => match found.as_slice() {
+                [one] => write!(f, "carries a run witness this run did not write (`{one}`)"),
+                many => write!(
+                    f,
+                    "carries {}{} run witnesses (`{}`) where a build of this run carries its \
+                     one",
+                    if many.len() == crate::elf::RUN_WITNESSES_KEPT {
+                        "at least "
+                    } else {
+                        ""
+                    },
+                    many.len(),
+                    many.join("`, `")
+                ),
+            },
+            Self::Unread(why) => write!(
+                f,
+                "is one the ELF reader refused, so no run witness could be read from it ({why})"
+            ),
+            Self::Bitcode => write!(
+                f,
+                "is LLVM bitcode, compiler IR the ELF reader does not read: under link-time optimization the compiler writes the `{section}` note with the code it generates"
+            ),
+            Self::Library { name, absence } => write!(
+                f,
+                "was not linked: `{name}`, a library the probe's link takes and this run \
+                 builds first, {absence}"
+            ),
+            Self::OtherCompiler {
+                lines,
+                named,
+                witnessed,
+            } => write!(
+                f,
+                "{}its `.comment` names another compiler (`{}`, where `toolchain` is {named})",
+                if *witnessed {
+                    "carries this run's witness, and "
+                } else {
+                    "is a relocatable object, and "
+                },
+                lines.join("`, `")
+            ),
+        }
+    }
+}
+
+/// What a run was asked, as a derived nonce digests it ([`RunWitness::derived_in`]): the
+/// profile's three flag lists, the run's `--env` pairs, the driver as the report names it,
+/// its version line and target triple, and the probe corpus's digest, which moves with any
+/// probe source and with the code that reads one.
+#[derive(Debug, Clone)]
+pub struct WitnessQuestion<'a> {
+    pub cflags: &'a [String],
+    pub cxxflags: &'a [String],
+    pub ldflags: &'a [String],
+    /// The run's `--env` pairs, name and value.
+    pub env: Vec<(&'a str, &'a str)>,
+    /// `toolchain.driver`.
+    pub driver: &'a str,
+    pub version_raw: Option<&'a str>,
+    pub target_triple: Option<&'a str>,
+    /// `run.probe_corpus_sha256`.
+    pub probe_corpus_sha256: &'a str,
+}
+
+impl WitnessQuestion<'_> {
+    /// One labelled line per field, a list's words joined by the unit separator, so no two
+    /// questions that differ in a field give the same lines.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        let list = |name: &str, flags: &[String]| format!("{name}={}", flags.join("\u{1f}"));
+        let mut lines = vec![
+            list("profile.cflags", self.cflags),
+            list("profile.cxxflags", self.cxxflags),
+            list("profile.ldflags", self.ldflags),
+        ];
+        lines.extend(
+            self.env
+                .iter()
+                .map(|(name, value)| format!("env.{name}={value}")),
+        );
+        lines.push(format!("toolchain.driver={}", self.driver));
+        for (name, value) in [
+            ("version_raw", self.version_raw),
+            ("target_triple", self.target_triple),
+        ] {
+            lines.push(format!("toolchain.{name}={}", value.unwrap_or("<unread>")));
+        }
+        lines.push(format!("probe_corpus_sha256={}", self.probe_corpus_sha256));
+        lines
+    }
+}
+
+/// The first four bytes of an LLVM bitcode file.
+pub const BITCODE_MAGIC: [u8; 4] = [b'B', b'C', 0xc0, 0xde];
+
+impl WitnessAbsence {
+    /// What can have left the artifact so, for the reason and the diagnostic to say after
+    /// the absence: a cache or a wrapper where nothing in the profile explains a missing or
+    /// foreign note, and nothing where the artifact's own form does (an object of IR).
+    #[must_use]
+    pub fn cause(&self) -> &'static str {
+        match self {
+            Self::Missing | Self::Foreign(_) => {
+                ": a compiler cache or a wrapper on PATH can hand chard an object another run \
+                 built"
+            }
+            Self::Unread(_) => {
+                ": a file the reader cannot read is one chard cannot show this run built, \
+                 whatever left it there"
+            }
+            Self::MissingFromIr | Self::Bitcode => "",
+            Self::Library { absence, .. } => absence.cause(),
+            Self::OtherCompiler { .. } => {
+                ": a compiler cache's prefix command or a wrapper on PATH can send a compile to another compiler"
+            }
+        }
+    }
+
+    /// The gating rule a check over a build whose artifact is set aside for this absence
+    /// publishes: `artifact-compiled-by-another-compiler` for [`Self::OtherCompiler`],
+    /// `artifact-lacks-run-witness` for every other.
+    #[must_use]
+    pub fn rule(&self) -> crate::report::gating_rule::Rule {
+        use crate::report::gating_rule::{ARTIFACT_OTHER_COMPILER, ARTIFACT_UNWITNESSED};
+        match self {
+            Self::OtherCompiler { .. } => ARTIFACT_OTHER_COMPILER,
+            Self::Library { absence, .. } => absence.rule(),
+            _ => ARTIFACT_UNWITNESSED,
+        }
+    }
+
+    /// What this absence keeps chard from showing of the artifact, for a sentence that ends
+    /// "so chard cannot show ...".
+    #[must_use]
+    pub fn unshown(&self) -> &'static str {
+        match self {
+            Self::OtherCompiler { .. } => "the compiler the report names built it",
+            Self::Library { absence, .. } => absence.unshown(),
+            _ => "this run built it",
+        }
+    }
+}
+
+impl RunWitness {
+    /// A witness whose nonce is 128 bits from the operating system, with its header written
+    /// into `workdir`.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the random device cannot be read or the header cannot be written.
+    pub fn random_in(workdir: &Path) -> Result<Self> {
+        Self::random_from(Path::new(RANDOM_DEVICE), workdir)
+    }
+
+    /// [`Self::random_in`], reading `device`, so a test can hand it one that is short.
+    fn random_from(device: &Path, workdir: &Path) -> Result<Self> {
+        use std::io::Read as _;
+        let mut nonce = [0u8; crate::elf::RUN_WITNESS_BYTES];
+        std::fs::File::open(device)
+            .and_then(|mut file| file.read_exact(&mut nonce))
+            .with_context(|| format!("reading the run's nonce from {}", device.display()))?;
+        let nonce = crate::elf::hex_of(&nonce);
+        Self::installed(nonce, WitnessSource::OsRandom, workdir)
+    }
+
+    /// A witness whose nonce is the first 128 bits of a SHA-256 over `asked`, one line each,
+    /// with its header written into `workdir`: what a run that must build the same bytes as
+    /// another run of the same measurement uses (`measure --normalize`).
+    ///
+    /// # Errors
+    ///
+    /// Errors when the header cannot be written.
+    pub fn derived_in<I, S>(asked: I, workdir: &Path) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut seed = String::from("chard-run-witness-v1\n");
+        for line in asked {
+            seed.push_str(line.as_ref());
+            seed.push('\n');
+        }
+        let nonce = digest::sha256_hex(seed.as_bytes())
+            .chars()
+            .take(crate::elf::RUN_WITNESS_BYTES.saturating_mul(2))
+            .collect();
+        Self::installed(nonce, WitnessSource::Derived, workdir)
+    }
+
+    fn installed(nonce: String, source: WitnessSource, workdir: &Path) -> Result<Self> {
+        use std::io::Write as _;
+        let witness = Self { nonce, source };
+        let path = workdir.join(RUN_WITNESS_HEADER_NAME);
+        // The name is cleared and the file created new, never written through what is
+        // there: a reused work directory can hold an earlier run's header, and a link left
+        // at the name would otherwise send this run's header wherever it points.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .context(crate::error::HarnessPath(path.clone()))
+                    .context("clearing an earlier run-witness header");
+            }
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(witness.header().as_bytes()))
+            .with_context(|| crate::error::HarnessPath(path.clone()))
+            .context("writing the run-witness header")?;
+        Ok(witness)
+    }
+
+    /// The nonce as [`crate::elf::ElfFacts::run_witness`] spells one.
+    #[must_use]
+    pub fn nonce_hex(&self) -> &str {
+        &self.nonce
+    }
+
+    /// Where the nonce came from.
+    #[must_use]
+    pub const fn source(&self) -> WitnessSource {
+        self.source
+    }
+
+    /// The words a build's command line carries for the witness, after its flags.
+    #[must_use]
+    pub fn compile_words() -> [String; 2] {
+        ["-include".to_owned(), RUN_WITNESS_HEADER_NAME.to_owned()]
+    }
+
+    /// The generated header's text.
+    #[must_use]
+    pub fn header(&self) -> String {
+        let bytes = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|b| format!("{b:#04x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut owner = crate::elf::RUN_WITNESS_OWNER.as_bytes().to_vec();
+        owner.push(0);
+        let namesz = owner.len();
+        while !owner.len().is_multiple_of(4) {
+            owner.push(0);
+        }
+        let nonce = self
+            .nonce
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| format!("0x{}", String::from_utf8_lossy(pair)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let directives = [
+            format!(
+                ".pushsection {},\"a\",%note",
+                crate::elf::RUN_WITNESS_SECTION
+            ),
+            ".balign 4".to_owned(),
+            format!(
+                ".4byte {namesz},{},{}",
+                crate::elf::RUN_WITNESS_BYTES,
+                crate::elf::RUN_WITNESS_TYPE
+            ),
+            format!(".byte {}", bytes(&owner)),
+            format!(".byte {nonce}"),
+            ".popsection".to_owned(),
+        ];
+        let mut text = String::from(
+            "/* Written by chard for one run and named on each compile line with -include.\n\
+             \x20* It is not a probe source. It places the run's nonce in a note section, and\n\
+             \x20* chard reads an artifact only where it finds that note. */\n\
+             #if defined(__ASSEMBLER__)\n",
+        );
+        for directive in &directives {
+            text.push('\t');
+            text.push_str(directive);
+            text.push('\n');
+        }
+        text.push_str("#else\n__asm__(\n");
+        for directive in &directives {
+            text.push_str("    \"\\t");
+            text.push_str(&directive.replace('"', "\\\""));
+            text.push_str("\\n\"\n");
+        }
+        text.push_str(");\n#endif\n");
+        text
+    }
+
+    /// Whether `facts` is an artifact of this run: its run witnesses are this nonce and
+    /// nothing else.
+    ///
+    /// # Errors
+    ///
+    /// The absence, where the artifact carries no witness or one this run did not write.
+    pub fn confirm(&self, facts: &crate::elf::ElfFacts) -> Result<(), WitnessAbsence> {
+        let holds_ir = || {
+            facts
+                .sections
+                .iter()
+                .any(|name| name.starts_with(crate::report::LTO_IR_SECTION_PREFIX))
+        };
+        match facts.run_witness.as_slice() {
+            [] if holds_ir() => Err(WitnessAbsence::MissingFromIr),
+            [] => Err(WitnessAbsence::Missing),
+            [one] if *one == self.nonce => Ok(()),
+            found => Err(WitnessAbsence::Foreign(found.to_vec())),
+        }
+    }
+}
+
+/// A build's words without the run-witness words ([`RunWitness::compile_words`]), wherever
+/// that pair stands on the line.
+#[must_use]
+pub fn without_witness_words(words: &[String]) -> Vec<String> {
+    let [include, header] = RunWitness::compile_words();
+    let mut kept = Vec::with_capacity(words.len());
+    let mut rest = words.iter().peekable();
+    while let Some(word) = rest.next() {
+        if *word == include && rest.peek().is_some_and(|next| **next == header) {
+            rest.next();
+        } else {
+            kept.push(word.clone());
+        }
+    }
+    kept
+}
 
 fn invoke(program: &Path, args: &[String]) -> Result<BuildRecord> {
     invoke_with_timeout(program, args, None, INVOKE_TIMEOUT, DRAIN_GRACE)
@@ -1019,11 +1104,6 @@ fn invoke(program: &Path, args: &[String]) -> Result<BuildRecord> {
 
 /// The body, with both bounds as parameters so a test can prove each of them fires
 /// without taking two minutes to do it.
-///
-/// `cwd` is the directory the child runs in, and `None` leaves it the caller's. With a
-/// directory, a relative `program` is made absolute first and recorded that way:
-/// `Command` leaves it unspecified whether a relative program is looked up before or
-/// after the change of directory, and `run::execute` met the second reading.
 fn invoke_with_timeout(
     program: &Path,
     args: &[String],
@@ -1053,24 +1133,28 @@ fn invoke_with_timeout(
     let mut child = command
         .env_clear()
         .envs(compiler_environment())
+        // A group of its own, so a timeout kills the driver's `cc1`, `as` and `ld` too
+        // (`run::kill_group`).
+        .process_group(0)
         .spawn()
         .with_context(|| format!("running {}", program.display()))?;
 
-    // Drained on their own threads rather than into files, which is where this departs from
-    // `run::execute` and why: that function always has a work directory to put them in, and
-    // `capture` is called from `toolchain`'s driver and linker probes, which have none. The
-    // hazard it names is real either way — a child that fills a pipe blocks forever while we
-    // poll `try_wait`, so nothing may wait on the child while a pipe is unread.
-    // `Stdio::piped()` above is what makes these `Some`; an absent pipe here would mean the
-    // spawn configuration and this code disagree, which is a bug rather than a runtime state.
-    // Handled rather than unwrapped anyway, because a panic inside a sweep loses the lane.
+    // Drained on their own threads rather than into files, unlike `run::execute`: `capture`
+    // is called from `toolchain`'s driver and linker probes, which have no work directory.
     let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
         crate::error::best_effort(child.kill());
         anyhow::bail!("{}: stdout and stderr were not piped", program.display());
     };
-    let out_reader = std::thread::spawn(move || drain(out_pipe));
-    let err_reader = std::thread::spawn(move || drain(err_pipe));
+    let (err_ended, pipe_ended) = std::sync::mpsc::channel();
+    let out_ended = err_ended.clone();
+    let out_reader = std::thread::spawn(move || drain(out_pipe, &out_ended));
+    let err_reader = std::thread::spawn(move || drain(err_pipe, &err_ended));
 
+    // The readers' end of file wakes this wait, under `EXIT_WAKE_BOUND`, and `try_wait` alone
+    // decides the child has exited: a pipe closes early where the child closes or redirects
+    // it, and late where another process holds it.
+    let mut open = 2_u8;
+    let mut closed_at = started;
     let status = loop {
         if let Some(status) = child.try_wait().context("waiting for the toolchain")? {
             break status;
@@ -1082,21 +1166,15 @@ fn invoke_with_timeout(
             if let Ok(Some(status)) = child.try_wait() {
                 break status;
             }
-            crate::error::best_effort(child.kill());
+            // The driver's whole group, before the reap (`run::kill_group` says why), so no
+            // `cc1` or `ld` it started runs on, or holds the pipes the readers wait on.
+            crate::run::kill_group(&mut child);
             crate::error::best_effort(child.wait());
             drop(out_reader);
             drop(err_reader);
-            // An error, not a `BuildRecord`. A timed-out compile must never reach a detector:
-            // `succeeded()` would be false and the `compiler-diag` channel reads a failed
-            // compile as its *observable*, so a wedged toolchain would publish as "the
-            // compiler rejected this" — a measurement, from a run that measured nothing. A
-            // failure to observe has to stay a failure to observe.
-            //
-            // Untyped, and in `tests/untyped_errors.rs`'s inventory as such. It reaches the
-            // envelope only through `toolchain::detect`, where the driver hung on its own
-            // interrogation, and a driver that hangs on `--version` hangs again, so the
-            // retry `TRANSIENT` promises is a class this failure has not earned; inside
-            // the measurement loop it is contained as an unmeasured probe.
+            // An error, not a `BuildRecord`: the `compiler-diag` channel reads a failed
+            // compile as its observable, so a wedged toolchain would publish as a
+            // measurement from a run that measured nothing.
             anyhow::bail!(
                 "{} did not finish within {}s: {}",
                 program.display(),
@@ -1104,39 +1182,27 @@ fn invoke_with_timeout(
                 args.join(" ")
             );
         }
-        crate::run::poll_sleep(started.elapsed());
+        if open == 0 {
+            crate::run::poll_sleep(closed_at.elapsed());
+            continue;
+        }
+        let left = timeout.saturating_sub(started.elapsed());
+        match pipe_ended.recv_timeout(left.min(EXIT_WAKE_BOUND)) {
+            Ok(()) => open = open.saturating_sub(1),
+            Err(RecvTimeoutError::Timeout) => continue,
+            // Both senders dropped and no end of file will come: a reader panicked, and
+            // `read_both` reports it.
+            Err(RecvTimeoutError::Disconnected) => open = 0,
+        }
+        if open == 0 {
+            closed_at = Instant::now();
+        }
     };
     // Before draining, not after: the reported duration is the child's lifetime, not the
     // child's lifetime plus our own bookkeeping.
     let ran_for = started.elapsed();
 
-    // The child is gone; its pipes may not be. Wait for both readers under a bound of
-    // their own, and treat a stream we could not read as a failure to observe rather than
-    // as an observation — an unread stderr published as empty says "the compiler was
-    // silent", which is a `compiler-diag` measurement we did not make. Same rule as the
-    // timeout branch above, for the same reason.
-    let drain_started = Instant::now();
-    while !(out_reader.is_finished() && err_reader.is_finished()) {
-        if drain_started.elapsed() >= drain_grace {
-            anyhow::bail!(
-                "{} exited but its output pipes were still held {:?} later, so its \
-                 diagnostics could not be read: {}",
-                program.display(),
-                drain_grace,
-                args.join(" ")
-            );
-        }
-        crate::run::poll_sleep(drain_started.elapsed());
-    }
-    // `unwrap_or_default` here would substitute an empty stream for an unread one, which
-    // is the same conversion the bail above refuses.
-    let (Ok(stdout), Ok(stderr)) = (out_reader.join(), err_reader.join()) else {
-        anyhow::bail!(
-            "{}: an output reader panicked, so its diagnostics could not be read: {}",
-            program.display(),
-            args.join(" ")
-        );
-    };
+    let (stdout, stderr) = read_both(out_reader, err_reader, drain_grace, program, args)?;
 
     let mut argv = vec![program.display().to_string()];
     argv.extend(args.iter().cloned());
@@ -1160,6 +1226,46 @@ fn invoke_with_timeout(
     })
 }
 
+/// The two readers' output once `invoke_with_timeout`'s child has been reaped, waited for
+/// under `drain_grace`.
+///
+/// # Errors
+///
+/// Where a pipe is still held `drain_grace` after the exit, or a reader panicked. A stream
+/// that could not be read is a failure to observe, for the reason the timeout branch gives: an
+/// unread stderr published as empty is a `compiler-diag` measurement nobody made.
+fn read_both(
+    out_reader: JoinHandle<Vec<u8>>,
+    err_reader: JoinHandle<Vec<u8>>,
+    drain_grace: Duration,
+    program: &Path,
+    args: &[String],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let drain_started = Instant::now();
+    while !(out_reader.is_finished() && err_reader.is_finished()) {
+        if drain_started.elapsed() >= drain_grace {
+            anyhow::bail!(
+                "{} exited but its output pipes were still held {:?} later, so its \
+                 diagnostics could not be read: {}",
+                program.display(),
+                drain_grace,
+                args.join(" ")
+            );
+        }
+        crate::run::poll_sleep(drain_started.elapsed());
+    }
+    // `unwrap_or_default` here would substitute an empty stream for an unread one, which
+    // is the same conversion the bail above refuses.
+    let (Ok(stdout), Ok(stderr)) = (out_reader.join(), err_reader.join()) else {
+        anyhow::bail!(
+            "{}: an output reader panicked, so its diagnostics could not be read: {}",
+            program.display(),
+            args.join(" ")
+        );
+    };
+    Ok((stdout, stderr))
+}
+
 /// Whether `output`, as read before any trim, ends partway through a line: text other than
 /// whitespace follows its last newline, or makes up the whole of it where it has none.
 /// Whitespace after the last newline is trimmed with that newline when `stdout` is stored, so
@@ -1179,10 +1285,6 @@ pub const CUT_OFF: &str = "with its output cut off partway through a line";
 
 /// Run a program with exactly `args` and nothing appended.
 ///
-/// Used to interrogate the toolchain (`--version`, `-dumpmachine`,
-/// `-print-prog-name=ld`) and to ask a distro package manager who owns the
-/// driver. Shares `invoke`'s environment scrubbing, so an interrogation cannot
-/// be perturbed by ambient build variables either.
 /// # Errors
 ///
 /// Errors when the program cannot be spawned at all. A non-zero exit status is
@@ -1193,28 +1295,6 @@ pub fn capture(program: &Path, args: &[String]) -> Result<BuildRecord> {
 
 /// Compile and link `source` into `out`, with `flags` inserted before it.
 ///
-/// Flag order is deliberate: profile flags, then the variant's control flags,
-/// then the source. Later flags win in both gcc and clang, so a control can
-/// always override a profile default — which is what makes the positive and
-/// negative controls trustworthy.
-///
-/// The driver runs in the source's directory and is handed the source by its file name
-/// alone ([`in_place`]), so nothing the compiler derives from the name it was given
-/// depends on where `--workdir` points. OpenBSD's clang names each RETGUARD cookie, and
-/// the `.openbsd.randomdata.retguard.<n>` section it lives in, from a hash of the module
-/// name and the function name, and the module name is the source path as given. Measured
-/// 2026-10-01 on OpenBSD 7.9 amd64 (clang 19.1.7) over a two-function file in a 6- and a
-/// 69-character directory: compiled by absolute path, the objects carried the cookies
-/// `352`, `515` and `1104` in one and `764`, `1048` and `1910` in the other, and differed;
-/// compiled from inside each directory by file name, both carried `2521`, `2588` and
-/// `3502` and were byte-identical, as were the linked executables, with `-o` absolute or
-/// relative. `-ffile-prefix-map`, `-fdebug-prefix-map` and `-fmacro-prefix-map` left each
-/// object byte-identical to the absolute build, so a prefix map does not reach the name.
-/// The same holds wherever a source name is compiled into the artifact as given, such as
-/// a sanitizer's source locations. The output path stays absolute; `-o` is not read into
-/// the module. A relative path in an explicit profile's flags would name a directory under
-/// the work directory here and one under chard's own elsewhere, and `measure` refuses it
-/// ([`relative_path_arguments`]).
 /// # Errors
 ///
 /// Errors when the compiler cannot be spawned. A failed *compilation* is
@@ -1226,13 +1306,37 @@ pub fn build(
     source: &Path,
     out: &Path,
     link_libs: &[&str],
+    witness: Option<&RunWitness>,
+) -> Result<BuildRecord> {
+    build_with_inputs(driver, flags, source, &[], out, link_libs, witness)
+}
+
+/// [`build`] with `inputs` (`probe::PositiveInput`), file names in `source`'s directory,
+/// named after `source` and before the libraries, since a library resolves only the objects
+/// named before it.
+///
+/// # Errors
+///
+/// As [`build`].
+pub fn build_with_inputs(
+    driver: &Path,
+    flags: &[String],
+    source: &Path,
+    inputs: &[&str],
+    out: &Path,
+    link_libs: &[&str],
+    witness: Option<&RunWitness>,
 ) -> Result<BuildRecord> {
     let (cwd, source_arg) = in_place(source);
     let mut args: Vec<String> = Vec::new();
     args.extend(flags.iter().cloned());
+    if witness.is_some() {
+        args.extend(RunWitness::compile_words());
+    }
     args.push("-o".to_owned());
     args.push(out.display().to_string());
     args.push(source_arg);
+    args.extend(inputs.iter().map(|s| (*s).to_owned()));
     // After the source, never before: GNU ld resolves libraries in command-line
     // order, so a `-l` ahead of the object that needs it contributes nothing — and
     // under `--as-needed` is dropped even when the symbol *is* used, which would make
@@ -1240,22 +1344,7 @@ pub fn build(
     args.extend(link_libs.iter().map(|s| (*s).to_owned()));
 
     // Clear the path first, so what is read afterwards can only be what this build
-    // wrote. Without it a probe inherits whatever a previous run left at the same
-    // name, and the work directory is reused by design — `--workdir` defaults into
-    // the caller's CWD and is never cleaned, because it is retained as evidence.
-    //
-    // Measured with this removal taken out: `--profile openssf-tldr` then `--profile
-    // explicit --flags -fsyntax-only` over one work directory. The second run compiles
-    // nothing (`-fsyntax-only` writes no output file), exits 0, and publishes `pie`,
-    // `relro` and `noexecstack` as `on` off the first run's binary, with the same
-    // `artifact_sha256` in both reports and every control triple `discriminating`. A
-    // fabricated `on` is the one outcome the control triple exists to make impossible,
-    // and it gets there without a hostile compiler: two ordinary invocations in one
-    // directory.
-    //
-    // `NotFound` is the expected case and not an error. Anything else — a directory in
-    // the way, a permission problem — must not be swallowed, because it would leave
-    // exactly the stale file this removal exists to prevent.
+    // wrote.
     match std::fs::remove_file(out) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1268,9 +1357,8 @@ pub fn build(
 
     let mut record = invoke_with_timeout(driver, &args, cwd, INVOKE_TIMEOUT, DRAIN_GRACE)?;
     if record.succeeded() {
-        // `None` here means the driver exited 0 and wrote nothing, which the
-        // caller reads as "no artifact to inspect" rather than as a build failure —
-        // the `compiler-diag` channel still has its observable either way.
+        // `None` here means the driver exited 0 and wrote nothing: no artifact to inspect,
+        // not a build failure.
         record.artifact_sha256 = digest::sha256_file(out);
     }
     Ok(record)
@@ -1281,8 +1369,6 @@ pub fn build(
 /// next word (`-I foo`, `--sysroot foo`). An option spelled with `--`, and
 /// `-resource-dir`, joins its argument only after `=`, so `--config-user-dir=d` is not
 /// `--config` with the argument `-user-dir=d`. One ending in `=` takes no next word.
-/// clang's own `-isystem-after` and `-include-pch` ([`CLANG_LONGER`]) are read as clang
-/// reads them, and as gcc reads them besides. [`relative_path_arguments`] reads them.
 const PATH_OPTIONS: &[&str] = &[
     "-B",
     "--prefix",
@@ -1442,7 +1528,7 @@ pub enum PathReading {
     /// The argument names a relative path as written.
     Relative,
     /// gcc reads the word as `option` joined to `value`, a relative path: clang's own
-    /// `-isystem-after` or `-include-pch` ([`CLANG_LONGER`]), which gcc does not know.
+    /// `-isystem-after` or `-include-pch` (`CLANG_LONGER`), which gcc does not know.
     GccJoined {
         /// The shorter option gcc reads.
         option: &'static str,
@@ -1453,6 +1539,15 @@ pub enum PathReading {
     /// pair after it: the tool reads its path from a word handed later, which this reader
     /// does not pair with it, or the line hands it none.
     Unpaired,
+    /// A word the driver reads as an input file (`foo.c`, `./foo.o`, `libfoo.a`): no option,
+    /// and the value of none, named by a relative path.
+    Input,
+    /// `option` and the word after it, which one driver reads as the option's value and the
+    /// other as an input file named by a relative path (`-Ttext 0x8000`, `-dumpbase foo.c`).
+    Divided {
+        /// The option the drivers divide.
+        option: String,
+    },
 }
 
 impl PathReading {
@@ -1463,14 +1558,15 @@ impl PathReading {
         match self {
             Self::Relative => None,
             Self::GccJoined { option, value } => Some(format!(
-                "which gcc reads as {option} with the relative path {value:?}; name a directory \
-                 with -idirafter, which both drivers read, or leave the option out"
+                "which gcc reads as {option} with the relative path {value:?}"
             )),
-            Self::Unpaired => Some(
-                "whose path is not handed in the same word or the pair after it, so the tool \
-                 reads it from a later word or from none; hand the option and its path together"
-                    .to_owned(),
-            ),
+            Self::Unpaired => {
+                Some("whose path is not handed in the same word or the pair after it".to_owned())
+            }
+            Self::Input => Some("an input file the driver opens in the work directory".to_owned()),
+            Self::Divided { option } => Some(format!(
+                "which one driver reads as the value of {option} and the other as an input file it opens in the work directory"
+            )),
         }
     }
 }
@@ -1495,8 +1591,9 @@ enum PathReader {
     /// read the driver's header options as the driver does, [`CLANG_LONGER`] as gcc reads
     /// them; but clang's `-cc1` reads `-I-` as the directory `-`.
     Preprocessor,
-    /// clang's driver for one architecture (`-Xarch_<arch>`): one word, a two-token option
-    /// with no path, which clang refuses.
+    /// clang's driver for one architecture (`-Xarch_<arch>`): one word, read as the driver
+    /// reads its own, so a word that is no option is an input file; a two-token option with
+    /// no path in it clang refuses.
     Arch,
     /// The assembler, through `-Xassembler`, `--for-assembler` or `-Wa,`: GNU as's `-I`, the
     /// one option of its own that names a directory it reads (`.include`), joined or as the
@@ -1517,6 +1614,13 @@ fn relative(path: &str) -> bool {
         && !path.starts_with('=')
         && !path.starts_with("$SYSROOT")
         && Path::new(path).is_relative()
+}
+
+/// Whether `word`, read by the driver as no option, names an input file by a relative path.
+/// `=` and `$SYSROOT` mean nothing at the head of an input's name, as they do for a path
+/// option's argument ([`relative`]); `@` begins a response file, which is refused apart.
+fn input_name(word: &str) -> bool {
+    !word.is_empty() && !word.starts_with(['-', '@']) && Path::new(word).is_relative()
 }
 
 /// What a linker reads in `word`, with `next` the item after it ([`path_word`]'s linker arm).
@@ -1637,10 +1741,29 @@ fn path_word(reader: PathReader, word: &str, next: Option<&str>) -> (usize, Opti
         .filter_map(|option| Some((*option, word.strip_prefix(*option)?)))
         .max_by_key(|(option, _)| option.len())
     else {
+        // An option the drivers divide takes the next word as its value under one and leaves
+        // it an input file under the other (`toolchain::divides_its_value`).
+        if reader == PathReader::Driver
+            && crate::toolchain::divides_its_value(word)
+            && let Some(value) = next
+            && input_name(value)
+        {
+            return (
+                2,
+                Some(PathReading::Divided {
+                    option: word.to_owned(),
+                }),
+            );
+        }
         // A value-taking option that names no path takes the next word as its value, which
         // is no option of its own (`-u -B<dir>`, `-MF -L<dir>`; `toolchain::takes_a_value`).
         if reader == PathReader::Driver && crate::toolchain::takes_a_value(word) {
             return (if next.is_some() { 2 } else { 1 }, None);
+        }
+        // Any other word of the driver's own that is no option is an input file it opens
+        // where it runs.
+        if matches!(reader, PathReader::Driver | PathReader::Arch) && input_name(word) {
+            return (1, Some(PathReading::Input));
         }
         return (1, None);
     };
@@ -1713,46 +1836,6 @@ fn read_run(
 /// The arguments in `flags` that hand the driver, or a tool it runs, a relative path, each
 /// as written and with how it was read ([`relative_path_arguments`] says why each is
 /// refused).
-///
-/// Each word is read by whoever reads it. The driver reads a [`PATH_OPTIONS`] option's
-/// path, a [`PATH_OR_NAME_OPTIONS`] argument with a `/` in it and a response file (`@file`);
-/// any other option that takes the next word as its value (`toolchain::takes_a_value`: `-u`,
-/// `-MF`, `-o`, `-D`) takes it unread, so `-u -B<dir>` names no prefix.
-/// A word that hands the next word to a tool (`toolchain::Handed`: `-Xlinker`,
-/// `-Xpreprocessor`, `-Xclang`, ...) is passed over by the driver with that word, and the
-/// words handed to one tool by adjacent pairs are read in order as that tool reads them: the
-/// preprocessor and the other tools with the driver's options, the assembler with GNU as's
-/// `-I`, a linker with GNU ld's ([`LINKER_PATH_OPTIONS`]). So `-Xpreprocessor -I
-/// -Xpreprocessor /abs` is `cc1`'s `-I /abs`, which gcc 16.1.1 and clang 22.1.8 hand `cc1`
-/// and `-cc1` for that line (measured 2026-10-28 on Fedora 44 x86_64 with `-v -E`), and not
-/// the driver's `-I` with the relative path `-Xpreprocessor`; `-Xlinker -Bsymbolic` is ld's,
-/// and no driver `-B`. `-Wl,<list>`, `-Wp,<list>` and `-Wa,<list>` hand their items to the
-/// linker, the preprocessor and the assembler, and the joined spellings of
-/// [`JOINED_PASS_THROUGH`] (`--for-linker=<word>`, `-Xclang=<word>`, ...) their one value,
-/// each read within the word. A word handed to clang's driver for one architecture
-/// (`-Xarch_<arch>`) is read as the driver's own word alone, a list within it included.
-///
-/// Where the drivers read a word apart, it is refused where either reads a relative path:
-///
-/// - clang's `-isystem-after` and `-include-pch`, which gcc reads as `-isystem` and
-///   `-include` joined to a relative path ([`CLANG_LONGER`]), whatever follows;
-/// - `-I -`: gcc reads it as `-I-`, and clang as the directory `-`, which its `-cc1` also
-///   reads for `-I-` handed to it (the same measurement). gcc's `-I-` to the driver splits
-///   the search list and names no directory, and clang refuses it, so it is no relative path.
-///
-/// A path option handed to a tool with no path in the same word or the pair after it
-/// (`-Xlinker -L -O2 -Xlinker dir`, `-Wl,-L -Wl,dir`) reads its path from a later word, or
-/// from none, which this reader does not pair, and is returned as [`PathReading::Unpaired`]:
-/// a refusal of a line ld would read, taken so that no path goes unread.
-///
-/// An option missing from these lists is not caught: the spellings GCC and Clang accept
-/// beyond them (unique-prefix abbreviations of the long options, `--include-directory` and
-/// kin, `-iframework`, `-T`, `-ivfsoverlay`, the value-taking options whose value is a path,
-/// which are read as values), the options that hand a tool its path joined to another word
-/// (`--for-l=`, an abbreviation gcc may take), `cc1`'s own options through `-Xclang`
-/// (`-internal-isystem`), and GNU ld's single-dash and abbreviated spellings of its long
-/// options (`-library-path=`, `--lib=`). The linker's words are read as GNU ld reads them,
-/// whichever linker `-fuse-ld=` names.
 #[must_use]
 pub fn relative_path_readings(flags: &[String]) -> Vec<RelativePath> {
     use crate::toolchain::{Handed, handed, read};
@@ -1851,20 +1934,6 @@ fn handed_within(word: &str) -> Option<(PathReader, Vec<&str>)> {
 /// The arguments in `flags` that hand the driver, or a tool it runs, a relative path, each
 /// as written, an option and its separate argument joined by a space
 /// ([`relative_path_readings`] says how each word is read).
-///
-/// A path is relative to the directory the driver runs in, and chard runs it in more
-/// than one: [`build`] and [`macro_dump`] run it in the work directory, while the
-/// link-line and toolchain interrogations ([`capture`]) run it in chard's own. A `--flags
-/// -Bmy-ld` written relative to where chard was started would reach the link-line capture
-/// as that directory and every probe build as a directory under the work directory, which
-/// does not exist, and the driver ignores a missing `-B`, `-L` or `-I` directory without a
-/// word: one report would describe two toolchains and say nothing. `measure` refuses such
-/// an argument, before the driver
-/// sees it, and asks for the path made absolute, or for what the reading's note
-/// ([`PathReading::note`]) names.
-///
-/// A path that begins with `=` or `$SYSROOT` is read against the sysroot, not the working
-/// directory, and is not returned.
 #[must_use]
 pub fn relative_path_arguments(flags: &[String]) -> Vec<String> {
     relative_path_readings(flags)
@@ -1890,46 +1959,8 @@ const JOINED_PASS_THROUGH: [&str; 6] = [
 /// The arguments in `flags` that hand a tool a response file: a word that begins with
 /// `@`, which also covers the word after `-Xlinker`, `-Xpreprocessor`, `-Xassembler`,
 /// `-Xclang`, `-mllvm` or `-Xarch_<arch>`; a `-Wl,`, `-Wp,` or `-Wa,` list with an item
-/// that begins with `@`; and a [`JOINED_PASS_THROUGH`] option whose value begins with
+/// that begins with `@`; and a `JOINED_PASS_THROUGH` option whose value begins with
 /// `@`. Each comes back as written.
-///
-/// Every tool on the build's path expands one in place: the driver, and through the
-/// pass-through spellings the preprocessor, the linker, and clang's `-cc1`. Measured
-/// 2026-10-05 on Fedora 44 x86_64 with gcc 16.1.1, clang 22.1.8 and GNU ld 2.46.1: a file
-/// holding `-DPLANTED=7` defined `PLANTED` in a `-dM -E` dump as `@file`, `-Wp,@file` and
-/// `-Xpreprocessor @file` under both drivers, and as `-Xclang @file` under clang; one
-/// holding `-m32` turned the dump to `__i386__`; one holding
-/// `--defsym=planted_sym=0x1234` put the symbol in the linked program through `-Wl,@file`
-/// and `-Xlinker @file` under both, and through `--for-linker=@file` under clang. The
-/// joined spellings, measured the same day on the same host and toolchains:
-/// under clang `-Xclang=@file` defined `PLANTED`, and with the file holding
-/// `-triple i386-unknown-linux-gnu` wrote an i386 object; `-mllvm=@file` handed LLVM's
-/// option parser the file's `-debug-pass=Structure`; `-Xclangas=@file` handed `-cc1as`
-/// the file's words; and under gcc `--for-assembler=@file` holding `--defsym=asym=1` put
-/// `asym` in the linked program. `-Xclang=-DX,@file` defined `X` as `,@file`: the joined
-/// value is one word, unsplit. `-Xthinlto-distributor=` is listed unmeasured, because it
-/// hands its value to a distributor program chard cannot read either.
-///
-/// chard reads the profile's flags to decide what each control arm carries (the target
-/// and linker selection), which flags a shared-object link drops (`-pie`), whether a
-/// macro the dump reports was forged by a `-D`, and where a relative path points, and
-/// none of those readers sees inside the file. A `-m32` there reached the measured build
-/// and no arm, so the triple validated each detector on another target than the cell
-/// measured. `measure` refuses such an argument, before the driver sees it, and asks for
-/// the flags written out.
-///
-/// Refused rather than expanded. Expanding is a read of a file the operator names, beside
-/// the flag text, and it would have to reproduce each tool's own syntax (gcc's and GNU
-/// ld's quoting, clang's, nested `@` inside the file, a missing file passed through as a
-/// literal word) to read what the tool read; a difference between the two expansions is a
-/// flag one side sees and the other does not, the hole this closes. The flags written out
-/// on the command line are the same measurement, and they are recorded as `profile.cflags`
-/// where a file's name would record nothing a reader can check.
-///
-/// A Darwin linker argument such as `-Wl,-rpath,@loader_path/lib` is refused too. GNU ld
-/// expands a word that begins with `@` and names a file whether or not it is an option's
-/// argument (in the same run, gcc's `-Wl,-rpath,@file` linked a `RUNPATH` of the file's
-/// contents), so the spelling alone does not say what the linker will read.
 #[must_use]
 pub fn response_file_arguments(flags: &[String]) -> Vec<String> {
     flags
@@ -1965,37 +1996,33 @@ fn in_place(source: &Path) -> (Option<&Path>, String) {
 /// `macro-dump` entry in the report's store: SHA-256 of the dump's lines sorted bytewise and
 /// joined by newlines, with no newline after the last, a repeated line kept as many times as
 /// it was printed. Lines are split as [`str::lines`] splits them, so a `\r` before a newline
-/// is not part of a line; the record's output is trimmed at its end before it gets here. The
-/// same value is `LC_ALL=C sort` over the dump with its final newline removed, then
-/// `sha256sum`.
-///
-/// gcc lists its macros in the order of its identifier table, so a `-D` that enters a name in
-/// that table can move other macros in the list with none of them changed. A digest of the
-/// dump as printed would move with that order; this one moves only where a line does. The
-/// macros parsed from a dump ([`parse_macros`]) are a sorted map, so nothing read from the
-/// dump depends on the order either.
+/// is not part of a line; the record's output is trimmed at its end before it gets here. For
+/// a dump with no `\r`, the same value is `LC_ALL=C sort` over the dump with the final
+/// newline of its output removed, then `sha256sum`.
 #[must_use]
 pub fn dump_digest(stdout: &str) -> String {
     let mut lines: Vec<&str> = stdout.lines().collect();
     lines.sort_unstable();
-    crate::digest::sha256_hex(lines.join("\n").as_bytes())
+    digest::sha256_hex(lines.join("\n").as_bytes())
 }
 
-/// Preprocess with `-dM -E` and return the predefined macros.
-///
-/// `with_libc_headers` decides whether libc headers are pulled in first. Both
-/// dumps are needed: the bare one shows what the *compiler* defines (so
-/// `__SSP_STRONG__` reflects a compiler default), while the with-headers one
-/// additionally shows what libc concluded (`__USE_FORTIFY_LEVEL`).
-///
-/// `lang` is the language of `driver`, and names the source `macros-<tag>.<suffix>`
-/// ([`crate::probe::Lang::source_suffix`]), so the C++ driver is handed a C++ file and
-/// does not warn that it is treating C input as C++. The two are passed apart and the
-/// callers pair them: `measure::Gatherer::gather` takes both from the probe's language,
-/// `toolchain` the C driver with C and the C++ driver with C++, each held by
-/// `tests/macro_dump_digest.rs`. The driver `--cc` names is dumped as C whatever its name,
-/// so a C++ driver given there under `-Werror` still fails its dump, a run whose macro
-/// channel withholds with the dump's error, which is true of it.
+/// The translation unit a [`macro_dump`] preprocesses.
+#[derive(Debug, Clone, Copy)]
+pub enum DumpUnit<'a> {
+    /// An empty unit: what the compiler defines by itself (`toolchain`'s intrinsic and
+    /// profile dumps), so `__SSP_STRONG__` reflects a compiler default.
+    Empty,
+    /// The libc headers of `LIBC_PROBE_HEADERS`: what the C library concludes besides
+    /// (`__USE_FORTIFY_LEVEL`), for `toolchain`'s with-headers dump.
+    LibcHeaders,
+    /// A probe's own source text, dumped under the words its build compiles with, so the
+    /// macro channel's two views are one translation unit through two jobs. The file is
+    /// written beside the probe's source and `chard_selfreport.h`, so its quoted include
+    /// resolves as the build's does.
+    Source(&'a str),
+}
+
+/// Preprocess `unit` with `-dM -E` and return the macros defined at its end.
 ///
 /// # Errors
 ///
@@ -2005,17 +2032,17 @@ pub fn macro_dump(
     driver: &Path,
     lang: crate::probe::Lang,
     flags: &[String],
-    with_libc_headers: bool,
+    unit: DumpUnit<'_>,
     work: &Path,
     tag: &str,
 ) -> Result<(BTreeMap<String, String>, BuildRecord)> {
     // A real file rather than stdin: it keeps the invocation reproducible by
     // hand and leaves the exact input behind as evidence.
     let source = work.join(format!("macros-{tag}.{}", lang.source_suffix()));
-    let body = if with_libc_headers {
-        LIBC_PROBE_HEADERS
-    } else {
-        ""
+    let body = match unit {
+        DumpUnit::Empty => "",
+        DumpUnit::LibcHeaders => LIBC_PROBE_HEADERS,
+        DumpUnit::Source(text) => text,
     };
     // A path chard constructed under the work directory, and tagged so: a failure to
     // write it is never the caller's typo.
@@ -2028,19 +2055,7 @@ pub fn macro_dump(
     args.push("-dM".to_owned());
     args.push("-E".to_owned());
     // The driver runs in the work directory and is handed the file by its name alone, as
-    // [`build`] does for a probe, and for a reason of the same kind. gcc lists its macros in
-    // the order of its identifier table, and the path it was given is entered in that table:
-    // a path whose hash collides with a macro's moves that macro to another slot, and the
-    // dump lists it elsewhere. Measured 2026-10-09 on Fedora 44 x86_64 (gcc 16.1.1, libstdc++
-    // 16): `g++ -dM -E` over one 7-line source copied into 60 directories and run by absolute
-    // path wrote the same 1358 lines in 8 orders, 53 copies in one and 7 in seven others, each
-    // differing from the first in the position of one line (`__FLT64X_HAS_INFINITY__`,
-    // `__unix__`, `_PSTL_CONFIG_H` and others). Run from inside each directory by file name,
-    // the 60 copies wrote one order. One source under 60 file names in one directory gave 7
-    // other orders as well, so the spelling of the path decides it, and one path run 21000
-    // times wrote one order, so it is not a race. The parsed map is sorted and never sees the
-    // order. A digest of the dump's stdout as printed would move with `--workdir`, so the
-    // published digest is over the sorted lines ([`dump_digest`]).
+    // [`build`] does for a probe.
     let (cwd, source_arg) = in_place(&source);
     args.push(source_arg);
 
@@ -2074,16 +2089,6 @@ pub fn parse_macros(text: &str) -> BTreeMap<String, String> {
 }
 
 /// Locate the C++ driver matching a C driver, if one exists.
-///
-/// The driver name is treated as `-`-separated components and the one naming the
-/// language is rewritten in place. Suffix or prefix matching is not enough: real
-/// drivers carry a version suffix (`gcc-15`), a target triple prefix
-/// (`x86_64-pc-linux-gnu-gcc`), or both, and every distribution that ships more
-/// than one compiler major ships the suffixed form. Matching only bare `gcc` and
-/// `*-gcc` would silently answer `None` for `gcc-15`. A miss withholds as `indeterminate`
-/// under `no-driver`, whose premise is this lookup, rather than reporting the C++ check
-/// as not-applicable, a property of the toolchain rather than of the lookup; a wrong miss
-/// still costs every C++ cell its verdict.
 pub fn cxx_driver_for(cc: &Path) -> Option<PathBuf> {
     let name = cc.file_name()?.to_str()?;
     let mut parts: Vec<&str> = name.split('-').collect();
@@ -2106,43 +2111,24 @@ fn sibling(original: &Path, name: &str) -> Option<PathBuf> {
 /// Write `body` under a `#!/bin/sh` line at `path`, mark it executable, and wait until the
 /// kernel will actually run it. For this crate's unit tests; `tests/common`'s `executable`
 /// is the integration tests' copy.
-///
-/// The wait is the point. `cargo test` runs these tests on threads of one process, and a
-/// thread that forks between another thread's `open` and `close` inherits the write
-/// descriptor; until that child reaches its own `exec`, the file is open for writing
-/// somewhere and `execve` on it fails with `ETXTBSY`. `toolchain::detect_linker_on` reads
-/// that as a driver that did not answer and returns `kind: "unknown"` with no path, which is
-/// a real failure of a test that was doing nothing wrong. Measured on Fedora 44 aarch64:
-/// three different tests of the seven sharing the toolchain shims failed this way across
-/// five full runs, one per run, each passing when run alone; the fifth run named it,
-/// `running /tmp/chard-linker-bare-75657/cc: Text file busy (os error 26)`. On 2026-10-01
-/// `run::tests::a_probe_receives_the_pinned_environment_and_nothing_else`, which then wrote
-/// its script with `std::fs::write` and ran it at once, failed the same way once in four
-/// lib runs on Fedora 44 x86_64; it and
-/// `tests::a_build_names_its_source_relative_to_the_directory_it_runs_in` write through
-/// here.
-///
-/// One successful spawn is enough. The descriptor can only be held by children that
-/// already existed when the file was open, so once they have gone the file cannot become
-/// busy again, and every later `exec` of it is safe. The spawn passes no arguments and
-/// ignores the exit status, so `body` must tolerate being run bare. Retrying inside the
-/// non-test code would be the wrong place: no code path there execs a file it wrote
-/// itself, since a compiler has exited before its artifact is run.
 #[cfg(test)]
-pub(crate) fn test_script(path: &Path, body: &str) -> std::path::PathBuf {
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the condition is a sibling test's fork closing its copy of the write descriptor, \
+              which nothing here can wait on: retrying the exec between sleeps, under the 5 s \
+              deadline, is the wait"
+)]
+pub(crate) fn test_script(path: &Path, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
-    // ETXTBSY is 26 on Linux and on Darwin alike. Any other error is left to the caller: a
-    // script that cannot be run for another reason is a broken test, and waiting on it
-    // would hide that.
+    // ETXTBSY is 26 on Linux and on Darwin alike.
     const ETXTBSY: i32 = 26;
     std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write a script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .expect("mark the script executable");
 
-    // Spawned through `capture`, which is where this crate's spawns are bounded;
-    // `every_spawn_site_sits_where_something_bounds_it` holds every other file to it, test
-    // modules included, and it is the same call the code under test will make.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Spawned through `capture`, where this crate's spawns are bounded
+    // (`every_spawn_site_sits_where_something_bounds_it`), the call the code under test makes.
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let Err(why) = capture(path, &[]) else {
             break;
@@ -2154,20 +2140,18 @@ pub(crate) fn test_script(path: &Path, body: &str) -> std::path::PathBuf {
         });
         assert!(busy, "running the script {}: {why:#}", path.display());
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "{} stayed busy for 5s; a descriptor is held open for writing somewhere that \
              never execs",
             path.display()
         );
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(2));
     }
     path.to_path_buf()
 }
 
 #[cfg(test)]
 mod tests {
-    /// [`dump_digest`] is SHA-256 of the lines sorted bytewise and joined by newlines with
-    /// none after the last, a repeated line counted, the case of a line kept.
     #[test]
     fn a_dump_digest_is_the_sha256_of_its_sorted_lines() {
         use super::dump_digest;
@@ -2201,18 +2185,6 @@ mod tests {
     }
     use super::*;
 
-    /// Every C driver this corpus meets maps to its own C++ driver.
-    ///
-    /// Two arms could be deleted with the suite green. What that changes is which compiler
-    /// builds the C++ probes: a missing `clang` arm sends a clang toolchain's C++ probes to
-    /// no driver at all, so every C++ check reports its probe unbuildable — and the report
-    /// blames chard rather than saying the toolchain has no C++ driver. `no-driver` withholds
-    /// as `indeterminate` and names the lookup as its premise.
-    ///
-    /// The lookup only answers for a driver that is actually there, so the test puts the
-    /// siblings on disk. The cross-compilation spellings matter as much as the bare ones:
-    /// a driver is commonly `x86_64-linux-gnu-gcc`, and the mapping replaces that one
-    /// component rather than the whole name.
     #[test]
     fn every_c_driver_maps_to_its_own_cxx_driver() {
         let dir = std::env::temp_dir().join(format!("chard-cxxmap-{}", std::process::id()));
@@ -2245,7 +2217,7 @@ mod tests {
         );
 
         // A driver with no C++ counterpart to name is `None` rather than a guess, and so
-        // is one whose counterpart is not installed — the distinction the caller needs.
+        // is one whose counterpart is not installed.
         assert_eq!(mapped("tcc"), None);
         std::fs::write(dir.join("icx"), b"").expect("write");
         assert_eq!(
@@ -2259,8 +2231,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// Each path-bearing form is read in both spellings, an absolute, sysroot-relative or
-    /// searched argument passes, and a word that only begins like an option is not one.
     #[test]
     fn a_relative_path_argument_is_found_in_every_form_it_takes() {
         let words = |text: &str| {
@@ -2302,7 +2272,8 @@ mod tests {
                  -fuse-ld=lld -specs=nosys.specs -specs nosys.specs @/tmp/args -Wl,-z,relro,-L/lib \
                  --config-user-dir=/c -fstack-protector-strong -D_FORTIFY_SOURCE=3"
             ))
-            .is_empty()
+            .is_empty(),
+            "no word here takes a relative path argument"
         );
         assert_eq!(
             relative_path_arguments(&words("--config-user-dir=cfg --configure")),
@@ -2311,8 +2282,6 @@ mod tests {
         );
     }
 
-    /// clang's `-resource-dir`, which `toolchain::runtime_selecting_flags` carries to every
-    /// arm, is refused relative in both spellings clang 22.1.8 accepts.
     #[test]
     fn a_relative_resource_directory_is_found_in_both_spellings() {
         let words = |text: &str| {
@@ -2327,11 +2296,6 @@ mod tests {
         assert_eq!(found, ["-resource-dir rd", "-resource-dir=rd2"]);
     }
 
-    /// `--prefix`, which gcc 16.1.1 and clang 22.1.8 read as `-B`, and clang's
-    /// `-ccc-install-dir`, both carried to every arm by `toolchain::runtime_selecting_flags`,
-    /// are refused relative in every spelling the drivers accept. Left out of
-    /// [`PATH_OPTIONS`], `--prefix rel` would name one directory to the probe builds and
-    /// another to the interrogations, as an unrefused `-Brel` would.
     #[test]
     fn a_relative_prefix_or_install_directory_is_found_in_every_spelling() {
         let words = |text: &str| {
@@ -2351,10 +2315,6 @@ mod tests {
         );
     }
 
-    /// clang's `-stdlib++-isystem`, which `toolchain::runtime_selecting_flags` carries to
-    /// every arm, opens its directory as `-isystem` does, in both of the spellings clang
-    /// 22.1.8 accepts. Missed, a relative C++ library header directory would reach the macro
-    /// dump and the probe builds as two different directories.
     #[test]
     fn a_relative_cxx_library_header_directory_is_found_in_both_spellings() {
         let words = |text: &str| {
@@ -2384,6 +2344,8 @@ mod tests {
                     PathReading::Relative => "relative".to_owned(),
                     PathReading::GccJoined { option, value } => format!("gcc {option} {value}"),
                     PathReading::Unpaired => "unpaired".to_owned(),
+                    PathReading::Input => "input".to_owned(),
+                    PathReading::Divided { option } => format!("divided {option}"),
                 };
                 (found.argument, reading)
             })
@@ -2401,12 +2363,6 @@ mod tests {
         assert_eq!(found, expected, "{line}");
     }
 
-    /// The three lines below are read as the drivers read them (measured 2026-10-28 on
-    /// Fedora 44 x86_64 with `-v -E`, gcc 16.1.1 and clang 22.1.8; [`relative_path_readings`]
-    /// has the measurement): the path `-Xpreprocessor` hands the preprocessor is the one the
-    /// pair after it hands, gcc's `-I-` names no directory, and clang's `-isystem-after` and
-    /// `-include-pch` are refused for gcc's reading, which names its path. The relative shapes
-    /// beside them are refused still.
     #[test]
     fn the_preprocessor_pair_gccs_split_and_clangs_longer_options_are_read_as_the_drivers_read_them()
      {
@@ -2459,10 +2415,119 @@ mod tests {
         );
     }
 
-    /// The words handed to the linker are read as GNU ld reads them: `-L`, `-T` and their long
-    /// spellings take a path, `-B` and the `-T` address options do not, and the words of
-    /// `-Xlinker`, `--for-linker` and `-Wl,` read alike, as do the dynamic linker, the run-time
-    /// search paths and the scripts and lists ld reads (`LINKER_PATH_OPTIONS`).
+    #[test]
+    fn an_input_file_named_by_a_relative_path_is_read_as_one() {
+        row("foo.c", "foo.c|input");
+        row("-O2 ./foo.o", "./foo.o|input");
+        row("libfoo.a -lm", "libfoo.a|input");
+        row("sub/libfoo.a", "sub/libfoo.a|input");
+        row("=foo.o", "=foo.o|input");
+        row("$SYSROOT/foo.o", "$SYSROOT/foo.o|input");
+        row("-Xarch_x86_64 foo.c", "-Xarch_x86_64 foo.c|input");
+        row(
+            "/srv/src/foo.c /srv/lib/libfoo.a -Xarch_x86_64 /srv/foo.o",
+            "",
+        );
+        row(
+            "-o out -x c -l m -z relro -u sym -D X -MT tgt -MF dep.d --param ssp-buffer-size=4",
+            "",
+        );
+        row(
+            "-target x86_64-linux-gnu --target=x86_64-linux-gnu -arch x86_64",
+            "",
+        );
+        // `--optimize` is gcc's `-O` alone, and the word after it the driver's own
+        // (`toolchain::read`): an input file.
+        row(
+            "--optimize 2 --machine 32 --output out --language c",
+            "2|input",
+        );
+        row("-dumpbase foo.c", "-dumpbase foo.c|divided -dumpbase");
+        row("-Ttext 0x8000", "-Ttext 0x8000|divided -Ttext");
+        row(
+            "-undefined dynamic_lookup",
+            "-undefined dynamic_lookup|divided -undefined",
+        );
+        row("--entry foo.c", "--entry foo.c|divided --entry");
+        row(
+            "-dependency-file dep.d",
+            "-dependency-file dep.d|divided -dependency-file",
+        );
+        row("-dumpbase /srv/foo.c -Ttext -O2", "");
+        row("-Ttext @/srv/args.rsp", "");
+        row(
+            "-Wl,-z,relro -Xlinker -z -Xlinker now -Wl,foo.o -Xlinker foo.o -Wa,foo.s \
+             -Xassembler foo.s -Wp,foo.c -Xclang foo.c -Xarch_x86_64 -Wl,foo.o",
+            "",
+        );
+        row("-O2 -- -foo.c", "");
+        // Distributions' own lists name no input file.
+        row(
+            "-g -O2 -ffile-prefix-map=/build/p=. -fstack-protector-strong \
+             -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection \
+             -Wdate-time -D_FORTIFY_SOURCE=3 -Wl,-z,relro -Wl,-z,now -Wl,-Bsymbolic-functions",
+            "",
+        );
+        row(
+            "-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall \
+             -Werror=format-security -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 \
+             -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 \
+             -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1 -m64 -march=x86-64 -mtune=generic \
+             -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection \
+             -mtls-dialect=gnu2 -Wl,-z,relro -Wl,--as-needed -Wl,-z,pack-relative-relocs \
+             -Wl,-z,now -specs=/usr/lib/rpm/redhat/redhat-hardened-ld",
+            "",
+        );
+        row(
+            "-march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions \
+             -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security \
+             -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer \
+             -mno-omit-leaf-frame-pointer -Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro \
+             -Wl,-z,now -Wl,-z,pack-relative-relocs",
+            "",
+        );
+        row(
+            "-Os -fstack-clash-protection -Wformat -Werror=format-security \
+             -D_FORTIFY_SOURCE=2 -Wl,--as-needed,-O1,--sort-common -Wl,-z,pack-relative-relocs",
+            "",
+        );
+        assert!(
+            relative_path_readings(&[String::new()]).is_empty(),
+            "an empty word"
+        );
+        assert_eq!(relative_path_in_value("hello world", |_| false), None);
+        assert_eq!(relative_path_in_value("foo.c", |_| false), None);
+        assert_eq!(relative_path_in_value("-Ttext 0x8000", |_| false), None);
+        assert_eq!(
+            relative_path_in_value("foo.c -I bar", |_| false).map(|found| found.argument),
+            Some("-I bar".to_owned()),
+            "a value's relative path option is refused beside a word that is no input"
+        );
+        assert_eq!(
+            relative_path_in_value("foo.c", |_| true).map(|found| found.reading),
+            Some(PathReading::Relative),
+            "a word naming a file in chard's directory is refused as the entry reading says"
+        );
+    }
+
+    #[test]
+    fn every_driver_path_option_begins_with_a_dash() {
+        let options: Vec<&str> = PATH_OPTIONS
+            .iter()
+            .chain(PATH_OR_NAME_OPTIONS)
+            .copied()
+            .chain(
+                CLANG_LONGER
+                    .iter()
+                    .flat_map(|(longer, shorter)| [*longer, *shorter]),
+            )
+            .collect();
+        assert!(options.len() > 30, "{options:?}");
+        for option in options {
+            assert!(option.starts_with('-'), "{option}");
+        }
+    }
+
     #[test]
     fn the_words_handed_to_the_linker_are_read_as_the_linker_reads_them() {
         row("-Xlinker -Bsymbolic -Wl,-Bstatic", "");
@@ -2497,10 +2562,6 @@ mod tests {
         );
     }
 
-    /// A path option handed to a tool with no path in the same word or the pair after it is
-    /// refused as unpaired, since the tool reads its path from a word this reader does not
-    /// pair with it, or the line hands it none; a hand-on word that ends the list hands it
-    /// nothing.
     #[test]
     fn a_path_option_handed_without_its_path_is_refused_as_unpaired() {
         let xp = "-Xpreprocessor";
@@ -2522,11 +2583,6 @@ mod tests {
         row("-Xarch_x86_64 -L", "");
     }
 
-    /// Each tool's own options: clang's longer options handed to the preprocessor are read as
-    /// gcc's `cc1` reads them, GNU as reads only `-I` (its `-L` keeps local symbols), ld's
-    /// dynamic linker, run-time search paths, scripts and lists name paths and its `-T`
-    /// address options do not, and the word `-Xarch_<arch>` hands clang's driver is read with
-    /// the list it carries.
     #[test]
     fn each_tool_reads_its_own_options() {
         let xp = "-Xpreprocessor";
@@ -2574,9 +2630,6 @@ mod tests {
         );
     }
 
-    /// A value-taking option that names no path takes the next word as its value, unread,
-    /// as both drivers take it (`toolchain::takes_a_value`), and an option of
-    /// [`PATH_OPTIONS`] among them keeps its path reading.
     #[test]
     fn a_value_taking_option_takes_its_value_unread() {
         row("-u -Brel -MF -Lrel -o -Irel -D -Irel -z -L", "");
@@ -2594,13 +2647,6 @@ mod tests {
         );
     }
 
-    /// gcc's long spellings and abbreviations of the path options are read as the short
-    /// words (`toolchain::LONG_ALIASES`): `--li rel` is `-L rel`, `--sys rel` is `--sysroot
-    /// rel`, `--pref rel/` is `-B rel/`, `--im rel.h` is `-imacros rel.h`,
-    /// `--include-directory rel` is `-I rel`, `--include=rel.h` is `-include rel.h`,
-    /// `--specs rel/f` and `--sp rel/f` are `-specs=rel/f`, each refused as the short
-    /// spelling is; an absolute path under each passes, as do `--machine 32`, which names no
-    /// path, and `--sp nosys.specs`, a name the driver searches for.
     #[test]
     fn gccs_long_spellings_of_the_path_options_are_read_as_the_short_words() {
         row(
@@ -2658,11 +2704,6 @@ mod tests {
         assert_eq!(fed, 8, "every `--` option of the path tables was fed");
     }
 
-    /// Every entry of the linker's tables is read as it says: a path option refuses a relative
-    /// path handed after it, through `-Xlinker` pairs and in a `-Wl,` list, and passes an
-    /// absolute one and a loader token; a joined one refuses its relative path in the word; a
-    /// path-or-name option refuses a relative path holding a `/` and passes a bare name; and
-    /// the offload linker's words are its own run, apart from the linker's.
     #[test]
     fn every_linker_table_entry_is_read_as_it_says() {
         let mut fed = 0_usize;
@@ -2710,9 +2751,6 @@ mod tests {
         );
     }
 
-    /// clang's longer options this reader reads gcc's way are the ones the selection walk
-    /// passes over alone (`toolchain::HEADER_LONGER`), each begins with the shorter
-    /// [`PATH_OPTIONS`] option gcc reads, and both are in that list.
     #[test]
     fn clangs_longer_options_are_the_selection_walks() {
         let longer: Vec<&str> = CLANG_LONGER.iter().map(|(longer, _)| *longer).collect();
@@ -2726,8 +2764,6 @@ mod tests {
         }
     }
 
-    /// An `--env` value is refused with how its argument was read: gcc's reading of clang's own
-    /// option, or a path option handed without its path, beside the relative path as written.
     #[test]
     fn an_env_value_is_refused_with_its_reading() {
         let refused = |value: &str| {
@@ -2740,8 +2776,6 @@ mod tests {
         assert!(refused("-Lrel").contains("is a relative path"));
     }
 
-    /// A response file is found in every spelling the 2026-10-05 measurement saw a tool
-    /// expand, and an `@` inside a word that hands no tool a file is not one.
     #[test]
     fn a_response_file_is_found_in_every_spelling_a_tool_expands() {
         let words = |text: &str| {
@@ -2781,15 +2815,11 @@ mod tests {
                 "-O2 -DAT=@ -Wl,--defsym,a@b=0 -fuse-ld=lld -I/opt/x@y -Wl,-z,now \
                  -Xclang=-DX=@ -mllvm=-x=@y --for-assembler=--noexecstack"
             ))
-            .is_empty()
+            .is_empty(),
+            "an @ inside a word's value is not a response file"
         );
     }
 
-    /// The variables the 2026-10-05 measurement found a driver reading stay named.
-    ///
-    /// `tests/fake_driver.rs` holds the spawned process to whatever the list says and
-    /// `tests/register.rs` holds `THREAT_MODEL.md` to it, so neither notices an entry
-    /// leaving both. This names the four the list's comment records as measured.
     #[test]
     fn the_include_and_temporary_directory_variables_are_on_the_record() {
         for name in ["CPLUS_INCLUDE_PATH", "TMP", "TEMP", "TEMPDIR"] {
@@ -2800,8 +2830,6 @@ mod tests {
         }
     }
 
-    /// A passed variable chard lacks is left out of the compiler's environment rather than
-    /// handed over empty, and one it has is handed over as it has it, before the pins.
     #[test]
     fn a_passed_variable_chard_lacks_is_absent_from_the_compiler_environment() {
         use std::ffi::OsString;
@@ -2827,9 +2855,6 @@ mod tests {
         );
     }
 
-    /// The `--env` pairs reach the compiler after the passed variables and before the pins,
-    /// and the published form names the passed variables without their values and carries
-    /// every value chard set.
     #[test]
     fn the_added_pairs_sit_between_the_passed_variables_and_the_pins() {
         use std::ffi::OsString;
@@ -2874,18 +2899,24 @@ mod tests {
         );
     }
 
-    /// The run's pairs are fixed by their first read: a set after it fails, as does a second
-    /// set, and the value read stays the one every invocation saw.
     #[test]
     fn a_set_after_the_pairs_were_read_is_an_error() {
         let pairs = compiler_environment_additions(&["A=1".to_owned()]).expect("a plain pair");
         let read_first = RunEnvironment::new();
-        assert!(read_first.get().as_slice().is_empty());
+        assert!(
+            read_first.get().as_slice().is_empty(),
+            "an environment read before any set is empty: {:?}",
+            read_first.get().as_slice()
+        );
         assert!(
             read_first.set(pairs.clone()).is_err(),
             "a set after a read succeeded, so invocations before and after it saw two environments"
         );
-        assert!(read_first.get().as_slice().is_empty());
+        assert!(
+            read_first.get().as_slice().is_empty(),
+            "a refused set leaves the environment as it was read: {:?}",
+            read_first.get().as_slice()
+        );
 
         let set_first = RunEnvironment::new();
         set_first
@@ -2898,8 +2929,6 @@ mod tests {
         assert_eq!(set_first.get(), &pairs);
     }
 
-    /// `--env` is refused, every argument named, where the compiler's environment cannot
-    /// honour it as written; what it accepts comes back sorted by name.
     #[test]
     fn an_env_argument_naming_a_passed_or_pinned_or_malformed_name_is_refused() {
         let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
@@ -2907,6 +2936,9 @@ mod tests {
             "PATH=/usr/bin",
             "LC_ALL=en_US.UTF-8",
             "TERM=xterm",
+            "CCACHE_DISABLE=0",
+            "CCACHE_NODISABLE=1",
+            "CCACHE_CONFIGPATH=/tmp/ccache.conf",
             "NOVALUE",
             "=x",
             "1ABC=x",
@@ -2954,9 +2986,70 @@ mod tests {
         assert!(!message.contains("  "), "a run of spaces: {message}");
     }
 
-    /// A value holding a relative path is found, whether as a path-list entry, a word naming
-    /// something in chard's directory, or a flag a wrapper variable carries; an absolute
-    /// path, a sysroot path, a reference and a plain word are not.
+    #[test]
+    fn every_pin_is_refused_with_its_own_reason() {
+        for (name, value) in COMPILER_ENV_PINNED {
+            let Some(why) = pin_reason(name) else {
+                panic!("the pin {name} has no reason for its --env refusal to give");
+            };
+            // Every pin is classed, and a boolean one is ccache's and set to a value ccache
+            // reads as true: its manual's negative words are an error, not a false.
+            let Some(boolean) = ccache_boolean_pin(name) else {
+                panic!("the pin {name} is not classed by `ccache_boolean_pin`");
+            };
+            if boolean {
+                assert!(name.starts_with("CCACHE_"), "{name} is not ccache's");
+                assert!(
+                    !["0", "false", "disable", "no"].contains(&value.to_ascii_lowercase().as_str()),
+                    "the boolean pin {name}={value} is a value ccache refuses"
+                );
+            }
+            let reader = if name.starts_with("CCACHE_") {
+                "ccache"
+            } else {
+                "compiler-diag"
+            };
+            assert!(
+                why.contains(reader),
+                "the pin {name}'s --env refusal does not name what reads it ({reader}): {why:?}"
+            );
+        }
+        assert_eq!(pin_reason("CCACHE_DIR"), None);
+        // Each refusal names the pin's value: the pin's own as `pinned to "1"`, its negation's
+        // as the variable every invocation receives.
+        for (arg, value) in [
+            ("CCACHE_DISABLE=", "pinned to \"1\""),
+            ("CCACHE_NODISABLE=true", "receives CCACHE_DISABLE=1 "),
+        ] {
+            let message = compiler_environment_additions(&[arg.to_owned()])
+                .expect_err(arg)
+                .to_string();
+            assert!(
+                message.contains("ccache masquerade directory")
+                    && message.contains(value)
+                    && !message.contains("compiler-diag"),
+                "{arg}: {message}"
+            );
+        }
+        assert_eq!(ccache_boolean_pin("CCACHE_DIR"), None);
+        assert_eq!(
+            countermanded_pin("CCACHE_NODISABLE"),
+            Some("CCACHE_DISABLE")
+        );
+        for name in [
+            "CCACHE_NODIRECT",
+            "CCACHE_NOCONFIGPATH",
+            "CCACHE_DISABLE",
+            "CCACHE_NO",
+            "NODISABLE",
+        ] {
+            assert_eq!(countermanded_pin(name), None, "{name}");
+        }
+        let kept = compiler_environment_additions(&["CCACHE_DIR=/var/cache/x".to_owned()])
+            .expect("CCACHE_DIR names no pin");
+        assert_eq!(kept.as_slice().len(), 1);
+    }
+
     #[test]
     fn a_relative_path_in_an_env_value_is_found() {
         let in_cwd = |path: &Path| path == Path::new("rel");
@@ -2991,9 +3084,6 @@ mod tests {
         );
     }
 
-    /// The environment a toolchain invocation is given names the passed variables chard
-    /// has and the pins, and nothing else: no found variable, whatever chard's own
-    /// environment holds, and no name twice.
     #[test]
     fn the_compiler_environment_is_the_passed_variables_and_the_pins() {
         let given: Vec<String> = compiler_environment()
@@ -3028,11 +3118,6 @@ mod tests {
         assert_eq!(names.len(), given.len(), "a name is set twice: {given:?}");
     }
 
-    /// The driver is handed the source by its file name and runs where that name
-    /// resolves, so the name it compiles in does not carry the work directory.
-    ///
-    /// The stand-in driver copies whatever its last argument names, read from its own
-    /// working directory, to its `-o` path: a copy of the source means both halves held.
     #[test]
     fn a_build_names_its_source_relative_to_the_directory_it_runs_in() {
         let dir = std::env::temp_dir().join(format!("chard-in-place-{}", std::process::id()));
@@ -3047,7 +3132,7 @@ mod tests {
         std::fs::write(&source, "int main(void){return 0;}\n").expect("source");
         let out = dir.join("probe");
 
-        let record = build(&driver, &[], &source, &out, &[]).expect("a record");
+        let record = build(&driver, &[], &source, &out, &[], None).expect("a record");
         assert!(record.succeeded(), "{}", record.stderr);
         assert_eq!(record.argv.last().map(String::as_str), Some("probe.c"));
         assert_eq!(
@@ -3059,34 +3144,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// A program that outlives the bound is killed, and the failure is an error.
-    ///
-    /// The distinction being pinned is not "does it stop" but "what does stopping produce".
-    /// A timed-out compile that came back as a `BuildRecord` would have `succeeded() ==
-    /// false`, and the `compiler-diag` channel reads a failed compile as its *observable* —
-    /// so a wedged toolchain would publish as "the compiler rejected this", a measurement
-    /// from a run that measured nothing.
-    ///
-    /// Uses a one-second bound via a helper rather than the real 120s, because a test that
-    /// takes two minutes to prove a timeout is a test nobody runs.
-    /// A build reads back only what it wrote, never what was already there.
-    ///
-    /// The work directory is reused by design — `--workdir` defaults into the caller's
-    /// CWD and is retained as evidence rather than cleaned — so a probe whose build
-    /// writes no output file would otherwise inherit the previous run's binary at the
-    /// same name. Measured before the removal existed: `--profile openssf-tldr` followed
-    /// by `--profile explicit --flags -fsyntax-only` over one work directory published
-    /// `pie`, `relro` and `noexecstack` as `on`, from the first run's artifact, with the
-    /// same `artifact_sha256` in both reports and every control triple `discriminating`.
-    ///
-    /// A fabricated `on` is the one outcome the control triple exists to make impossible,
-    /// and reaching it took two ordinary invocations rather than a hostile compiler.
-    ///
-    /// `true` stands in for a driver that exits 0 and writes nothing, which is what
-    /// `-fsyntax-only` does to a real one. Resolved on `PATH` rather than hardcoded to
-    /// `/bin/true`, which does not exist on macOS -- a host this project claims to run
-    /// on, and where the hardcoded path failed the test for the host's reasons rather
-    /// than the code's.
     #[test]
     fn a_build_that_writes_nothing_does_not_inherit_the_last_one() {
         let dir = std::env::temp_dir().join(format!("chard-stale-{}", std::process::id()));
@@ -3097,7 +3154,7 @@ mod tests {
         std::fs::write(&out, b"\x7fELF stale artifact from a previous run").expect("stale");
 
         let exits_zero = crate::toolchain::resolve_driver("true").expect("`true` on PATH");
-        let record = build(&exits_zero, &[], &source, &out, &[])
+        let record = build(&exits_zero, &[], &source, &out, &[], None)
             .expect("a driver that exits 0 yields a record");
 
         assert!(record.succeeded(), "`true` exits 0");
@@ -3138,16 +3195,38 @@ mod tests {
         );
     }
 
-    /// The bound covers *reading* the output, not merely waiting for the child.
-    ///
-    /// `try_wait` returning a status means the child is gone, not that its pipes are
-    /// closed — a backgrounded process inherits the write end and holds it open. Joining
-    /// the drain threads therefore had no deadline of its own, and this exact call
-    /// returned after 30.0 s under a 400 ms bound before `DRAIN_GRACE` existed.
-    ///
-    /// What it must produce is an error rather than a `BuildRecord` with empty streams:
-    /// an unread stderr published as empty says "the compiler was silent", which is a
-    /// `compiler-diag` observable, from a stream nobody read.
+    #[test]
+    fn a_timeout_kills_what_the_driver_started() {
+        let dir = std::env::temp_dir().join(format!("chard-invokegroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let started = dir.join("started");
+        let got = invoke_with_timeout(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                format!(
+                    "(trap '' TERM HUP INT; exec /bin/sleep 30) & echo $! > '{}'; wait",
+                    started.display()
+                ),
+            ],
+            None,
+            Duration::from_millis(400),
+            Duration::from_millis(300),
+        );
+        let err = got.expect_err("a driver that outlives the bound must not return a record");
+        assert!(format!("{err}").contains("did not finish"), "{err}");
+        let pid: u32 = std::fs::read_to_string(&started)
+            .expect("the driver wrote its child's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            crate::run::gone_within(pid, Duration::from_secs(2)),
+            "the driver's child {pid} is still running after the timeout killed the driver"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     #[test]
     fn the_bound_covers_reading_the_output_not_only_waiting_for_the_child() {
         let started = Instant::now();
@@ -3170,12 +3249,141 @@ mod tests {
         );
     }
 
-    /// Output still arrives whole, on both streams, when the program exits normally.
-    ///
-    /// The timeout drains by hand where `.output()` would, and the hazard of that is a
-    /// child that fills a pipe while nothing is reading it. This writes more than a pipe
-    /// buffer holds (`64 KiB` is the usual Linux capacity), so a version that waits on the
-    /// child before draining deadlocks here rather than in a sweep.
+    #[test]
+    fn a_child_that_closes_its_output_early_is_still_waited_for() {
+        let record = invoke_with_timeout(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                "echo early; exec >/dev/null 2>&1; sleep 0.3; exit 4".to_owned(),
+            ],
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .expect("a program that exits is not an error");
+        assert_eq!(
+            record.exit_status, 4,
+            "the status of the exit, not of the end of file"
+        );
+        assert_eq!(record.stdout, "early");
+        assert!(
+            record.duration_ms >= 300,
+            "the record must cover the child's whole lifetime, not end at its end of file: {} ms",
+            record.duration_ms
+        );
+    }
+
+    #[test]
+    fn a_child_that_closes_its_output_and_hangs_still_times_out() {
+        let started = Instant::now();
+        let got = invoke_with_timeout(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                "exec >/dev/null 2>&1; exec /bin/sleep 30".to_owned(),
+            ],
+            None,
+            Duration::from_millis(400),
+            Duration::from_millis(300),
+        );
+        let err = got.expect_err("a child that outlives the bound must not return a record");
+        assert!(format!("{err}").contains("did not finish"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the timeout, not the child, ended the wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_duration_ends_at_the_exit_not_when_the_pipes_are_let_go() {
+        let record = invoke_with_timeout(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                "/bin/sleep 1 & /bin/sleep 0.05; exit 0".to_owned(),
+            ],
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .expect("a holder that lets go within the drain bound leaves a record");
+        assert!(
+            record.duration_ms < 300,
+            "the duration ran on to the holder's end of file: {} ms",
+            record.duration_ms
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_wait_after_both_pipes_close_does_not_spin() {
+        const SCHEDSTAT: &str = "/proc/thread-self/schedstat";
+        // The first field of `schedstat` is the thread's time on a CPU, in nanoseconds.
+        let on_cpu = |text: &str| -> u64 {
+            let field = text.split_whitespace().next().expect("a time on CPU");
+            field.parse().expect("a time on CPU in nanoseconds")
+        };
+        let before = match std::fs::read_to_string(SCHEDSTAT) {
+            Ok(text) => on_cpu(&text),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                panic!("{SCHEDSTAT} is there and does not read: {e}")
+            }
+            Err(_) => {
+                crate::error::capability_gap(
+                    "the_wait_after_both_pipes_close_does_not_spin",
+                    "this kernel has no /proc/thread-self/schedstat",
+                );
+                return;
+            }
+        };
+        let record = invoke_with_timeout(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                "exec >/dev/null 2>&1; exec /bin/sleep 1".to_owned(),
+            ],
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .expect("a program that exits is not an error");
+        let after = on_cpu(&std::fs::read_to_string(SCHEDSTAT).expect("the thread's schedstat"));
+        // A counter that did not move over a second of waiting is a kernel that does not
+        // account it, and a zero read from it would pass a spinning wait.
+        if after <= before {
+            crate::error::capability_gap(
+                "the_wait_after_both_pipes_close_does_not_spin",
+                "this kernel's /proc/thread-self/schedstat does not count time on a CPU",
+            );
+            return;
+        }
+        let spent = Duration::from_nanos(after.saturating_sub(before));
+        assert!(record.duration_ms >= 1000, "{} ms", record.duration_ms);
+        assert!(
+            spent < Duration::from_millis(200),
+            "the wait spent {spent:?} on a CPU over a one-second child"
+        );
+    }
+
+    #[test]
+    fn a_reader_that_panicked_is_an_error() {
+        let ok = || std::thread::spawn(Vec::new);
+        let panicked = || std::thread::spawn(|| -> Vec<u8> { panic!("a reader panicked") });
+        for (out_reader, err_reader) in [(ok(), panicked()), (panicked(), ok())] {
+            let got = read_both(
+                out_reader,
+                err_reader,
+                Duration::from_secs(5),
+                Path::new("cc"),
+                &[],
+            );
+            let err = got.expect_err("an unread stream must not publish as empty");
+            assert!(format!("{err}").contains("output reader panicked"), "{err}");
+        }
+    }
+
     #[test]
     fn output_survives_the_draining_even_when_it_exceeds_a_pipe_buffer() {
         let record = invoke(
@@ -3193,9 +3401,7 @@ mod tests {
             "the real status, not an invented one"
         );
         // Not an exact count: `BuildRecord` trims trailing whitespace on both streams, so
-        // stderr lands one byte short of what was written. What is being pinned is that
-        // neither stream stopped at a pipe buffer — 64 KiB on Linux — which is the failure
-        // a wait-before-drain would produce.
+        // stderr lands one byte short of what was written.
         assert!(
             record.stdout.len() > 150_000,
             "stdout truncated at {} bytes, which is a pipe buffer and not the output",
@@ -3243,18 +3449,6 @@ mod tests {
         assert_eq!(map_name("tcc"), None);
     }
 
-    /// Every child chard spawns is spawned somewhere that bounds it.
-    ///
-    /// `INVOKE_TIMEOUT` claims that every measurement runs through this module. That is
-    /// a claim about the whole crate, and it was false: `env::musl_version` called
-    /// `.output()` directly — which waits forever — on the `chard measure` path of every
-    /// musl host. Nothing detected it, because a claim in a doc comment has nothing
-    /// holding it up.
-    ///
-    /// Two modules may spawn, and each carries its own bound: `compile` with
-    /// `INVOKE_TIMEOUT` and `DRAIN_GRACE`, `run` with the probe timeout its caller
-    /// supplies. A `Command::new` anywhere else is a child with nothing bounding it,
-    /// which is how an unbounded `.output()` call would get in.
     #[test]
     fn every_spawn_site_sits_where_something_bounds_it() {
         const BOUNDED: &[&str] = &["compile.rs", "run.rs"];
@@ -3262,9 +3456,7 @@ mod tests {
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
         // The whole tree, not its top level: `src/decode/` and `src/predicate/` hold modules,
-        // and a child spawned there is as unbounded as one spawned beside this file. The
-        // exemption is keyed on the path below `src/`, so a nested file sharing a bounded
-        // module's name is scanned rather than excused.
+        // and a child spawned there is as unbounded as one spawned beside this file.
         let mut dirs = vec![src.clone()];
         let mut files = Vec::new();
         while let Some(dir) = dirs.pop() {
@@ -3447,9 +3639,6 @@ mod tests {
         found
     }
 
-    /// The lexer `one_child_runs_at_a_time_and_its_spawner_waits_for_it` reads the crate
-    /// through: every literal and comment form blanked, the code around them kept word for
-    /// word, and every line kept in place.
     #[test]
     fn the_one_child_scan_reads_code_and_only_code() {
         let source = r##"use std::thread::{sleep, spawn}; // spawn
@@ -3509,9 +3698,8 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
     }
 
     /// The innermost function whose body holds byte `at` of `code`: the offsets of its `fn`
-    /// keyword, its opening brace and its closing brace. Any qualifier may precede the `fn`
-    /// (`pub(in ..)`, `const`, `async`, `unsafe`, `extern`). A `fn` whose first `{` or `;`
-    /// is a `;` has no body here: a trait item, or a function-pointer type.
+    /// keyword, its opening brace and its closing brace. A `fn` whose first `{` or `;` is a
+    /// `;` has no body here: a trait item, or a function-pointer type.
     fn enclosing_fn(
         code: &str,
         braces: &BTreeMap<usize, usize>,
@@ -3552,13 +3740,9 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
     }
 
     /// The loop keyword whose body is the brace at byte `o`, where `o` sits directly in the
-    /// block opened at byte `parent`. Each `for`, `while` or `loop` word standing in that
-    /// block, not in a block nested in it, is followed forward with `()` and `[]` balanced:
-    /// a `;` at its level ends the statement, a brace group at its level is skipped and the
-    /// head goes on only when another `{` follows at once (`while { .. } { .. }`), and
-    /// reaching `o` makes `o` its body. A closure or block in the loop's head
-    /// (`for _ in it.filter(|_| { .. }) {`) is inside parentheses or skipped as a group, so it
-    /// does not hide the keyword, as it would from a scan of the text before `o` alone.
+    /// block opened at byte `parent`. Each loop word in that block is followed forward with
+    /// `()` and `[]` balanced and brace groups skipped, so a closure or block in the loop's
+    /// head (`for _ in it.filter(|_| { .. }) {`) does not hide the keyword.
     fn loop_owning<'a>(
         code: &'a str,
         braces: &BTreeMap<usize, usize>,
@@ -3600,26 +3784,8 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
     }
 
     /// The process spawn whose word `spawn` starts at byte `start` of `code` (`code_only`'s
-    /// output, so a wait or a loop in a comment is neither) is one child, bound once and
-    /// waited for by the function that spawned it. Four rejections, each named in its panic:
-    ///
-    /// - The spawn sits in a `for`, `while` or `loop` body inside its function. A loop that
-    ///   spawns is how a pool starts, and whether each iteration waits before the next is not
-    ///   something a scan can follow, so the scan refuses the shape.
-    /// - The statement holding the spawn is not `let mut <name> = ...`, or is `let` without
-    ///   `mut`.
-    /// - Anywhere between that binding and the brace that closes the function, `<name>` is
-    ///   used other than through `.` (a method or a field) or behind `&`/`&mut`: passed to a
-    ///   call by value, pushed, returned, assigned, or bound again by `let`. Any of those can
-    ///   put the child where the wait does not reach, and a re-let makes a wait that follows
-    ///   name another child. The scan does not stop at the first wait: a `try_wait`, which
-    ///   does not block, followed by `Ok(child)` would return a running child.
-    /// - No blocking `<name>.wait()`, with `<name>` a whole word not reached through `.` or
-    ///   `::`, comes before that brace. A `try_wait` alone polls and does not hold the child
-    ///   to its end; both sites today poll with `try_wait` and end on `wait` after `kill`.
-    ///
-    /// The function is the innermost `fn` (any qualifiers: `pub(in ..)`, `const`, `async`,
-    /// `unsafe`, `extern`) whose body, found by matching braces, holds the spawn.
+    /// output) is one child, bound once and waited for by the innermost function that holds
+    /// it. Four rejections, each named in its panic:
     fn assert_spawner_waits(name: &str, code: &str, start: usize) {
         let line_of = |p: usize| code[..p].matches('\n').count() + 1;
         let line_text = |p: usize| {
@@ -3661,8 +3827,8 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
             ),
         };
 
-        // Every later mention of `child` up to the first wait: a method or a field, or a
-        // borrow, and nothing else.
+        // Every later mention of `child` up to the function's close: a method or a field, or
+        // a borrow, and nothing else.
         let from = bound + child.len();
         let mut waited = None;
         let mut mentions = 0usize;
@@ -3738,16 +3904,17 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         "tokio",
     ];
     // (file below `src/`, site, occurrences, the bound that keeps the site to one child).
-    // A site is a word from `WORDS`, or `thread::spawn` for a `spawn` that path names.
     /// The sites allowed, each with the bound that keeps it to one child (the ratchet below).
     const ALLOWED: &[(&str, &str, usize, &str)] = &[
         (
             "compile.rs",
             "thread::spawn",
-            2,
+            4,
             "the stdout and stderr readers of the one child `invoke_with_timeout` \
-             spawned; each reads a pipe and spawns nothing, and is joined or abandoned \
-             before that function returns",
+             spawned; each reads a pipe, sends its end of file on a channel to that \
+             function and spawns nothing, and is joined or abandoned before that function \
+             returns; and the two stand-in readers of `a_reader_that_panicked_is_an_error` \
+             (test module only), which start no process and are joined by `read_both`",
         ),
         (
             "compile.rs",
@@ -3758,8 +3925,12 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         (
             "run.rs",
             "spawn",
-            1,
-            "`execute`'s probe, waited for under the probe timeout its caller supplies",
+            3,
+            "`execute`'s probe, waited for under the probe timeout its caller supplies; \
+             `kill_group`'s shell, spawned only once a child has outlived its bound, beside \
+             that child as it is killed and before it is reaped, and waited for under \
+             `KILL_BOUND`; and a test's `sleep`, killed by `kill_group_through` and reaped \
+             by the test",
         ),
         (
             "elf.rs",
@@ -3778,61 +3949,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         ),
     ];
 
-    /// One child at a time: nothing in the crate runs work concurrently, and each process
-    /// spawn is waited for in the function that spawned it.
-    ///
-    /// One exception, in a test module and outside every measurement: `src/elf.rs`'s
-    /// corruption test parses in-memory copies on scoped threads, written out as
-    /// `thread::Scope::spawn` so the scan below counts them as threads, and allowlisted with
-    /// that bound. They start no process.
-    ///
-    /// `measure::Driver` rests on this. The `runtime` channel and both records'
-    /// `duration_ms` are read off a harness running one child, and the auxiliary libraries
-    /// are linked at one name per work directory, so a second child beside the first
-    /// perturbs a measurement or overwrites another variant's dependency chain, with no
-    /// error either way. The property is held by construction (the sequential probe loop in
-    /// `main.rs`, and `invoke_with_timeout` and `run::execute` each waiting for their
-    /// child), and held to it by this test rather than by a sentence.
-    ///
-    /// Two halves. Every word in `src/` that starts concurrent work is counted per file and
-    /// compared, exactly, with an allowlist whose entries name their site and the bound that
-    /// keeps it to one child: an added site fails, and so does an allowlisted one that is
-    /// gone. Then each process spawn passes `assert_spawner_waits`, whose four rejections are
-    /// listed on it: no spawn in a `for`, `while` or `loop` body, a `let mut` binding, no
-    /// by-value use or re-binding of that name in its function, and a blocking `wait` naming
-    /// it as a whole word before the function's closing brace. `.output()` and `.status()` wait for
-    /// their child themselves; `every_spawn_site_sits_where_something_bounds_it` holds where
-    /// any `Command` may be built.
-    ///
-    /// The scan reads words of code, not substrings of lines. `code_only` blanks comments and
-    /// literals (`the_one_child_scan_reads_code_and_only_code` holds it), and a word is
-    /// counted wherever it stands, so `Command::spawn(&mut c)`, a bare `spawn` imported by
-    /// `use std::thread::{spawn}`, and `.spawn()` are one word three ways. Every way into
-    /// `std::thread`'s concurrency names `spawn`, `scope` or `Builder` at its use or its call,
-    /// so `thread` itself, which `sleep` also needs, is not counted. A `spawn` preceded by
-    /// `thread::` is a thread; any other is a process spawn and gets the wait check. The
-    /// wait check reads the file as one text and matches braces, so line breaks, trailing
-    /// comments and function qualifiers do not move it. The frame is `src/`: `build.rs`
-    /// runs at build time, before any measurement.
-    ///
-    /// What the wait check does not see, and why each is tolerable or is not yet held:
-    ///
-    /// - Order in the text, not control flow. A wait inside one branch, or an early return
-    ///   (`?`, `bail!`) between the spawn and the wait, passes; a dropped `Child` is neither
-    ///   waited for nor killed. `invoke_with_timeout` has such a return today: it kills,
-    ///   without reaping, a child whose pipes were not set up, which the spawn configuration
-    ///   above it rules out.
-    /// - A move through a borrow: `std::mem::replace(&mut child, ..)` or `swap` reads as a
-    ///   borrow.
-    /// - Iteration through a closure (`(0..n).map(|_| ...spawn())`) is not a loop body. It
-    ///   fails anyway, as the binding check or as a missing wait, because the statement then
-    ///   binds a collection, and `.wait()` on a collection does not compile.
-    /// - A loop in a caller is outside the frame. The spawner waits before it returns, so a
-    ///   sequential caller still runs one child, and a threaded caller is counted above.
-    /// - A function-pointer type whose next `{` comes before any `;` (`|f: fn()| { .. }`)
-    ///   reads as a `fn` body, which narrows the function to that brace: a wait after it
-    ///   fails, and a loop outside it is missed. An `impl .. for` block inside a function
-    ///   reads as a loop and fails. Neither stands in `src/` today.
     #[test]
     fn one_child_runs_at_a_time_and_its_spawner_waits_for_it() {
         let sources = rust_sources();
@@ -3851,7 +3967,7 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
                 }
                 // A thread, not a process: `thread::spawn`, or a scoped thread written out as
                 // `thread::Scope::spawn(scope, ..)` (a scope's workers are joined before the
-                // scope returns). A method call `s.spawn(..)` reads as a process spawn here.
+                // scope returns).
                 let threaded = word == "spawn"
                     && code[..offset]
                         .trim_end()
@@ -3919,10 +4035,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         );
     }
 
-    /// `failure` is `None` for a job that exited 0 whatever it wrote to stderr, and for one
-    /// that did not, `exited N` (or `was killed by a signal` for a recorded `-1`) with the
-    /// first non-empty stderr line after a colon where there is one, published against the
-    /// work directory.
     #[test]
     fn a_failure_names_the_status_and_the_first_stderr_line() {
         let workdir = Path::new("/scratch/chard-work");
@@ -3960,9 +4072,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         assert_eq!(record(255, "").failure(None), Some("exited 255".to_owned()));
     }
 
-    /// `invoke` records whether the job's stdout ended partway through a line from the bytes
-    /// it read, which the stored, trimmed `stdout` cannot show: `printf 'a\nb'` and
-    /// `printf 'a\nb\n'` are stored alike.
     #[test]
     fn invoke_records_an_unterminated_stdout_before_the_trim() {
         let run = |script: &str| {
@@ -3987,9 +4096,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         assert_eq!(failed.exit_status, 1);
     }
 
-    /// A dump loses the last line its output ended partway through, whatever its status, and
-    /// no other: `#define __GLIBC_MINOR__ 4` cut from `43` is not glibc 2.4, and a whole last
-    /// line is read where a signal or a non-zero status followed it.
     #[test]
     fn a_dump_loses_only_a_last_line_its_output_ended_partway_through() {
         let record = |exit_status: i32, raw: &str| BuildRecord {
@@ -4033,9 +4139,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         );
     }
 
-    /// Every byte prefix of a listing, shaped as `invoke` records it, parses to defines the
-    /// whole listing has with the values it gives them, and one that stops partway through a
-    /// define reads as failed under exit 0: no cut point yields a define the listing lacks.
     #[test]
     fn no_cut_of_a_listing_reads_a_define_it_lacks() {
         let listing = "#define __GLIBC_MINOR__ 43\n#define __GLIBC__ 2\n#define __SSP_STRONG__ 3\n\
@@ -4075,9 +4178,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         assert!(!ends_mid_line(""));
     }
 
-    /// `dump_failure` is `failure` where the job did not succeed, the cut where it exited 0
-    /// with its output ended partway through a line, and `None` for a whole listing that
-    /// exited 0, whatever it wrote to stderr.
     #[test]
     fn a_dump_that_exited_0_with_its_output_cut_off_failed() {
         let record = |exit_status: i32, stdout_unterminated: bool| BuildRecord {
@@ -4112,13 +4212,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         );
     }
 
-    /// The published copy of a build is relative to the work directory, and the record
-    /// it was copied from is not touched.
-    ///
-    /// Both spellings the driver is handed: `workdir/name` for the output and the source,
-    /// which become bare names, and `-Lworkdir` for the chain search path, which becomes
-    /// `-L.`. The diagnostic quoting the source path is rewritten the same way, so a
-    /// report measured in two directories carries the same text.
     #[test]
     fn a_published_build_is_relative_to_its_work_directory_and_the_original_is_not() {
         let workdir = Path::new("/scratch/chard-work");
@@ -4165,9 +4258,8 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         assert_eq!(relativize("/usr/bin/cc", Path::new("/")), "/usr/bin/cc");
         assert_eq!(relativize("/usr/bin/cc", Path::new("")), "/usr/bin/cc");
 
-        // Whole components. A directory that merely begins with the work directory's
-        // spelling is a different directory, and the operator's `-I/tmp/wd2` under a
-        // work directory of `/tmp/wd` was published as `-I.2`.
+        // Whole components: a directory that merely begins with the work directory's
+        // spelling is a different directory.
         let wd = Path::new("/tmp/wd");
         for kept in [
             "-I/tmp/wd2",
@@ -4231,9 +4323,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         assert!(!record.succeeded());
     }
 
-    /// A relative driver path run under another working directory is the path from this
-    /// process's own: it is made absolute before the change of directory, so the child's
-    /// directory, deeper than this one, does not move what it names.
     #[test]
     fn a_relative_driver_names_the_same_file_under_another_working_directory() {
         let root = std::env::temp_dir().join(format!("chard-relcc-{}", std::process::id()));
@@ -4263,9 +4352,6 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         crate::error::best_effort(std::fs::remove_dir_all(&root));
     }
 
-    /// The drain bound holds where one pipe closes and the other stays held: a child that
-    /// exits leaving a grandchild on its stderr alone is an error once the bound passes, not
-    /// a record read after the grandchild lets go.
     #[test]
     fn one_pipe_still_held_after_the_child_exits_is_an_error() {
         let started = Instant::now();
@@ -4284,6 +4370,451 @@ spawn"; fn h<'life>(x: &'life u8) { b'x'; br"spawn"; r#async; }
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the drain bound, not the grandchild or the call's own timeout, ended the wait"
+        );
+    }
+
+    /// A directory of one witness test's own under the temporary directory, emptied first.
+    fn witness_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("chard-nonce-{tag}-{}", std::process::id()));
+        crate::error::best_effort(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("the test's directory");
+        dir
+    }
+
+    /// Facts whose run witnesses are `witnesses`.
+    fn facts_carrying(witnesses: &[&str]) -> crate::elf::ElfFacts {
+        let mut facts = crate::probe::tests::elf_with_report("");
+        facts.run_witness = witnesses.iter().map(|w| (*w).to_owned()).collect();
+        facts
+    }
+
+    #[test]
+    fn a_witness_writes_the_header_its_builds_name() {
+        let dir = witness_dir("header");
+        let witness = RunWitness::derived_in(["a line"], &dir).expect("a witness");
+        let written = std::fs::read_to_string(dir.join(RUN_WITNESS_HEADER_NAME))
+            .expect("the header is on disk");
+        assert_eq!(written, witness.header());
+        assert_eq!(
+            RunWitness::compile_words(),
+            ["-include", RUN_WITNESS_HEADER_NAME]
+        );
+
+        let nonce = witness.nonce_hex();
+        assert_eq!(nonce.len(), crate::elf::RUN_WITNESS_BYTES * 2, "{nonce}");
+        assert!(
+            nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{nonce}"
+        );
+        let bytes: Vec<String> = nonce
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| format!("0x{}", String::from_utf8_lossy(pair)))
+            .collect();
+        let nonce_line = format!(".byte {}", bytes.join(","));
+        let section = format!(".pushsection {},", crate::elf::RUN_WITNESS_SECTION);
+        // "chard" and its NUL, padded to a multiple of four.
+        let owner_line = ".byte 0x63,0x68,0x61,0x72,0x64,0x00,0x00,0x00";
+        let header_line = format!(
+            ".4byte 6,{},{}",
+            crate::elf::RUN_WITNESS_BYTES,
+            crate::elf::RUN_WITNESS_TYPE
+        );
+        for needle in [&nonce_line, &section, owner_line, &header_line, "%note"] {
+            assert_eq!(
+                written.matches(needle).count(),
+                2,
+                "`{needle}` is not in both forms of the header:\n{written}"
+            );
+        }
+        let conditionals: Vec<&str> = written.lines().filter(|l| l.starts_with('#')).collect();
+        assert_eq!(
+            conditionals,
+            ["#if defined(__ASSEMBLER__)", "#else", "#endif"],
+            "the header is conditional on more than the unit's language"
+        );
+        assert!(written.contains("__asm__("), "{written}");
+        assert!(
+            !written.contains("  \\"),
+            "a line continuation left a run of spaces in the header"
+        );
+    }
+
+    #[test]
+    fn a_nonce_is_derived_from_the_question_or_read_whole_from_the_device() {
+        let dir = witness_dir("sources");
+        let asked = ["profile.cflags=-O2", "env.A=1"];
+        let first = RunWitness::derived_in(asked, &dir).expect("a witness");
+        let again = RunWitness::derived_in(asked, &dir).expect("a witness");
+        let other =
+            RunWitness::derived_in(["profile.cflags=-O2", "env.A=2"], &dir).expect("a witness");
+        let joined =
+            RunWitness::derived_in(["profile.cflags=-O2env.A=1"], &dir).expect("a witness");
+        assert_eq!(first, again);
+        assert_eq!(first.source(), WitnessSource::Derived);
+        assert_ne!(first.nonce_hex(), other.nonce_hex());
+        assert_ne!(
+            first.nonce_hex(),
+            joined.nonce_hex(),
+            "two lines and their concatenation derive one nonce"
+        );
+
+        let device = dir.join("device");
+        std::fs::write(&device, [0xa5u8; crate::elf::RUN_WITNESS_BYTES]).expect("a device");
+        let random = RunWitness::random_from(&device, &dir).expect("a witness");
+        assert_eq!(random.source(), WitnessSource::OsRandom);
+        assert_eq!(
+            random.nonce_hex(),
+            "a5".repeat(crate::elf::RUN_WITNESS_BYTES)
+        );
+        std::fs::write(&device, [0xa5u8; 15]).expect("a short device");
+        let short = RunWitness::random_from(&device, &dir).expect_err("fifteen bytes are no nonce");
+        assert!(
+            format!("{short:#}").contains("reading the run's nonce"),
+            "{short:#}"
+        );
+        let absent =
+            RunWitness::random_from(&dir.join("no-device"), &dir).expect_err("no device, no nonce");
+        assert!(format!("{absent:#}").contains("no-device"), "{absent:#}");
+
+        // The host's device gives two runs two nonces.
+        if Path::new(RANDOM_DEVICE).exists() {
+            let one = RunWitness::random_in(&dir).expect("a witness");
+            let two = RunWitness::random_in(&dir).expect("a witness");
+            assert_ne!(one.nonce_hex(), two.nonce_hex());
+        }
+    }
+
+    #[test]
+    fn an_artifact_is_confirmed_by_the_runs_nonce_alone() {
+        let dir = witness_dir("confirm");
+        let witness = RunWitness::derived_in(["confirm"], &dir).expect("a witness");
+        let own = witness.nonce_hex().to_owned();
+        let other = "00".repeat(crate::elf::RUN_WITNESS_BYTES);
+        assert_ne!(own, other);
+
+        assert_eq!(witness.confirm(&facts_carrying(&[&own])), Ok(()));
+        assert_eq!(
+            witness.confirm(&facts_carrying(&[])),
+            Err(WitnessAbsence::Missing)
+        );
+        // An object of IR alone: no note, and the absence says the IR is why.
+        let mut ir = facts_carrying(&[]);
+        ir.sections = vec![
+            ".text".to_owned(),
+            format!("{}decls.0", crate::report::LTO_IR_SECTION_PREFIX),
+        ];
+        assert_eq!(witness.confirm(&ir), Err(WitnessAbsence::MissingFromIr));
+        ir.run_witness = vec![own.clone()];
+        assert_eq!(witness.confirm(&ir), Ok(()));
+        let from_ir = WitnessAbsence::MissingFromIr.to_string();
+        assert!(
+            from_ir.contains("carries no run witness") && from_ir.contains("compiler IR"),
+            "{from_ir}"
+        );
+        assert_eq!(
+            witness.confirm(&facts_carrying(&[&other])),
+            Err(WitnessAbsence::Foreign(vec![other.clone()]))
+        );
+        assert_eq!(
+            witness.confirm(&facts_carrying(&[&own, &other])),
+            Err(WitnessAbsence::Foreign(vec![own.clone(), other.clone()]))
+        );
+        // Upper case is another spelling the reader never writes, so it is not the nonce.
+        if own.to_uppercase() != own {
+            assert!(
+                witness
+                    .confirm(&facts_carrying(&[&own.to_uppercase()]))
+                    .is_err()
+            );
+        }
+
+        let missing = WitnessAbsence::Missing.to_string();
+        assert!(missing.contains("carries no run witness"), "{missing}");
+        assert!(
+            missing.contains(crate::elf::RUN_WITNESS_SECTION),
+            "{missing}"
+        );
+        let foreign = WitnessAbsence::Foreign(vec![other.clone()]).to_string();
+        assert!(
+            foreign.contains(&other) && foreign.contains("did not write"),
+            "{foreign}"
+        );
+        let mixed = WitnessAbsence::Foreign(vec![own.clone(), other.clone()]).to_string();
+        assert!(
+            mixed.contains("2 run witnesses") && mixed.contains(&own) && mixed.contains(&other),
+            "{mixed}"
+        );
+        assert!(!mixed.contains("at least"), "{mixed}");
+        // A list read from note segments has no section to name, so neither form names one.
+        for reason in [&foreign, &mixed] {
+            assert!(
+                !reason.contains(crate::elf::RUN_WITNESS_SECTION),
+                "{reason}"
+            );
+        }
+        // A list at the reader's cap may stand for more values than it holds.
+        let capped: Vec<String> = (0..crate::elf::RUN_WITNESSES_KEPT)
+            .map(|i| format!("{i:032x}"))
+            .collect();
+        let capped = WitnessAbsence::Foreign(capped).to_string();
+        assert!(
+            capped.contains(&format!(
+                "at least {} run witnesses",
+                crate::elf::RUN_WITNESSES_KEPT
+            )),
+            "{capped}"
+        );
+    }
+
+    /// A question in literals, for
+    /// [`a_derived_nonce_moves_with_every_field_of_the_question`]'s rows.
+    #[derive(Clone, Copy)]
+    struct Asked {
+        c: &'static [&'static str],
+        cxx: &'static [&'static str],
+        ld: &'static [&'static str],
+        env: &'static [(&'static str, &'static str)],
+        driver: &'static str,
+        version: Option<&'static str>,
+        triple: Option<&'static str>,
+        corpus: &'static str,
+    }
+
+    const ASKED: Asked = Asked {
+        c: &["-O2"],
+        cxx: &[],
+        ld: &["-pie"],
+        env: &[("A", "1")],
+        driver: "/usr/bin/cc",
+        version: Some("cc 1.0"),
+        triple: Some("x86_64-linux-gnu"),
+        corpus: "00",
+    };
+
+    /// The nonce derived from `asked`, with its header written under `dir`.
+    fn derived_nonce(asked: Asked, dir: &Path) -> String {
+        let words =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|w| (*w).to_owned()).collect() };
+        let (cflags, cxxflags, ldflags) = (words(asked.c), words(asked.cxx), words(asked.ld));
+        let question = WitnessQuestion {
+            cflags: &cflags,
+            cxxflags: &cxxflags,
+            ldflags: &ldflags,
+            env: asked.env.to_vec(),
+            driver: asked.driver,
+            version_raw: asked.version,
+            target_triple: asked.triple,
+            probe_corpus_sha256: asked.corpus,
+        };
+        RunWitness::derived_in(question.lines(), dir)
+            .expect("a witness")
+            .nonce_hex()
+            .to_owned()
+    }
+
+    /// [`ASKED`] with one field moved, by what moved.
+    #[rustfmt::skip]
+    const MOVED: [(&str, Asked); 12] = [
+        ("cflags", Asked { c: &["-O1"], ..ASKED }),
+        ("cxxflags", Asked { cxx: &["-O2"], ..ASKED }),
+        ("ldflags", Asked { ld: &[], ..ASKED }),
+        ("a flag moved between lists", Asked { c: &[], cxx: &["-O2"], ..ASKED }),
+        ("an env value", Asked { env: &[("A", "2")], ..ASKED }),
+        ("an env name", Asked { env: &[("B", "1")], ..ASKED }),
+        ("no env pair", Asked { env: &[], ..ASKED }),
+        ("driver", Asked { driver: "/usr/bin/gcc", ..ASKED }),
+        ("version_raw", Asked { version: Some("cc 1.1"), ..ASKED }),
+        ("no version_raw", Asked { version: None, ..ASKED }),
+        ("target_triple", Asked { triple: Some("aarch64-linux-gnu"), ..ASKED }),
+        ("probe corpus", Asked { corpus: "01", ..ASKED }),
+    ];
+
+    #[test]
+    fn a_derived_nonce_moves_with_every_field_of_the_question() {
+        let dir = witness_dir("question");
+        let asked = derived_nonce(ASKED, &dir);
+        assert_eq!(derived_nonce(ASKED, &dir), asked);
+        let mut seen = vec![asked];
+        for (what, question) in MOVED {
+            let other = derived_nonce(question, &dir);
+            assert!(
+                !seen.contains(&other),
+                "{what} does not move the derived nonce"
+            );
+            seen.push(other);
+        }
+        // Two words of one list and one word holding both are two questions.
+        let split = Asked {
+            c: &["-O2", "-g"],
+            ..ASKED
+        };
+        let joined = Asked {
+            c: &["-O2 -g"],
+            ..ASKED
+        };
+        assert_ne!(derived_nonce(split, &dir), derived_nonce(joined, &dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_header_is_written_fresh_and_never_through_a_link() {
+        let dir = witness_dir("fresh");
+        let elsewhere = dir.join("elsewhere.h");
+        std::fs::write(&elsewhere, "untouched\n").expect("a file to point at");
+        let name = dir.join(RUN_WITNESS_HEADER_NAME);
+        std::os::unix::fs::symlink(&elsewhere, &name).expect("a link at the header's name");
+        let witness = RunWitness::derived_in(["fresh"], &dir).expect("a witness");
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).expect("the pointed-at file"),
+            "untouched\n",
+            "the header was written through the link"
+        );
+        let meta = std::fs::symlink_metadata(&name).expect("the header");
+        assert!(
+            meta.file_type().is_file(),
+            "the header's name is still a link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&name).expect("the header"),
+            witness.header()
+        );
+        // An earlier run's header at the name is replaced, not kept.
+        let again = RunWitness::derived_in(["another question"], &dir).expect("a witness");
+        assert_eq!(
+            std::fs::read_to_string(&name).expect("the header"),
+            again.header()
+        );
+        assert_ne!(again.nonce_hex(), witness.nonce_hex());
+    }
+
+    #[test]
+    fn an_absence_blames_a_cache_only_where_nothing_else_explains_it() {
+        let foreign = WitnessAbsence::Foreign(vec!["ab".repeat(crate::elf::RUN_WITNESS_BYTES)]);
+        for blamed in [&WitnessAbsence::Missing, &foreign] {
+            assert!(blamed.cause().contains("compiler cache"), "{blamed}");
+        }
+        for explained in [WitnessAbsence::MissingFromIr, WitnessAbsence::Bitcode] {
+            assert_eq!(explained.cause(), "", "{explained}");
+            let said = explained.to_string();
+            assert!(
+                said.contains("compiler IR") && !said.contains("cache"),
+                "{said}"
+            );
+        }
+        let unread = WitnessAbsence::Unread("x: not an ELF file".to_owned());
+        assert!(
+            !unread.cause().contains("compiler cache"),
+            "{}",
+            unread.cause()
+        );
+        assert!(unread.to_string().contains("not an ELF file"));
+        let library = WitnessAbsence::Library {
+            name: "liba.so".to_owned(),
+            absence: Box::new(WitnessAbsence::Missing),
+        };
+        assert_eq!(library.cause(), WitnessAbsence::Missing.cause());
+        assert!(library.to_string().contains("`liba.so`"), "{library}");
+        assert_eq!(BITCODE_MAGIC, *b"BC\xc0\xde");
+    }
+
+    /// Its sentence quotes each `.comment` line and the compiler the report names, and its
+    /// cause names a prefix or a wrapper. Every other absence keeps the witness's rule, and a
+    /// library takes its absence's rule.
+    #[test]
+    fn an_object_another_compiler_built_is_held_under_its_own_rule() {
+        use crate::report::gating_rule::{ARTIFACT_OTHER_COMPILER, ARTIFACT_UNWITNESSED};
+        let other = WitnessAbsence::OtherCompiler {
+            lines: vec![
+                "GCC: (GNU) 16.2.1 20261029 (Red Hat 16.2.1-3)".to_owned(),
+                "GCC: (GNU) 15.2.1".to_owned(),
+            ],
+            named: "clang 22.1.8".to_owned(),
+            witnessed: true,
+        };
+        assert_eq!(other.rule(), ARTIFACT_OTHER_COMPILER);
+        assert_eq!(other.unshown(), "the compiler the report names built it");
+        let said = other.to_string();
+        assert!(
+            said.contains("carries this run's witness, and its `.comment` names another compiler")
+                && said.contains(
+                    "(`GCC: (GNU) 16.2.1 20261029 (Red Hat 16.2.1-3)`, `GCC: (GNU) 15.2.1`, \
+                     where `toolchain` is clang 22.1.8)"
+                ),
+            "{said}"
+        );
+        assert!(
+            other.cause().contains("prefix command or a wrapper"),
+            "{}",
+            other.cause()
+        );
+        for kept in [
+            WitnessAbsence::Missing,
+            WitnessAbsence::MissingFromIr,
+            WitnessAbsence::Foreign(vec!["ab".repeat(crate::elf::RUN_WITNESS_BYTES)]),
+            WitnessAbsence::Unread("x: not an ELF file".to_owned()),
+            WitnessAbsence::Bitcode,
+        ] {
+            assert_eq!(kept.rule(), ARTIFACT_UNWITNESSED, "{kept}");
+            assert_eq!(kept.unshown(), "this run built it", "{kept}");
+        }
+        // A run with no witness holds the object all the same, and claims no witness.
+        let unwitnessed = WitnessAbsence::OtherCompiler {
+            lines: vec!["GCC: (GNU) 15.2.0".to_owned()],
+            named: "clang 21.0.0".to_owned(),
+            witnessed: false,
+        };
+        let said = unwitnessed.to_string();
+        assert!(
+            said.starts_with("is a relocatable object, and its `.comment` names another")
+                && !said.contains("witness"),
+            "{said}"
+        );
+        assert_eq!(unwitnessed.rule(), ARTIFACT_OTHER_COMPILER);
+        let library = WitnessAbsence::Library {
+            name: "liba.so".to_owned(),
+            absence: Box::new(other.clone()),
+        };
+        assert_eq!(library.rule(), other.rule());
+        assert_eq!(library.unshown(), other.unshown());
+    }
+
+    /// A build handed a witness names the header on its recorded command line, after its
+    /// flags and before `-o`; a build handed none names nothing.
+    #[test]
+    fn a_build_names_the_witness_header_after_its_flags() {
+        let dir = witness_dir("argv");
+        let driver = test_script(&dir.join("cc"), "exit 0\n");
+        let source = dir.join("probe.c");
+        std::fs::write(&source, "int main(void){return 0;}\n").expect("a source");
+        let out = dir.join("probe");
+        let witness = RunWitness::derived_in(["argv"], &dir).expect("a witness");
+        let flags = ["-O2".to_owned(), "-include".to_owned(), "own.h".to_owned()];
+
+        let with =
+            build(&driver, &flags, &source, &out, &["-lm"], Some(&witness)).expect("a record");
+        let words: Vec<&str> = with.argv.iter().skip(1).map(String::as_str).collect();
+        assert_eq!(
+            words,
+            [
+                "-O2",
+                "-include",
+                "own.h",
+                "-include",
+                RUN_WITNESS_HEADER_NAME,
+                "-o",
+                out.to_str().expect("a UTF-8 path"),
+                "probe.c",
+                "-lm"
+            ]
+        );
+        let without = build(&driver, &flags, &source, &out, &[], None).expect("a record");
+        assert!(
+            !without.argv.iter().any(|w| w == RUN_WITNESS_HEADER_NAME),
+            "{:?}",
+            without.argv
         );
     }
 }

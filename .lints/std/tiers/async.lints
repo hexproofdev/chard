@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier async: crates with an async runtime.
+clippy.await_holding_lock = "deny"
+clippy.await_holding_refcell_ref = "deny"
+clippy.await_holding_invalid_type = "deny"     # list the repo's guard types in await-holding-invalid-types (local)
+clippy.let_underscore_future = "deny"
+clippy.arc_with_non_send_sync = "deny"
+clippy.rc_mutex = "deny"
+clippy.large_futures = "deny"

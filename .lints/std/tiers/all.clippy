@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier all: clippy.toml knobs. Test code keeps unwrap, expect, panic, indexing, dbg and print.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true

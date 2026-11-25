@@ -11,8 +11,7 @@
 //!
 //! A file that names a commit is taken at its word. The unpacked sources are not checked
 //! against it, so a tree edited after unpacking builds as the archive's commit, without the
-//! `-dirty` a clone would give it; the assumption `archive-revision-names-the-unpacked-tree`
-//! (`report::ASSUMPTIONS`) says so and what would retire it.
+//! `-dirty` a clone would give it.
 //!
 //! The rest is what the build says about where its revision came from: [`Source`], which a
 //! report publishes as `run.harness_revision_source`; [`asserted`], the refusals an asserted

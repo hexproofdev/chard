@@ -79,6 +79,15 @@ __attribute__((noinline)) static int check_survives(int *p) {
 int main(void) {
     int *p = opaque;
     CHARD_NOT_DUMPABLE;
+    /* Before the dereference, and flushed: an unoptimized build executes the dead load and
+     * dies on it, and this line is then the detector's word that the death is the build's
+     * missing optimization rather than anything else. */
+#ifdef __OPTIMIZE__
+    printf("optimize=yes\n");
+#else
+    printf("optimize=no\n");
+#endif
+    fflush(stdout);
     if (check_survives(p)) {
         printf("null-check=deleted\n");
     } else {

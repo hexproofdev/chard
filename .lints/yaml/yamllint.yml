@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# House yamllint configuration (yamllint 1.38.0). A repository copies this file to
+# .lints/yaml/yamllint.yml, unedited; its root .yamllint says
+# `extends: .lints/yaml/yamllint.yml`
+# plus only the local settings the standard's YAML guide allows. The gate runs `yamllint -s .`:
+# every finding fails. Measured over 22 checkouts; left off, with the count measured:
+# quoted-strings (4,450, style), key-ordering (3,565, style), document-end (170) and
+# empty-values (27, all idioms such as `workflow_dispatch:`).
+---
+extends: default
+
+rules:
+  # Width 100, as for Rust, markdown and shell. A repository not yet reflowed sets
+  # `line-length: disable` locally, once, until its reflow commit (834 lines over 100 measured).
+  line-length:
+    max: 100
+  # `{ a: b }` is the house flow-mapping style (614 measured under the default of no spaces).
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+  # Keys are not values: the `on:` of every workflow file is not the boolean it looks like.
+  truthy:
+    check-keys: false
+  # YAML 1.1 traps, off by default, 0 findings measured: a file mode written 0644 is octal to one
+  # parser and decimal to another; `.5` and `1e3` float forms read differently across parsers.
+  octal-values: enable
+  float-values:
+    require-numeral-before-decimal: true
+    forbid-scientific-notation: true
+    forbid-nan: true
+    forbid-inf: true

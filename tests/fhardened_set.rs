@@ -1,43 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The `-fhardened` set chard reduces over, against the one the host gcc prints.
-//!
-//! `composite::FHARDENED_FLAGS` is a constant transcribed by hand from `gcc --help=hardened`
-//! under gcc 16.1.1, and chard never runs that command. A gcc release that adds a member
-//! leaves `fhardened-effective` reading `in-force` for a build that lacks it, and one that
-//! drops a member leaves it demanding something the umbrella does not promise. Without this
-//! test the only thing that would notice is the sentence in the doc comment asking to
-//! re-read the list.
-//!
-//! The comparison is by option line, in both directions. Each slot of the constant expands
-//! to the lines gcc prints for it: the `relro` slot to `-Wl,-z,relro` and `-Wl,-z,now`, which
-//! chard reads as one check, and the fortify slot to gcc's whole line, level rule included.
-//! That line is formatted from `composite::FHARDENED_FORTIFY`, the rule
-//! `fhardened_constituents` picks its level by (3, or 2 below glibc 2.35 under gcc 16.1.1),
-//! so a change to either the composite's rule or gcc's text is a difference. Whitespace is
-//! collapsed, since gcc 16.1.1 prints `-fPIE  -pie` with two spaces.
-//!
-//! The host condition is a gcc that has the option: gcc 14 introduced `-fhardened`, and a
-//! `gcc` that is clang has no `--help=hardened`. The target condition is x86_64 or aarch64
-//! Linux, the two targets whose text is recorded in this tree, and `target_gap` decides it
-//! from `gcc -dumpmachine` alone so that the gate is tested on any host. Both targets are
-//! compared against the same expected lines. gcc 16.2.1 on Fedora 44 aarch64 prints
-//! `-fcf-protection=full` in its list, byte for byte the text gcc 16.1.1 prints on x86_64,
-//! although `-fhardened` does not apply it there: `gcc -fhardened -c` exits 0 on aarch64,
-//! and `-fcf-protection=full` given explicitly fails with "not supported for this target".
-//! So the constant keeps the CET slot on every target, and whether the slot applies is
-//! `composite::cet_constituent`'s question, not this text's. The aarch64 comparison
-//! therefore checks gcc's text on aarch64 builds of gcc, and says nothing about which
-//! constituents chard holds an aarch64 artifact to. Other architectures are a gap, since
-//! what gcc prints for them is not recorded here, and so is a gcc for a system other than
-//! Linux, since gcc documents `-fhardened` for GNU/Linux only.
-//! Each unmet condition is announced through `tests/common`'s capability gap and counted.
-//! A gcc 14 or later that is not clang and prints no `-fhardened` header is a failure.
-//!
-//! In its own binary because no other file compares a chard constant with a compiler's
-//! self-description: `tests/inert_flags.rs` drives `chard measure` over a row table, and
-//! `tests/elf_notes.rs` builds objects for the ELF reader. The comparison itself is a pure
-//! function, so the doctored-text test exercises both directions on any host.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -90,10 +66,6 @@ struct Frame {
 }
 
 /// Compare `help`, the text of `gcc --help=hardened`, with the constant's expansion.
-///
-/// A missing header is a difference rather than an empty read: a text with no header has
-/// no option lines to examine, and reporting the constant's lines as unprinted would name
-/// the wrong cause.
 fn compare(help: &str) -> Frame {
     let expected = expected_lines();
     let mut lines = help.lines();
@@ -196,9 +168,6 @@ const COMPARED_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
 /// Why a gcc whose `-dumpmachine` is `machine` cannot be compared, or `None` when it can;
 /// `name` is what the reason calls the compiler.
-///
-/// A pure function of the triple, so `the_target_gate_compares_x86_64_and_aarch64_linux_only`
-/// holds it to a table on any host; `gap` reaches it only on a gcc 14 or later.
 fn target_gap(name: &str, machine: &str) -> Option<String> {
     let arch = machine.split('-').next().unwrap_or("");
     if !COMPARED_ARCHES.contains(&arch) {
@@ -216,8 +185,6 @@ fn target_gap(name: &str, machine: &str) -> Option<String> {
     None
 }
 
-/// The target gate compares x86_64 and aarch64 Linux gcc and announces every other triple
-/// as a gap, whichever host runs it.
 #[test]
 fn the_target_gate_compares_x86_64_and_aarch64_linux_only() {
     let table = [
@@ -265,8 +232,6 @@ fn the_target_gate_compares_x86_64_and_aarch64_linux_only() {
     assert_eq!(compared, 6, "three x86_64 and three aarch64 Linux triples");
 }
 
-/// Every line of the host gcc's `--help=hardened` is a line the constant expands to, and
-/// every line the constant expands to is one gcc prints.
 #[test]
 fn the_fhardened_constant_is_the_set_the_host_gcc_prints() {
     let driver = chard::toolchain::resolve_driver("gcc").ok();
@@ -291,11 +256,7 @@ fn the_fhardened_constant_is_the_set_the_host_gcc_prints() {
         );
         assert!(
             frame.differences.is_empty(),
-            "{name}'s --help=hardened and composite::FHARDENED_FLAGS disagree:\n  {}\n\
-             The constant is a transcription of this output; re-read it and update the \
-             constant and `fhardened_constituents` together. A line the constant expands to \
-             and gcc omits can also mean this gcc was built without that feature (linker \
-             PIE, now or relro), in which case the constant claims too much for it.\n--- gcc --help=hardened ---\n{help}",
+            "{name}'s --help=hardened and FHARDENED_FLAGS disagree:\n  {}\n--- help ---\n{help}",
             frame.differences.join("\n  ")
         );
         assert!(frame.read > 0, "{name} printed no option lines");
@@ -308,11 +269,6 @@ fn the_fhardened_constant_is_the_set_the_host_gcc_prints() {
     );
 }
 
-/// The comparison reports a difference in each direction, on any host.
-///
-/// The text is gcc 16.1.1's on Fedora 44 x86_64, which the constant matches, doctored once
-/// per direction: a member gcc adds, a member gcc drops, and half of the `relro` slot.
-/// gcc 16.2.1's on Fedora 44 aarch64 is a second clean text.
 #[test]
 fn a_doctored_help_text_is_reported_in_both_directions() {
     const GCC_16_1_1: &str = "The following options are enabled by -fhardened:\n  \

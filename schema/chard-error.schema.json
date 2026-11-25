@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hexproofdev/chard/schema/chard-error.schema.json",
   "title": "chard error envelope",
-  "description": "What stdout carries in place of a command's document when chard exits 2 (it refused the invocation or failed, a command line clap refuses among them, and a declared `--execution` that what chard observed contradicts) or 3 (`measure` built a report that contradicts itself and did not publish it). `src/error.rs` states the classification, and `tests/schema_conformance.rs` (`every_envelope_conforms_to_the_error_schema`) holds live envelopes to this file.",
+  "description": "What stdout carries in place of a command's document when chard exits 2 or 3. The CLI contract (`chard --help`) says when each status is given.",
   "type": "object",
   "additionalProperties": true,
   "required": [

@@ -1,26 +1,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! What the test suite does when it cannot run a test here.
-//!
-//! Shared by every integration test that needs a C toolchain or a built `chard`,
-//! because a skip rule that exists in two copies is a skip rule that will disagree
-//! with itself.
-//!
-//! The rule: **declining to run is not a neutral outcome.** These tests are the only
-//! thing standing behind claims that no human re-checks: that a report conforms to
-//! its shipped schema, that a control triple discriminated before a verdict was
-//! trusted. A test that reports `ok` having done none of that is the clean-looking
-//! zero this project exists to refuse, and it was in the project's own gate.
-//!
-//! So the default is to fail. `CHARD_ALLOW_TEST_SKIP=1` opts out, for the one
-//! legitimate case: a packaging environment with no C toolchain, where the operator
-//! has decided the compile-dependent tests are out of scope.
 
-// A `tests/common` module is compiled separately into every integration-test binary
-// that declares it, so each binary sees the helpers the *other* binaries use as dead
-// code. The alternative to this allow is splitting the rule into one module per
-// consumer, which is the duplication this module exists to prevent.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "a tests/common module is compiled separately into every integration-test binary \
+              that declares it, so each binary sees the helpers the other binaries use as dead \
+              code; the alternative is one module per consumer, the duplication this module \
+              exists to prevent"
+)]
 
 pub mod schema;
 
@@ -34,43 +22,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// the records it feeds to `$defs/elf_facts`, and integration tests are separate crates
 /// that share a number only through a module both compile. A builder added to the
 /// catalogue moves this one number.
-pub const ELF_FIXTURE_COUNT: usize = 25;
+pub const ELF_FIXTURE_COUNT: usize = 26;
 
 /// How many tests have declined to run in this process.
 static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 
-/// Did the operator opt into skipping?
-pub fn skip_allowed() -> bool {
+/// Did the operator opt into skipping? Private: [`refuse`] is the one caller, so a skip always
+/// prints its banner and writes its ledger row. This is the variable's one read in the suite.
+fn skip_allowed() -> bool {
     std::env::var_os("CHARD_ALLOW_TEST_SKIP").is_some()
 }
 
 /// Refuse to pretend a test ran: panic, or (if the operator opted in) announce it
 /// unmissably and let the caller return.
-///
-/// The skip is per test, never `std::process::exit(0)`. Exiting from inside a libtest thread
-/// tears the whole harness down mid-run: every *other* test in the binary silently never
-/// executes, libtest prints no `test result:` line at all, and cargo exits 0. With no compiler
-/// on `PATH` that reads `running 3 tests` and then nothing, a green CI tick over zero tests.
-/// One unrunnable test takes every other test in the binary with it, the containment defect
-/// `measure::run_probe` guards against, in the harness rather than the product.
-///
-/// So the caller returns, libtest prints its result line, and the rest of the binary still
-/// runs.
-///
-/// # Loudness
-///
-/// The announcement goes through [`std::io::stderr`] rather than `eprintln!`,
-/// deliberately. libtest captures the `eprintln!` macro per test and replays it only
-/// when that test *fails*, so a message written that way is invisible on a passing run without
-/// `--nocapture`, which is exactly the run where it matters. The capture is a
-/// thread-local consulted by the macro's formatting shim, not by the handle underneath
-/// it, so writing the handle directly reaches the real file descriptor 2.
-///
-/// Reopening `/dev/stderr` would also bypass the capture, and it is wrong: each caller gets
-/// its own description with its own file offset, so with tests running in parallel the
-/// banners overwrite each other, and a four-character fragment of one warning can print in
-/// place of another. `stderr().lock()` is a
-/// process-wide lock and one `write_all` under it emits the banner whole.
 ///
 /// # Panics
 ///
@@ -78,9 +42,7 @@ pub fn skip_allowed() -> bool {
 pub fn refuse(reason: &str, verifies: &str) {
     assert!(
         skip_allowed(),
-        "cannot run this test ({reason}).\n\
-         It verifies {verifies}, so it fails rather than passing vacuously.\n\
-         Set CHARD_ALLOW_TEST_SKIP=1 only if this machine genuinely cannot run it."
+        "cannot run this test ({reason}); it verifies {verifies}; see CHARD_ALLOW_TEST_SKIP"
     );
 
     let n = SKIPPED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -91,19 +53,32 @@ pub fn refuse(reason: &str, verifies: &str) {
          A green run below does not mean this was checked.\n"
     );
 
-    let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(banner.as_bytes());
-    let _ = stderr.flush();
+    write_banner(&banner);
     record("skipped", &format!("{reason}; it verifies {verifies}"));
+}
+
+/// Write a banner whole to the real stderr under its lock, as [`refuse`] says why. A banner
+/// that cannot be written fails the test rather than leave a skip, a gap or a regeneration
+/// unannounced, except while the thread is already panicking: that test is failing anyway,
+/// and a second panic would abort the binary. Only these three go through here, the banners a
+/// gate that reads a run's output or the ledger's reader stands on (`scripts/test-ledger.sh`);
+/// a test's own note to stderr (a seed, a count it also asserts) is a log line, and keeps
+/// `chard::error::best_effort`.
+fn write_banner(banner: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let written = stderr
+        .write_all(banner.as_bytes())
+        .and_then(|()| stderr.flush());
+    if let Err(e) = written {
+        assert!(
+            std::thread::panicking(),
+            "writing a banner to stderr: {e}; it said:{banner}"
+        );
+    }
 }
 
 /// The longest file name the filesystem holding `dir` creates, in bytes: names from 255
 /// down are created in `dir` and removed until one is taken.
-///
-/// A test that sizes a name against the limit reads it here rather than assuming 255.
-/// fuse-overlayfs, a rootless container's storage and the `/tmp` of the Ubuntu 24.04 image
-/// CI's toolchain was measured in, holds 251 (2026-10-14), so a 240-byte name whose
-/// `.contradicted` sibling fits 255 has a sibling that filesystem refuses.
 ///
 /// # Panics
 ///
@@ -124,8 +99,7 @@ pub fn longest_name(dir: &Path) -> usize {
             }
             Err(e) if e.kind() == std::io::ErrorKind::InvalidFilename => {}
             Err(e) => panic!(
-                "creating a {length}-byte name in {} failed for another reason than its \
-                 length: {e}",
+                "creating a {length}-byte name in {} failed, not on its length: {e}",
                 dir.display()
             ),
         }
@@ -134,46 +108,25 @@ pub fn longest_name(dir: &Path) -> usize {
 }
 
 /// Announce an arm that could not run because the *toolchain* lacks a capability.
-///
-/// Distinct from [`refuse`], and deliberately not gated on `CHARD_ALLOW_TEST_SKIP`: a
-/// compiler that does not implement `-fcf-protection=full` is a property of the
-/// compiler, legitimately variable between hosts, and demanding an opt-out for it would
-/// train the operator to set the variable permanently, which would then also excuse the
-/// skips that are not legitimate.
-///
-/// It still goes to the real stderr rather than `eprintln!`, for the reason [`refuse`]
-/// does: a coverage reduction that is only visible under `--nocapture` is not visible.
 pub fn capability_gap(arm: &str, why: &str) {
-    let banner = format!("\nchard: arm not exercised — {arm}: {why}\n");
-    let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(banner.as_bytes());
-    let _ = stderr.flush();
+    write_banner(&format!("\nchard: arm not exercised — {arm}: {why}\n"));
     record("gap", &format!("{arm}: {why}"));
 }
 
 /// The directory every test binary of one build appends its unexercised arms to, read back
 /// by `scripts/test-ledger.sh` after `make test`.
-///
-/// The banners above reach the terminal, interleaved with a few hundred `ok` lines across
-/// thirty-odd binaries, and a green summary follows them: a reader who sees the summary and
-/// not the banners reads every arm as run, the clean-looking zero inside the suite. The
-/// ledger is the same announcements collected where one command can count and print them
-/// after the run. `CARGO_TARGET_TMPDIR` is cargo's scratch directory for integration tests,
-/// fixed at compile time, so no environment variable decides where the ledger goes.
 pub const LEDGER_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/test-ledger");
 
+/// The test binary this process runs: what [`record`] names the ledger file by, and what a
+/// test runs again to see what a helper prints in a process of its own. Not the chard binary,
+/// which [`chard_binary`] finds.
+pub fn this_test_binary() -> Option<PathBuf> {
+    std::env::current_exe().ok()
+}
+
 /// Append one line to this process's ledger file: a kind, the test binary, and the text.
-///
-/// One file per process, named by the binary and the process id, so binaries never share
-/// a file and a stale file from an earlier run is told from this one by `make test`
-/// clearing the directory first. Each line is one `write_all` on a file opened for append,
-/// so the threads of one binary cannot interleave within a line. A ledger that cannot be
-/// written is said on stderr and not otherwise acted on: the banner already reached the
-/// terminal, and `scripts/test-ledger.sh` fails a run whose ledger lacks the lines the
-/// binaries that always write one owe it.
 pub fn record(kind: &str, text: &str) {
-    let binary = std::env::current_exe()
-        .ok()
+    let binary = this_test_binary()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "unknown".to_owned());
     // cargo names an integration test binary `<test>-<hash>`; the ledger names the test.
@@ -192,24 +145,15 @@ pub fn record(kind: &str, text: &str) {
     });
     if let Err(e) = written {
         let mut stderr = std::io::stderr().lock();
-        let _ = writeln!(
+        chard::error::best_effort(writeln!(
             stderr,
             "chard: the test ledger {} could not be written: {e}",
             file.display()
-        );
+        ));
     }
 }
 
 /// The compiler family a gate requires `cc` to be, from `CHARD_TEST_EXPECT_CC`, or `None`.
-///
-/// Rows that are inert only under one compiler family run only where `cc` is that family,
-/// so on a gcc host every clang row is announced and the run still passes. `make
-/// compiler-arms` points `cc` at the other family and sets this variable, and the driving
-/// tests then fail unless the toolchain the reports name is that family and every row of it
-/// ran. Without the variable a `cc` that resolved to the wrong compiler would pass that gate
-/// with the rows announced again: Fedora's ccache shim picks the compiler from `argv[0]`, so
-/// a `cc` symlink to the shim runs gcc. Read only by the tests; chard itself reads nothing
-/// from the environment but `PATH`.
 pub fn expected_compiler() -> Option<String> {
     std::env::var("CHARD_TEST_EXPECT_CC")
         .ok()
@@ -217,16 +161,6 @@ pub fn expected_compiler() -> Option<String> {
 }
 
 /// Does the host's `cc` emit ELF?
-///
-/// Several floors in this suite ("at least one measurement was examined", "at least one
-/// elf-static check was measured") are correct on every host chard supports and false on
-/// a Mach-O one, where the artifact channel has nothing to read. They are the guards that
-/// stop a test passing having checked nothing, so they must not be relaxed on the basis of
-/// the *result*; that is the clean-looking zero. Relaxing them on the basis of the *host*
-/// is a different claim, and this constant is the one place it is made.
-///
-/// `cfg!` rather than `#[cfg]` so the surrounding code is compiled and type-checked on
-/// every host, including the ones where the floor does not apply.
 pub const ELF_HOST: bool = cfg!(any(
     target_os = "linux",
     target_os = "freebsd",
@@ -234,44 +168,6 @@ pub const ELF_HOST: bool = cfg!(any(
 ));
 
 /// A scratch directory that removes itself.
-///
-/// Three copies of this existed (`Workspace` in `elf_notes`, `Work` in
-/// `measurement_loop` and `Work` in `schema_conformance`) identical but for the name
-/// they gave the directory. That is the duplication this module's header objects to,
-/// applied to cleanup rather than to skipping: three `Drop` impls are three chances to
-/// leave a tree behind in `/tmp`, and only the one you are reading gets audited.
-///
-/// `prefix` names the test binary and `tag` the test, because the pid alone does not
-/// separate two binaries of the same run.
-///
-/// # A process the test left behind fails the test
-///
-/// Dropping a `Work` also looks for processes the test left running: any process whose
-/// arguments name the directory or a path under it, or whose working directory is in it.
-/// One still there after [`LEFTOVER_GRACE`] is killed and the test fails, naming it and
-/// saying whether the kill took. The directory carries this process's pid, so a concurrent
-/// suite run's processes are not mistaken for this one's; a match is the directory followed
-/// by `/` or by the end of an argument, so `...-busy-workdir-12` does not match another
-/// run's `...-busy-workdir-123`. Both spellings of the directory are compared, the one
-/// `TMPDIR` gave and the resolved one, because the kernel reports a working directory
-/// resolved: under a `TMPDIR` reached through a symlink the given spelling alone matches no
-/// working directory at all.
-///
-/// This is the check for a fixture that outlives its test. A fake driver that waits for a gate
-/// file with no bound, whose `chard measure` the test kills and whose directory is removed,
-/// polls for a file that cannot appear. A leaked process
-/// is invisible to the run that leaked it, which exits 0, so the check sits where the test's
-/// scratch is cleaned up, and every test that uses `Work` gets it without opting in. The
-/// tests that show each channel discriminates are the `a_process_left_in_a_work_directory_*`
-/// tests in `tests/error_classes.rs`.
-///
-/// What it does not see: a process that names the directory in neither its arguments nor its
-/// working directory (a descendant that changed directory away and was started with no path
-/// into it, or one holding only an open file there), and scratch a test makes outside `Work`.
-/// A marker in the environment would not reach further, since chard runs its driver under a
-/// cleared environment. Where `/proc` is absent or unreadable the processes cannot be seen,
-/// and the check says so once per test binary through [`capability_gap`], naming which,
-/// rather than passing as though it had looked.
 pub struct Work {
     dir: PathBuf,
     /// `dir` with every symlink resolved, as `/proc/<pid>/cwd` reads back.
@@ -310,12 +206,6 @@ impl Work {
 /// A [`Work`] made by [`Work::shared`], the kind a test binary keeps in a `static` for all
 /// its tests. A separate type, so a `static` written to hold one cannot be given a plain
 /// [`Work`] by mistake.
-///
-/// Rust runs no destructor for a `static`, so the [`Drop`] of the `Work` inside never runs
-/// and its directory outlives the binary. The next run that makes a `SharedWork` with the
-/// same prefix and tag removes it. So after any number of runs the newest run's directory
-/// stays. The directory of a run still going is kept too. A run that never makes its
-/// `SharedWork` (one whose measurement is skipped) removes nothing.
 pub struct SharedWork(Work);
 
 impl SharedWork {
@@ -330,17 +220,10 @@ impl SharedWork {
 
 impl Work {
     /// The [`SharedWork`] for `prefix` and `tag`, under the temporary directory.
-    ///
-    /// A directory already under this process's name was left by an ended run whose pid
-    /// this one now has. It is removed, and a new empty one is made; where it cannot be
-    /// emptied, the test panics rather than reuse what it holds. Then the directories of
-    /// ended runs with the same prefix and tag are removed ([`remove_stale`], with
-    /// [`process_alive`]). Where one of them needs judging and `kill` cannot be run, nothing
-    /// more is removed and the gap is announced through [`capability_gap`].
     pub fn shared(prefix: &str, tag: &str) -> SharedWork {
         let base = std::env::temp_dir();
         let own = base.join(format!("chard-{prefix}-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&own);
+        removed(std::fs::remove_dir_all(&own), &own);
         let work = Self::under(&base, prefix, tag);
         assert!(
             std::fs::read_dir(work.dir())
@@ -367,25 +250,6 @@ pub fn owner_of(path: &Path) -> u32 {
 }
 
 /// Removes the directories of ended runs from `base`, and returns the ones removed.
-///
-/// A directory is removed when all of these hold:
-/// - its name is exactly the one [`Work::under`] gives for `prefix`, `tag` and a pid
-///   (`chard-<prefix>-<tag>-<pid>`);
-/// - it is a directory, not a symlink or a file;
-/// - user `owner` owns it;
-/// - the pid is not this process's;
-/// - `alive` says the pid's process has ended.
-///
-/// A directory that cannot be removed is kept and named on stderr. Where `alive` cannot
-/// tell (`None`), the walk stops and returns why, so nothing more is removed.
-///
-/// The owner check is there because `kill -0` fails for a process this user may not signal
-/// as well as for one that has ended. This user may signal its own processes, so for this
-/// user's directories a failure means the process has ended. Two cases remain:
-/// - Where another process of this user now has the pid, the directory is kept. This errs
-///   towards leaving one.
-/// - A run of this user in another pid namespace that shares `base` reads as ended,
-///   because `kill -0` cannot see it. Its directory can be removed while it runs.
 pub fn remove_stale(
     base: &Path,
     prefix: &str,
@@ -428,12 +292,14 @@ pub fn remove_stale(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 let mut stderr = std::io::stderr().lock();
-                let _ = stderr.write_all(
-                    format!(
-                        "\nchard: an ended run's directory {} was not removed: {e}\n",
-                        path.display()
-                    )
-                    .as_bytes(),
+                chard::error::best_effort(
+                    stderr.write_all(
+                        format!(
+                            "\nchard: an ended run's directory {} was not removed: {e}\n",
+                            path.display()
+                        )
+                        .as_bytes(),
+                    ),
                 );
             }
         }
@@ -444,10 +310,6 @@ pub fn remove_stale(
 /// Whether process `pid` is running, read by `kill -0`, or `None` where `kill` cannot be
 /// run. `kill -0` also fails for a process this user may not signal, which therefore reads
 /// as not running; [`remove_stale`] removes only this user's directories for that reason.
-///
-/// The `kill` program, because the crate denies `unsafe` and so has no binding to the call.
-/// A lock held by the live run would be the better sign, but `File::lock` is newer than the
-/// declared MSRV.
 pub fn process_alive(pid: u32) -> Option<bool> {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -499,11 +361,12 @@ pub fn processes_unseen() -> Option<&'static str> {
 impl Work {
     /// The live processes, other than this one, that name this directory, or why they
     /// cannot be seen ([`processes_unseen`]).
-    pub fn leftover_processes(&self) -> Result<Vec<Leftover>, &'static str> {
+    pub fn leftover_processes(&self) -> Result<Vec<Leftover>, String> {
         if let Some(why) = processes_unseen() {
-            return Err(why);
+            return Err(why.to_owned());
         }
-        let entries = std::fs::read_dir("/proc").map_err(|_| "/proc stopped being listable")?;
+        let entries =
+            std::fs::read_dir("/proc").map_err(|e| format!("/proc stopped being listable: {e}"))?;
         let given = self.dir.as_os_str().as_encoded_bytes();
         let resolved = self.resolved.as_os_str().as_encoded_bytes();
         let spellings = [given, resolved];
@@ -521,9 +384,7 @@ impl Work {
                 continue;
             }
             // An entry that cannot be read is a process that exited after the listing, or
-            // one belonging to another user. A fixture this test started is neither: it runs
-            // as this user, and this process's own entries were just read. A zombie reads an
-            // empty command line and no working directory: it runs nothing.
+            // one belonging to another user.
             let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
                 continue;
             };
@@ -564,18 +425,46 @@ fn names(arg: &[u8], dir: &[u8]) -> bool {
         })
 }
 
+/// Judges the removal of a test's own scratch path, the result of a `remove_dir_all` or a
+/// `remove_file` of `path`: a path already gone is the state the cleanup wants, and any other
+/// error fails the test, so a directory that will not empty is found by the test that left it
+/// rather than read by the next. While the thread is already panicking the error is written
+/// to stderr instead, since a second panic would abort the test binary.
+#[track_caller]
+pub fn removed(result: std::io::Result<()>, path: &Path) {
+    let e = match result {
+        Ok(()) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => e,
+    };
+    let message = format!("removing {}: {e}", path.display());
+    if std::thread::panicking() {
+        let mut stderr = std::io::stderr().lock();
+        chard::error::best_effort(writeln!(stderr, "\nchard: {message}"));
+    } else {
+        panic!("{message}");
+    }
+}
+
 impl Drop for Work {
     fn drop(&mut self) {
         // Removed first: a bounded fixture loop also ends when its directory goes.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let first = std::fs::remove_dir_all(&self.dir);
         let deadline = std::time::Instant::now() + LEFTOVER_GRACE;
         let left = loop {
             let left = match self.leftover_processes() {
                 Ok(left) => left,
                 Err(why) => {
                     static ANNOUNCED: std::sync::Once = std::sync::Once::new();
-                    ANNOUNCED.call_once(|| {
-                        capability_gap("a process a test leaves running fails the test", why);
+                    removed(
+                        first.or_else(|_| std::fs::remove_dir_all(&self.dir)),
+                        &self.dir,
+                    );
+                    // After the removal, and forced: a banner that fails to write panics in
+                    // the closure, which would otherwise leave the directory and poison the
+                    // `Once` for every later drop, a panic while panicking among them.
+                    ANNOUNCED.call_once_force(|_| {
+                        capability_gap("a process a test leaves running fails the test", &why);
                     });
                     return;
                 }
@@ -583,23 +472,39 @@ impl Drop for Work {
             if left.is_empty() || std::time::Instant::now() >= deadline {
                 break left;
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the condition is that no process names the directory, read from /proc, \
+                          which offers nothing to wait on: re-reading it between sleeps, up to \
+                          LEFTOVER_GRACE, is the wait"
+            )]
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         if left.is_empty() {
+            removed(
+                first.or_else(|_| std::fs::remove_dir_all(&self.dir)),
+                &self.dir,
+            );
             return;
         }
         // Killed whether or not this test then fails, so a failing test does not leak
-        // either. `kill` the program, because the crate denies `unsafe` and so has no
-        // binding to the call; whether it took is read back from `/proc`, not assumed.
+        // either.
         for leftover in &left {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &leftover.pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            chard::error::best_effort(
+                std::process::Command::new("kill")
+                    .args(["-KILL", &leftover.pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status(),
+            );
         }
         // A process killed while writing into the directory can leave it behind.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let second = match std::fs::remove_dir_all(&self.dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                format!("\nand the directory was not removed: {e}")
+            }
+            Ok(()) | Err(_) => String::new(),
+        };
         let pids: Vec<u32> = left.iter().map(|l| l.pid).collect();
         let settle = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let survivors: Vec<u32> = loop {
@@ -613,6 +518,12 @@ impl Drop for Work {
             if still.is_empty() || std::time::Instant::now() >= settle {
                 break still;
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the condition is that the killed processes have left /proc, which offers \
+                          nothing to wait on: re-reading it between sleeps, up to a second, is the \
+                          wait"
+            )]
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let listed: Vec<String> = left
@@ -625,7 +536,7 @@ impl Drop for Work {
             format!("still running after `kill -KILL`, not killed: {survivors:?}")
         };
         let message = format!(
-            "{} process(es) naming {} outlived the test by {LEFTOVER_GRACE:?}:\n  {}\n{outcome}",
+            "{} process(es) naming {} outlived the test by {LEFTOVER_GRACE:?}:\n  {}\n{outcome}{second}",
             left.len(),
             self.dir.display(),
             listed.join("\n  ")
@@ -633,7 +544,7 @@ impl Drop for Work {
         if std::thread::panicking() {
             // The test is already failing; a second panic would abort the binary.
             let mut stderr = std::io::stderr().lock();
-            let _ = stderr.write_all(format!("\nchard: {message}\n").as_bytes());
+            chard::error::best_effort(stderr.write_all(format!("\nchard: {message}\n").as_bytes()));
         } else {
             panic!("{message}");
         }
@@ -666,26 +577,8 @@ pub fn temporary_files_beside(output: &Path) -> Vec<PathBuf> {
 
 /// Write `body` under a `#!/bin/sh` line at `path`, mark it executable, and wait until
 /// the kernel will run it.
-///
-/// The wait is the point, and the reason a test that writes a program it will run goes
-/// through this in place of `std::fs::write`. `cargo test` runs tests on threads of one
-/// process, and a thread that forks between another thread's `open` and `close` inherits
-/// the write descriptor; until that child reaches its own `exec`, the file is open for
-/// writing somewhere and `execve` on it fails with `ETXTBSY`. A wrapper that chard then
-/// cannot run reads as a driver that did not answer, which is a real failure of a test
-/// doing nothing wrong. `Shims::script` in `src/toolchain.rs` records the measurement
-/// (three of seven tests failing one per run on Fedora 44 aarch64) and the argument that
-/// one successful spawn is enough: the descriptor can only be held by children that
-/// existed while the file was open, so once one exec has succeeded no later one can be
-/// refused.
-///
-/// The probe spawn runs the script with no arguments and ignores its exit status; only
-/// the spawn error matters. A body that cannot cope with no arguments should begin by
-/// handling that case.
 pub fn executable(path: &Path, body: &str) -> PathBuf {
-    // ETXTBSY is 26 on Linux and on Darwin alike. Any other error is left to the caller:
-    // a script that cannot be run for another reason is a broken test, and waiting on
-    // it would hide that.
+    // ETXTBSY is 26 on Linux and on Darwin alike.
     const ETXTBSY: i32 = 26;
     std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("writing the script");
     #[cfg(unix)]
@@ -701,10 +594,15 @@ pub fn executable(path: &Path, body: &str) -> PathBuf {
             Err(why) if why.raw_os_error() == Some(ETXTBSY) => {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "{} stayed busy for 5s; a descriptor is held open for writing \
-                     somewhere that never execs",
+                    "{} stayed busy for 5s",
                     path.display()
                 );
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the condition is a sibling test's fork closing its copy of the write \
+                              descriptor, which nothing here can wait on: retrying the exec \
+                              between sleeps, under the 5 s deadline, is the wait"
+                )]
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Err(why) => panic!("running the script {}: {why}", path.display()),
@@ -714,15 +612,6 @@ pub fn executable(path: &Path, body: &str) -> PathBuf {
 }
 
 /// Is there a C compiler to measure with?
-///
-/// The environment precondition every compile-dependent test shares. It was written
-/// twice, and the two had already diverged: `schema_conformance` additionally checked
-/// that `chard` was built, `measurement_loop` did not, which is the shape the header
-/// above warns about: not a copy that is wrong, a copy that answers a different
-/// question under the same name.
-///
-/// Returns `false` only when the operator opted into skipping; otherwise [`refuse`]
-/// panics.
 pub fn require_cc(verifies: &str) -> bool {
     if std::process::Command::new("cc")
         .arg("--version")
@@ -735,11 +624,17 @@ pub fn require_cc(verifies: &str) -> bool {
     true
 }
 
+/// The `chard` binary under test: the path cargo hands integration tests at compile time
+/// (`CARGO_BIN_EXE_chard`), where it built the binary whatever the target directory or the
+/// build-dir layout. A test binary's own path says neither: derived from `current_exe`, it
+/// assumed the test binaries sit in `deps/` beside the binary, which cargo 1.101's build-dir
+/// moved, and every test behind [`require_binary`] refused. No test derives the path another
+/// way.
+pub fn chard_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_chard"))
+}
+
 /// Was the binary under test actually built?
-///
-/// Kept separate from [`require_cc`] for the reason `schema_conformance` gives at
-/// length: a single hatch cannot tell "this box has no compiler" from "chard is
-/// broken", and the second would then wear the first's exemption.
 pub fn require_binary(binary: &Path, verifies: &str) -> bool {
     if !binary.exists() {
         refuse(&format!("{} is not built", binary.display()), verifies);
@@ -749,18 +644,6 @@ pub fn require_binary(binary: &Path, verifies: &str) -> bool {
 }
 
 /// Run a command that execs a file the test just wrote, waiting out `ETXTBSY`.
-///
-/// `cargo test` runs tests on threads of one process, and a thread that forks between
-/// another thread's `open` and `close` of a file inherits the write descriptor; until that
-/// child reaches its own `exec`, an `execve` of the file fails with `ETXTBSY`. A test that
-/// writes an executable and then has the built `chard` run it therefore sees a spurious
-/// `Text file busy` one run in several, and `src/toolchain.rs`'s test shim already waits
-/// the same window out for the shims it writes. This is the shared form for the case where
-/// chard is the one spawning: the invocation is retried while chard's own output reports
-/// the busy errno, and any other outcome ends the wait, because the descriptor can only be
-/// held by children that already existed when the file was open. Past the deadline the
-/// last output is returned as it stands, so the test that reads it fails on the busy
-/// message rather than on a silence.
 pub fn output_waiting_out_etxtbsy(
     build: impl Fn() -> std::process::Command,
 ) -> std::process::Output {
@@ -774,17 +657,18 @@ pub fn output_waiting_out_etxtbsy(
         if !busy || std::time::Instant::now() >= deadline {
             return output;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is a sibling test's fork closing its copy of the write \
+                      descriptor, which nothing here can wait on: retrying the command between \
+                      sleeps, under the 5 s deadline, is the wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
 /// Every `.rs` file under `src`, recursively, named by its path relative to `src` with
 /// `/` separators and sorted by that name.
-///
-/// The source scans (`tests/discarded_failures.rs`, `tests/untyped_errors.rs`, the schema's
-/// name check) read `src/` through this one walk. Each read the top level alone before it,
-/// which left a module directory such as `src/predicate/` outside every ratchet with
-/// nothing to say so.
 pub fn rust_sources(src: &Path) -> Vec<(String, PathBuf)> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
         let entries =

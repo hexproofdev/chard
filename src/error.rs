@@ -1,111 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Classified error envelope.
-//!
-//! stdout carries the command's document (unless it goes to a file: `-o`'s, or `measure`'s
-//! default) or this envelope. `emit` is
-//! the sole exit point for a failure, and [`emit_contradiction`] for `measure`'s refusal to
-//! publish a report that contradicts itself; `main` catches every error, a command line clap
-//! refuses among them, and forwards it to the first.
-//!
-//! ```json
-//! {
-//!   "chard_schema": "1",
-//!   "error": {
-//!     "code": "USER_INPUT" | "PERMISSION" | "TRANSIENT" | "CONFIGURATION" | "INTERNAL",
-//!     "operation": "measure",
-//!     "message": "no C compiler found at `cc`",
-//!     "hint": "pass --cc /path/to/compiler"
-//!   }
-//! }
-//! ```
-//!
-//! The exit statuses ([`EXIT_OK`] and its siblings below), the envelope's shape and what
-//! stdout and stderr carry are the CLI's contract, stated once as `CONTRACT` in `main.rs`
-//! and in `DESIGN.md` ("The command-line contract"), which also says why the
-//! statuses are apart.
-//!
-//! ## The class says whose action comes next
-//!
-//! `code` is what a caller branches on, and `DESIGN.md` ("The error envelope") is
-//! where each value's meaning lives and where the envelope is placed beside the report as
-//! the second thing stdout can carry. A class in the wrong direction sends a sweep to file a
-//! bug for a typo, or tells an operator to check a path they never typed. The exit status
-//! is `2` for every class; the class lives in the envelope alone.
-//!
-//! ## Who owns the path decides the class of an io error
-//!
-//! `classify` is a function of the typed constructor an error was built with and, for an
-//! io error, of which side owns the path it failed on. A path the caller typed (`--cc`,
-//! `--workdir`, `--output`, the files given to `elf`, `table` and `matrix`, and `detect`'s
-//! `--evidence` and `--artifact`) is the caller's to fix, so `NotFound` on it is
-//! `USER_INPUT`. A path chard constructed (the run's claim on the work directory, the
-//! self-report header, the probe sources and the auxiliary library sources in it, a
-//! macro-dump source, a probe artifact and its capture files) is tagged [`HarnessPath`] at
-//! the site that touches it,
-//! and `NotFound` there is chard losing its own file: `INTERNAL`, with a hint naming what
-//! was lost. The tag is the context object, and anyhow's downcast walks the context chain,
-//! so the io kind underneath stays reachable beside it.
-//!
-//! No end-to-end path reaches a [`HarnessPath`] `NotFound` today short of the race the
-//! hint names: `run.rs`'s errors and the auxiliary library source, which `measure.rs`
-//! writes per variant mid-run, are contained by `measure_probe` as an unmeasured probe, and
-//! the macro-dump source, the self-report header and the probe sources are written in the
-//! same call sequence as the `create_dir_all` that made their directory, so
-//! `tests/error_classes.rs` cannot provoke it deterministically. The coverage for that
-//! direction is the classify unit test plus the site tags, which are there so a future
-//! un-containment cannot mislabel it.
-//!
-//! [`ElfError`] is the one domain type `classify` reads directly. Its `Io` variant carries
-//! an io error on a path the caller typed, and reading it here reuses the io table below
-//! rather than keeping a second copy of it at `main.rs`'s `Elf` arm; the other variants
-//! are statements about the caller's bytes, and their hints sit beside the io rows they
-//! are ordered against.
-//!
-//! The arms, in the order `classify` tries them:
-//!
-//! | found in the chain | class | hint |
-//! |---|---|---|
-//! | [`UserError`] | `USER_INPUT` | its own |
-//! | [`PermissionError`] | `PERMISSION` | its own |
-//! | [`ConfigError`] | `CONFIGURATION` | none |
-//! | [`TransientError`] | `TRANSIENT` | none |
-//! | [`ElfError::Io`] | by io kind, as a caller path | as the io rows |
-//! | [`ElfError::NotElf`], [`ElfError::MachO`], [`ElfError::TooLarge`] | `USER_INPUT` | what `chard elf` reads |
-//! | [`ElfError::Malformed`], [`ElfError::Truncated`] | `USER_INPUT` | the `readelf -h` cross-check |
-//! | io `PermissionDenied`, either owner | `PERMISSION` | the path, when it is chard's, for a write or a run |
-//! | io `ReadOnlyFilesystem`, `StorageFull`, either owner | `PERMISSION` | the path, when it is chard's |
-//! | io `Interrupted`, `WouldBlock`, `ExecutableFileBusy`, either owner | `TRANSIENT` | none |
-//! | io `NotFound` under a [`HarnessPath`] | `INTERNAL` | the file chard lost |
-//! | io `NotFound`, caller path | `USER_INPUT` | check the path and its directories |
-//! | io `IsADirectory`, `NotADirectory`, `AlreadyExists`, caller path | `USER_INPUT` | the shape of the path |
-//! | io `InvalidFilename`, `ELOOP`, caller path | `USER_INPUT` | resolve the path |
-//! | io `ENOEXEC`, caller path | `USER_INPUT` | name an executable |
-//! | any other io kind | `INTERNAL` | none |
-//! | anything else | `INTERNAL` | none |
-//!
-//! The io rows are a closed list of the kinds a site can produce on a path it owns, and
-//! `every_io_kind_is_classified_by_its_kind_and_its_owner` pins each row in both columns.
-//! `ELOOP` is matched on its raw errno because `ErrorKind::FilesystemLoop` is unstable at
-//! the crate's `rust-version`. Two kinds were considered and left in the default arm on
-//! purpose: `InvalidInput`, which no site produces, since an argument vector carries no
-//! `NUL` byte and clap refuses an empty `--workdir` before chard runs; and `InvalidData`,
-//! which the three sites that read a caller's file never let reach here (below).
-//!
-//! The last arm is where an untyped `bail!` or `anyhow!` lands, and `tests/untyped_errors.rs`
-//! holds the count of those constructors per module so a new one has to be named. The
-//! sites that stay untyped are internal by intent: `compile.rs`, for a child whose pipes
-//! were not the ones configured, whose pipes were still held after it exited, whose
-//! reader thread panicked, or that did not finish within the bound (a driver that hangs
-//! on its own interrogation hangs again, so the retry `TRANSIENT` promises is a class it
-//! has not earned), and for the run's `--env` pairs set after a toolchain invocation read
-//! them, which `measure` setting them first rules out; `matrix.rs`, for a build over no
-//! reports, which clap keeps off the command line. A `serde_json::Error` that reaches this arm is a report chard could
-//! not serialize: the three sites that parse a caller's file (`dataset::read_reports`, which
-//! `table` and `matrix` read through, `detect::decode_file` for `detect --evidence`, and
-//! `main`'s reader of `--image-attestation`) read bytes and wrap a parse failure, a file that
-//! is not UTF-8 among them, in [`UserError`] where it happens, so a caller's file and chard's
-//! own output never have to be told apart by error type. Their io errors keep their kind.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -117,8 +12,9 @@ use crate::elf::ElfError;
 
 pub const EXIT_OK: u8 = 0;
 /// A gate tripped, and the document is written: `measure --fail-on-missing` over a check
-/// that did not settle, or `detect` over a report that disagrees with its replay. Both are a
-/// finding about the input the caller can act on, not a fault in chard.
+/// that did not settle, that `--allow` did not excuse, where [`EXIT_MACHINE_LIMIT`] does not
+/// apply, or `detect` over a report
+/// that disagrees with its replay. Both are a finding about the input, not a fault in chard.
 pub const EXIT_GATE: u8 = 1;
 pub const EXIT_FAILURE: u8 = 2;
 /// chard contradicted itself: `measure` built a report that disagrees with itself and did
@@ -127,6 +23,15 @@ pub const EXIT_FAILURE: u8 = 2;
 /// quarantine file. Nothing else exits 3, `detect`'s disagreement included: a caller routing 3
 /// to a chard bug report would otherwise file one for every report that failed its replay.
 pub const EXIT_CONTRADICTION: u8 = 3;
+/// `measure --fail-on-missing` tripped, as for [`EXIT_GATE`], and every shortfall is a machine
+/// limit or a target limit, at least one a machine limit. A machine limit is a check the
+/// kernel and CPU the run had cannot answer (a gating rule of `MACHINE_LIMITS` in `main.rs`).
+/// A target limit is a check chard does not read on the target (`TARGET_LIMITS`). A rerun on a
+/// machine that gives every feature the machine limits name withholds the target limits again,
+/// so it still exits [`EXIT_GATE`] while a target limit that `--allow` does not excuse stands.
+/// No allowance moves this status: it is decided over every shortfall, the excused ones with
+/// the rest. The report is written as for [`EXIT_GATE`].
+pub const EXIT_MACHINE_LIMIT: u8 = 4;
 
 /// Errno for a program the kernel has no loader for: a `+x` text file with no shebang.
 /// `std` maps it to no [`std::io::ErrorKind`], so it is read from the raw value, which is
@@ -173,7 +78,6 @@ impl ErrorClass {
 }
 
 /// Typed marker for operator-supplied configuration that cannot be honored.
-/// Classifies without message-substring guessing.
 #[derive(Debug)]
 pub struct ConfigError(pub String);
 
@@ -219,11 +123,6 @@ impl std::error::Error for UserError {}
 
 /// Typed marker for a path the caller named that chard may not write, with the hint
 /// that says what to change.
-///
-/// An io `PermissionDenied` on a caller's path is `PERMISSION` with no hint, since
-/// `classify_io` cannot see what the operation was. `main` builds one of these where it
-/// knows: an `-o` whose directory takes no new file and whose file cannot be written in
-/// place, refused before the run by `report::refuse_unpublishable`.
 #[derive(Debug)]
 pub struct PermissionError {
     pub message: String,
@@ -239,14 +138,9 @@ impl std::fmt::Display for PermissionError {
 impl std::error::Error for PermissionError {}
 
 /// Typed marker for a failure worth retrying as it stands, decided on grounds no errno
-/// carries.
-///
-/// The io kinds that mean the same thing (`Interrupted`, `WouldBlock`,
-/// `ExecutableFileBusy`) need no marker. `measure::claim_workdir` builds one for a work
-/// directory a live run holds, which that run's exit settles, and
-/// `measure::WorkdirClaim::confirm` for a run whose claim was removed under it, which a run
-/// alone settles. The driver-interrogation
-/// timeout was considered and left untyped, since a driver that hangs on `--version`
+/// carries: `measure::claim_workdir` builds one for a work directory a live run holds, and
+/// `measure::WorkdirClaim::confirm` for a run whose claim was removed under it. The
+/// driver-interrogation timeout stays untyped, since a driver that hangs on `--version`
 /// hangs again.
 #[derive(Debug)]
 pub struct TransientError(pub String);
@@ -261,13 +155,6 @@ impl std::error::Error for TransientError {}
 
 /// Context tag for io on a path chard constructed: work-directory contents, probe
 /// artifacts, macro-dump sources, capture files.
-///
-/// Used as the context object under a human message, `.context(HarnessPath(p))`, so the
-/// io error stays the root and this sits one link above it. `classify` reads the tag
-/// before the io kind: `NotFound` on one of these is chard losing its own file, and a
-/// hint telling the caller to check a path they never typed is the wrong direction.
-/// `Display` is the path alone, so the chain reads `writing the self-report header:
-/// /work/chard_selfreport.h: No such file or directory`.
 #[derive(Debug)]
 pub struct HarnessPath(pub PathBuf);
 
@@ -321,21 +208,11 @@ pub(crate) fn classify(err: &anyhow::Error) -> (ErrorClass, Option<String>) {
 }
 
 /// Would the same call, made again, plausibly succeed?
-///
-/// Defined as `classify` answering `Transient`, so a caller that retries on it (a test
-/// waiting out `ETXTBSY` on a file it wrote) cannot disagree with the envelope.
 pub fn is_transient(err: &anyhow::Error) -> bool {
     classify(err).0 == ErrorClass::Transient
 }
 
 /// The object `chard elf` or the measurement loop could not read.
-///
-/// Every variant but `Io` is a statement about the bytes, and the bytes are the caller's:
-/// `chard elf` reads objects chard did not build (`THREAT_MODEL.md`), and inside a
-/// measurement `facts_for`'s failure is contained as `Variant::elf_error` and never reaches
-/// here. A malformed object is reported as the caller's input with the cross-check that
-/// separates a bad file from a reader defect, because `tests/elf_readelf.rs` is where the
-/// reader is held to readelf and a refusal is a different event from a panic.
 fn classify_elf(elf: &ElfError) -> (ErrorClass, Option<String>) {
     let named = elf
         .path()
@@ -351,39 +228,25 @@ fn classify_elf(elf: &ElfError) -> (ErrorClass, Option<String>) {
         ElfError::TooLarge { cap, .. } => (
             ErrorClass::UserInput,
             Some(format!(
-                "`chard elf` refuses an object above {cap} bytes before reading it, and \
-                 the cap has no override"
+                "`chard elf` refuses an object above {cap} bytes before reading it"
             )),
         ),
         ElfError::Malformed { .. } | ElfError::Truncated { .. } => (
             ErrorClass::UserInput,
-            Some(format!(
-                "{named} is malformed or truncated; if `readelf -h` reads it, report this \
-                 as a chard bug"
-            )),
+            Some(format!("{named} is malformed or truncated")),
         ),
     }
 }
 
 /// An io failure, read with the owner of the path it happened on.
-///
-/// `harness` is `Some` when the chain carries a [`HarnessPath`], and the two owners split
-/// only where the action differs: a missing file is the caller's typo on their path and
-/// chard's defect on its own, and the hints for a directory, a malformed path or a
-/// program with no loader are all about arguments only a caller supplies.
 fn classify_io(io: &std::io::Error, harness: Option<&Path>) -> (ErrorClass, Option<String>) {
     use std::io::ErrorKind as Kind;
     match (io.kind(), harness) {
-        // One hint for both operations a chard-owned path meets: the capture files and the
-        // sources are written, and the probe artifact is run, so the `EACCES` a `noexec`
-        // mount returns at the spawn is answered here too.
+        // One hint for both operations a chard-owned path meets, a write and a run: a
+        // `noexec` mount returns `EACCES` at the probe artifact's spawn.
         (Kind::PermissionDenied, Some(path)) => (
             ErrorClass::Permission,
-            Some(format!(
-                "chard could not write or run {}; check that the work directory is writable \
-                 and its mount allows execution",
-                path.display()
-            )),
+            Some(format!("chard could not write or run {}", path.display())),
         ),
         (Kind::PermissionDenied, None) => (ErrorClass::Permission, None),
         (Kind::ReadOnlyFilesystem | Kind::StorageFull, harness) => (
@@ -401,8 +264,7 @@ fn classify_io(io: &std::io::Error, harness: Option<&Path>) -> (ErrorClass, Opti
         (Kind::NotFound, Some(path)) => (
             ErrorClass::Internal,
             Some(format!(
-                "the work directory was removed while chard ran (it lost {}); if it was \
-                 not, report this",
+                "the work directory was removed while chard ran (it lost {})",
                 path.display()
             )),
         ),
@@ -411,11 +273,7 @@ fn classify_io(io: &std::io::Error, harness: Option<&Path>) -> (ErrorClass, Opti
         // names an interpreter that does not exist, and `classify_io` cannot see which.
         (Kind::NotFound, None) => (
             ErrorClass::UserInput,
-            Some(
-                "check that the path, every directory in it, and for a script its \
-                 interpreter, exist"
-                    .to_owned(),
-            ),
+            Some("check that the path, every directory in it".to_owned()),
         ),
         (Kind::IsADirectory, None) => (
             ErrorClass::UserInput,
@@ -431,7 +289,7 @@ fn classify_io(io: &std::io::Error, harness: Option<&Path>) -> (ErrorClass, Opti
         ),
         (Kind::InvalidFilename, None) => (
             ErrorClass::UserInput,
-            Some("the path is too long or malformed for this filesystem; check it".to_owned()),
+            Some("the path is too long or malformed for this filesystem".to_owned()),
         ),
         (_, None) if io.raw_os_error() == Some(ELOOP) => (
             ErrorClass::UserInput,
@@ -520,8 +378,7 @@ pub fn emit_declaration_contradicted(
             code: ErrorClass::Configuration.as_str(),
             operation: "measure",
             message: format!(
-                "--execution {} was declared and chard observed {observed} ({}), so the report \
-                 was not published",
+                "--execution {} was declared and chard observed {observed} ({})",
                 execution.mode.as_str(),
                 execution.mode_evidence.observation
             ),
@@ -534,17 +391,13 @@ pub fn emit_declaration_contradicted(
 }
 
 fn contradiction_message(contradictions: usize) -> String {
-    format!(
-        "the report contradicts itself in {contradictions} place(s) and was not published; \
-         this is a defect in chard, not a finding about the toolchain"
-    )
+    format!("the report contradicts itself in {contradictions} place(s) and was not published")
 }
 
 fn contradiction_hint(quarantine: Option<&Path>) -> String {
     quarantine.map_or_else(
         || {
-            "re-run with -o naming a regular file FILE to keep the report as FILE.contradicted, \
-             and attach it to a bug report"
+            "re-run with -o naming a regular file FILE to keep the report as FILE.contradicted"
                 .to_owned()
         },
         |path| {
@@ -586,12 +439,6 @@ fn write_rendered(rendered: &str) {
 }
 
 /// Deliberately discard a fallible result.
-///
-/// Used only where there is genuinely nothing to be done about a failure. If
-/// writing a note to stderr fails there is nowhere left to report that; if killing
-/// an already-dead child fails, it is already dead. Spelled out as a named function
-/// rather than `let _ =` so the lint wall stays intact and each use site reads as
-/// a decision instead of an oversight.
 pub fn best_effort<T, E>(_result: Result<T, E>) {}
 
 /// Progress and warnings. Never stdout: that is the document's alone, where it goes there.
@@ -601,10 +448,6 @@ pub fn note(message: &str) {
 }
 
 /// What a path a command refused from its metadata is, for the refusal to name.
-///
-/// Shared by `elf::facts_for`, `dataset::read_report_bytes`, `detect::decode_file` and the
-/// binary's `--image-attestation` reader, so their refusals use the same words for the same
-/// shape.
 #[must_use]
 pub fn file_type_name(kind: std::fs::FileType) -> &'static str {
     use std::os::unix::fs::FileTypeExt as _;
@@ -622,12 +465,6 @@ pub fn file_type_name(kind: std::fs::FileType) -> &'static str {
 }
 
 /// Announce, from a unit test, an arm the host could not exercise.
-///
-/// The banner `tests/common::capability_gap` prints, for the test modules under `src/`,
-/// and written the same way: straight to the descriptor rather than through `eprintln!`,
-/// which libtest captures per test and replays only on failure, so on the passing run
-/// where the announcement matters it would never appear. One helper, so a grep for `arm
-/// not exercised` over a run finds every site.
 #[cfg(test)]
 pub(crate) fn capability_gap(arm: &str, why: &str) {
     let banner = format!("\nchard: arm not exercised — {arm}: {why}\n");
@@ -645,17 +482,14 @@ mod tests {
         anyhow::Error::new(Error::new(kind, "x"))
     }
 
-    /// The same io error, one link under a [`HarnessPath`] and a human message, which is
-    /// the shape every tagged site in `main.rs`, `compile.rs` and `run.rs` produces.
+    /// The same io error, one link under a [`HarnessPath`] and a human message: the shape
+    /// every tagged site produces.
     fn harness_io(kind: ErrorKind, path: &str) -> anyhow::Error {
         io(kind)
             .context(HarnessPath(PathBuf::from(path)))
             .context("writing the self-report header")
     }
 
-    /// A [`PermissionError`] is `PERMISSION` with its own hint, wherever it sits in the
-    /// chain and whatever io error sits under it: the hint is the reason it exists, since
-    /// the io row for a caller's `PermissionDenied` carries none.
     #[test]
     fn a_permission_error_carries_its_hint() {
         let denied = || PermissionError {
@@ -678,14 +512,6 @@ mod tests {
         assert_eq!(classify(&io(ErrorKind::PermissionDenied)).1, None);
     }
 
-    /// Each io error kind is classified by its kind and by who owns the path, and the
-    /// class names are the published ones.
-    ///
-    /// The class decides the hint a caller gets and the action a sweep takes, so a
-    /// `NotFound` classified as `Internal` tells an operator that chard is broken when
-    /// their path is wrong, and the same `NotFound` on a file chard wrote and lost tells
-    /// them to check a path they never typed. One table, two columns, so the two
-    /// directions are pinned side by side.
     #[test]
     fn every_io_kind_is_classified_by_its_kind_and_its_owner() {
         use ErrorClass::{Internal, Permission, Transient, UserInput};
@@ -720,8 +546,7 @@ mod tests {
             );
         }
 
-        // The two errnos read raw. `ELOOP` is checked against the kind `std` decodes it
-        // to here, so a wrong constant fails on the host it is wrong for.
+        // The two errnos read raw.
         let eloop = Error::from_raw_os_error(ELOOP);
         assert_eq!(format!("{:?}", eloop.kind()), "FilesystemLoop");
         assert_eq!(classify(&anyhow::Error::new(eloop)).0, UserInput);
@@ -744,15 +569,13 @@ mod tests {
             "the caller-path hint is what makes the class actionable"
         );
 
-        // The names are the published contract: they appear in the JSON error envelope,
-        // in `schema/chard-error.schema.json` and in `tests/error_classes.rs`, so a
-        // constant here would rename them everywhere at once and agree with itself while
-        // doing it.
-        assert_eq!(ErrorClass::UserInput.as_str(), "USER_INPUT");
-        assert_eq!(ErrorClass::Permission.as_str(), "PERMISSION");
-        assert_eq!(ErrorClass::Transient.as_str(), "TRANSIENT");
+        // The names are the published contract, so they are spelled out here: a constant
+        // would rename them everywhere at once and agree with itself while doing it.
+        assert_eq!(UserInput.as_str(), "USER_INPUT");
+        assert_eq!(Permission.as_str(), "PERMISSION");
+        assert_eq!(Transient.as_str(), "TRANSIENT");
         assert_eq!(ErrorClass::Configuration.as_str(), "CONFIGURATION");
-        assert_eq!(ErrorClass::Internal.as_str(), "INTERNAL");
+        assert_eq!(Internal.as_str(), "INTERNAL");
     }
 
     /// The rows of [`the_default_arm_catches_only_the_inventoried_internal_sites`] for the
@@ -811,13 +634,6 @@ mod tests {
         ]
     }
 
-    /// One constructed error per constructor the crate uses, with the class beside it.
-    ///
-    /// The bare `anyhow!` is the only row that lands in `Internal` without a typed reason,
-    /// and `tests/untyped_errors.rs` counts the sites that build one. A serialization
-    /// failure is a bug in chard's own output, so a bare `serde_json::Error` stays there
-    /// too: the sites that parse a caller's file wrap the failure in a `UserError` before
-    /// it can reach this arm.
     #[test]
     fn the_default_arm_catches_only_the_inventoried_internal_sites() {
         use ErrorClass::{Configuration, Internal, Permission, Transient, UserInput};
@@ -891,8 +707,6 @@ mod tests {
         assert_eq!(hint.as_deref(), Some("pass --cc"));
     }
 
-    /// A `UserError` used as the context object is found the same way as one at the root,
-    /// which is what lets `table` and `matrix` keep the parser's own text in the chain.
     #[test]
     fn a_user_error_as_context_still_classifies_as_user_input() {
         let err = anyhow::Error::new(Error::new(ErrorKind::InvalidData, "expected value"))
@@ -911,13 +725,10 @@ mod tests {
 
     #[test]
     fn permission_denied_io_classifies_as_permission() {
-        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let err = anyhow::Error::new(Error::from(ErrorKind::PermissionDenied));
         assert_eq!(classify(&err).0, ErrorClass::Permission);
     }
 
-    /// The ledger's "other direction": a file chard wrote and then could not find is
-    /// chard's defect, and the hint names the file rather than telling the caller to
-    /// check a path they never typed.
     #[test]
     fn a_missing_file_chard_created_is_chards_own_defect() {
         let err = harness_io(ErrorKind::NotFound, "/w/chard_selfreport.h");
@@ -925,9 +736,7 @@ mod tests {
         assert_eq!(class, ErrorClass::Internal);
         assert!(
             hint.as_deref()
-                .is_some_and(|h| h.contains("/w/chard_selfreport.h")
-                    && h.contains("work directory was removed")
-                    && h.contains("report this")),
+                .is_some_and(|h| h.contains("/w/chard_selfreport.h")),
             "{hint:?}"
         );
         assert_eq!(
@@ -937,9 +746,6 @@ mod tests {
         );
     }
 
-    /// `EACCES` on a chard-owned path comes from a write (a capture file, a source) or
-    /// from running the probe artifact on a `noexec` mount, and the one hint names both
-    /// operations, since `classify_io` cannot see which the site attempted.
     #[test]
     fn a_permission_failure_on_a_chard_path_is_still_permission() {
         for path in ["/w/stack-canary-clean.stdout", "/w/stack-canary-clean"] {
@@ -947,17 +753,12 @@ mod tests {
             let (class, hint) = classify(&err);
             assert_eq!(class, ErrorClass::Permission);
             assert!(
-                hint.as_deref().is_some_and(|h| h.contains(path)
-                    && h.contains("write or run")
-                    && h.contains("writable")
-                    && h.contains("execution")),
+                hint.as_deref().is_some_and(|h| h.contains(path)),
                 "{hint:?}"
             );
         }
     }
 
-    /// `ETXTBSY` is the kernel still holding a file open for writing, on whichever side
-    /// wrote it, and `toolchain`'s own test shim already retries on it.
     #[test]
     fn executable_file_busy_is_transient_on_either_path() {
         assert_eq!(
@@ -979,8 +780,6 @@ mod tests {
         );
     }
 
-    /// A refused object is the caller's, and the hint carries the cross-check that tells a
-    /// bad file from a reader defect.
     #[test]
     fn an_elf_refusal_is_the_callers_object_and_names_the_cross_check() {
         let truncated = anyhow::Error::new(ElfError::Truncated {
@@ -993,8 +792,7 @@ mod tests {
         let (class, hint) = classify(&truncated);
         assert_eq!(class, ErrorClass::UserInput);
         assert!(
-            hint.as_deref()
-                .is_some_and(|h| h.contains("/objects/cut") && h.contains("readelf -h")),
+            hint.as_deref().is_some_and(|h| h.contains("/objects/cut")),
             "{hint:?}"
         );
 

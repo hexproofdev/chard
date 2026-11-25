@@ -9,53 +9,15 @@ use std::collections::BTreeMap;
 use crate::probe::Evidence;
 
 /// The words a cut marker is spelled with, in the one place that spells them.
-///
-/// Five call sites built `[N chars omitted]` independently, and `coverage` has to
-/// recognise the result to count the observations carrying one. A sixth spelling, or a
-/// reworded fifth, would leave the counter reporting zero cuts over a report full of
-/// them, which is the shape of clean-looking zero this project refuses.
 pub const CUT_MARKER: &str = "chars omitted";
 
 /// Whether a published string carries a cut marker.
-///
-/// The predicate `coverage` counts with, kept beside the spelling it depends on.
 #[must_use]
 pub fn carries_a_cut(text: &str) -> bool {
     text.contains(CUT_MARKER)
 }
 
 /// Keep the informative end of a captured stream, and say how much was cut.
-///
-/// Every `observed` string that quotes a runtime stream goes through here, and so does
-/// every control arm's `detail` on those channels, since `report::decide` publishes the
-/// detector's `observed` as the arm's detail. The compiler-diag channel quotes through
-/// [`excerpt_around`] instead, which cuts around the line the detector matched; this
-/// function is its fallback for a stream with no match. The two properties a reader
-/// depends on:
-///
-/// - **The tail is kept.** A message follows its prefix: glibc's `__libc_message` names
-///   the artifact path ahead of `buffer overflow detected`, and the probes' own stdout
-///   puts the self-report first and the reading last. A cut that kept the head spent
-///   the whole budget on the path when the work directory was long, and the `observed`
-///   for `implicit-function-declaration-is-error` ended mid-path with `error: implicit
-///   declaration of function` never appearing, in a report whose control detail was
-///   the only evidence for that arm.
-/// - **The cut is marked, at the cut.** A silent cut reads as the whole stream, and
-///   on the compiler-diag and runtime channels a stream that ends early is a
-///   different measurement. The marker states the count in characters, which is
-///   also the unit the cut is made in, so a multi-byte quote (gcc's U+2018 under a
-///   UTF-8 locale) is never split.
-///
-/// The text is cut as the report publishes it: [`Evidence::published`] makes the work
-/// directory relative and replaces the compilers' temporary names first, so the cut point
-/// and the count do not depend on `--workdir`. With the cut first and the rewrite after
-/// it, the count would include path characters the published text does not carry;
-/// [`Evidence::published`] has the fleet measurement. Taking the evidence
-/// rather than a published string is what keeps a call site from cutting first again.
-///
-/// `keep` is per call site rather than one constant, because the budgets differ by
-/// what the string is for: 160 for a stream a reader compares across cells, 80 for a
-/// stdout that should have carried a one-line reading and did not.
 pub(crate) fn excerpt_tail(ev: &Evidence<'_>, text: &str, keep: usize) -> String {
     cut_tail(&ev.published(text), keep)
 }
@@ -73,28 +35,6 @@ pub(crate) fn cut_tail(text: &str, keep: usize) -> String {
 
 /// Whether `stderr` is, or carries, a structured diagnostics document rather than the
 /// compiler's text.
-///
-/// The compiler-diag detectors read prose: a needle on a line, the severity word on the same
-/// line. A SARIF document breaks both halves. gcc 16.1.1 writes the message on a line of its
-/// own with the level on another, and embeds the translation unit's source in
-/// `artifacts[].contents.text` whenever it reports anything, so a needle the probe's own
-/// source or comments contain matches a line that is not a diagnostic (measured 2026-10-09
-/// on Fedora 44 x86_64, gcc 16.1.1: `-O2 -fdiagnostics-format=sarif-stderr` read six
-/// warning checks `on` that `-O2` read `off`, and four error checks `off` that read `on`).
-///
-/// The stream is recognised by its own shape and not by the flag list, because the format
-/// also arrives by a specs file, a clang configuration file or `-fdiagnostics-set-output`:
-///
-/// - a SARIF document opens at column 0 with `{` and names `"$schema"` and `sarif` within its
-///   first few hundred bytes (gcc 16.1.1 and clang 22.1.8; clang prints a text banner ahead
-///   of it and a count after, which is why the opening is looked for on every line);
-/// - gcc's `-fdiagnostics-format=json` (gcc 9 to 15; gcc 16 rejects it) is an array of
-///   objects opening with `"kind"`, one line (gcc 12.2.0 in a Debian 12 image and gcc 13.3.0
-///   in an Ubuntu 24.04 image, 2026-10-09).
-///
-/// A document cut short by the capture still opens the same way, so the test reads the
-/// opening and parses nothing. `-fdiagnostics-add-output=sarif:...` writes to a file and
-/// leaves stderr as text, so it is correctly not recognised.
 #[must_use]
 pub(crate) fn structured_stream(stderr: &str) -> bool {
     /// How far past an opening brace the schema key may sit.
@@ -132,13 +72,6 @@ pub(crate) fn structured_stream(stderr: &str) -> bool {
 
 /// The first line of `stderr` carrying one of `needles`, matched the way every
 /// compiler-diag detector matches: case-insensitively, on the whole line.
-///
-/// Returns the line's index and its lowercased text. [`diag_severity_of`] reads the
-/// severity from that text and [`excerpt_around`] quotes that index, so the line whose
-/// severity decided the verdict and the line the published `detail` is built around are
-/// one line by construction rather than two lines that happen to agree.
-///
-/// [`diag_severity_of`]: super::diag::diag_severity_of
 pub(crate) fn needle_line(stderr: &str, needles: &[&str]) -> Option<(usize, String)> {
     let needles: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
     stderr
@@ -151,37 +84,6 @@ pub(crate) fn needle_line(stderr: &str, needles: &[&str]) -> Option<(usize, Stri
 
 /// A quoted compiler stream cut around the line the detector matched, with the count of
 /// what was removed on each side.
-///
-/// [`excerpt_tail`] keeps a stream's end, and a compiler diagnostic has no fixed end.
-/// gcc prints the observable and then the canary; clang prints the observable, then its
-/// fix-it notes, then the canary. Measured on Apple clang 21 for
-/// `implicit-fallthrough-warned` under a 24-character work directory: 741 characters of
-/// stderr with `fall-through between switch labels` in the first line, so a
-/// 640-character tail quotes three notes and the canary and cuts the diagnostic the
-/// verdict rests on. The detector reads the whole stream and the verdict is right, but
-/// the `detail` a reader re-derives it from loses the match. That is the failure a tail
-/// cut exists to prevent, at the head of the stream instead of its foot.
-///
-/// So the excerpt is built from the match. The line [`needle_line`] found is kept whole,
-/// the lines on either side are added while they fit the budget, nearer lines first,
-/// and each side that lost anything says how much: `[N chars omitted]` before the first
-/// kept line and after the last. A matched line that alone exceeds the budget is cut
-/// inside itself, in a window centred on the needle, so the matched text survives
-/// whatever the path prefix ahead of it cost. A stream with no matched line, the shape of
-/// a clean build and of a suppressed channel, falls back to [`excerpt_tail`]: there is
-/// nothing to centre on, and the end, where both compilers print the canary, is then the
-/// informative part.
-///
-/// The needle's position inside an over-long line is read from the lowercased published
-/// line. A case fold that changes a character count would shift the window
-/// by that much and the centring absorbs it; no compiler diagnostic has been seen to
-/// carry one.
-///
-/// The line is found in the stream as captured, the stream the detector read, and the
-/// cut is made in the published copy ([`Evidence::published`]), which has the same lines
-/// because the rewrite touches paths and never a line break. The matched line is
-/// therefore the detector's line, whatever a path in an earlier line spelled, and the
-/// counts are what the published text lost.
 pub(crate) fn excerpt_around(
     ev: &Evidence<'_>,
     text: &str,
@@ -194,9 +96,6 @@ pub(crate) fn excerpt_around(
 
 /// [`excerpt_around`]'s cut around line `hit` of `text`, for a detector that finds the
 /// deciding line by a rule of its own rather than by [`needle_line`].
-///
-/// `hit` counts the lines of `text` as captured, as `str::lines` and `needle_line` count
-/// them; `needles` only places the window inside a matched line longer than `keep`.
 pub(crate) fn excerpt_at(
     ev: &Evidence<'_>,
     text: &str,
@@ -301,16 +200,6 @@ fn cut_at(text: &str, hit: Option<usize>, needles: &[&str], keep: usize) -> Stri
 }
 
 /// Which C++ standard library the toolchain says it is using, from its own macros.
-///
-/// `_CXX_STDLIB` is chard's own summary, written into the self-report by the probe
-/// header's `#if defined(_LIBCPP_VERSION)` arm, so it is available only where the
-/// artifact can be read. `_LIBCPP_VERSION` and `__GLIBCXX__` are the real macros that arm
-/// tests, and a preprocessor dump carries them whatever the object format is, which keeps
-/// the identity answerable on a platform chard has no reader for.
-///
-/// One function rather than the three copies of this ladder that preceded it. The copies
-/// were identical in effect and differed in wording, which is the arrangement where one
-/// of them silently stops matching the others.
 #[must_use]
 pub fn cxx_stdlib(macros: &BTreeMap<String, String>) -> Option<&str> {
     match macros.get("_CXX_STDLIB").map(String::as_str) {
@@ -322,19 +211,13 @@ pub fn cxx_stdlib(macros: &BTreeMap<String, String>) -> Option<&str> {
 }
 
 /// The self-report between its own markers, when a probe printed one on stdout.
-///
-/// `None` when the region is absent or unterminated — a probe killed mid-write would leave
-/// an opening marker and a truncated body, and half a report read as a whole one is how a
-/// missing field becomes a confident undefined. `CHARD_PRINT_REPORT` flushes for this
-/// reason; this is the half that does not trust it. The region is [`report_region`]'s.
 pub(crate) fn marked_region(stream: &str) -> Option<String> {
     let region = report_region(stream)?;
     region.terminated.then(|| region.text.to_owned())
 }
 
-/// The markers `probes/chard_selfreport.h` wraps the report in. Spelled once here so the
-/// header and the reader cannot drift; `tests/probe_sources.rs` reads a header build back
-/// through them.
+/// The markers `probes/chard_selfreport.h` wraps the report in; `tests/probe_sources.rs`
+/// reads a header build back through them.
 const CHARD_REPORT_MARKER: &str = "CHARD-REPORT-V2";
 const CHARD_REPORT_END: &str = "CHARD-REPORT-END";
 
@@ -347,8 +230,7 @@ const CHARD_REPORT_MARKER_V1: &str = "CHARD-REPORT-V1";
 
 /// How the header spells a macro that was not defined: the name, then this, and no `=`.
 /// A defined macro's line is the name, `=` and the value's spelling, and a stringified
-/// value holds no newline, so no value can write this line. The predicate language's
-/// `observed` spells an undefined macro read with it too (`predicate`, Rendering).
+/// value holds no newline, so no value can write this line.
 pub(crate) const UNDEFINED_SUFFIX: &str = " undefined";
 
 /// Which header wrote a report, from its marker line.
@@ -371,10 +253,9 @@ struct Region<'a> {
 /// The first report in `text`. A marker is a whole line, trimmed, that is exactly one of the
 /// two markers, and the end is the first whole line after it that is exactly
 /// `CHARD-REPORT-END`, so no value's spelling starts or ends a report: a macro defined as
-/// `CHARD-REPORT-END` writes `name=CHARD-REPORT-END`, which until V2 cut the report at
-/// that field and read every field after it as undefined. A line naming another version
-/// (`CHARD-REPORT-V3`) starts nothing, so a report this reader has no dialect for is no
-/// report.
+/// `CHARD-REPORT-END` writes `name=CHARD-REPORT-END`, which is no end line. A line naming
+/// another version (`CHARD-REPORT-V3`) starts nothing, so a report this reader has no
+/// dialect for is no report.
 fn report_region(text: &str) -> Option<Region<'_>> {
     let mut offset = 0usize;
     let mut opened: Option<(usize, Dialect)> = None;
@@ -409,23 +290,10 @@ fn report_region(text: &str) -> Option<Region<'_>> {
     })
 }
 
-/// Every field of the first report in `report` ([`report_region`]), in order, with the
+/// Every field of the first report in `report` (`report_region`), in order, with the
 /// value the header wrote for a defined macro and `None` for one it says was not defined
 /// when the unit was preprocessed; a report whose fields all read undefined is a report.
 /// `None` where the text holds no report or holds one this cannot read whole.
-/// [`parse_self_report`] is this with the undefined fields dropped, and
-/// `report::self_report_entries` reads this to tell a report of nothing defined from no
-/// report.
-///
-/// A `CHARD-REPORT-V2` report spells undefined `name undefined`, so its `name=?` is a macro
-/// defined as `?` and is read as that value. It is read strictly, as the header writes it:
-/// closed by its end line, and every line between is `name=value` or `name undefined` with a
-/// name holding no whitespace and given once; a blank line, any other line, another marker
-/// among them, or no end line makes the text no report, since a line dropped or a tail cut
-/// would read as a macro undefined. A `CHARD-REPORT-V1` report is read as its
-/// header wrote it: `name=?` is undefined and a line without `=` is skipped, except an
-/// exact marker line, which makes the text no report as under V2: two reports in one
-/// region would read the second by the first's dialect.
 pub fn self_report_fields(report: &str) -> Option<Vec<(&str, Option<&str>)>> {
     let region = report_region(report)?;
     if region.dialect == Dialect::V2 && !region.terminated {
@@ -468,23 +336,38 @@ pub fn self_report_fields(report: &str) -> Option<Vec<(&str, Option<&str>)>> {
 /// The account a `.chard.report` section's text gives, or `None` where the text holds no
 /// report: a report is what `probes/chard_selfreport.h` writes, the `CHARD-REPORT-V2`
 /// marker (or the `CHARD-REPORT-V1` of an older header), `CHARD-REPORT-END` after it, each
-/// a whole line ([`report_region`]), and at least one field between them, every line read
-/// ([`self_report_fields`]). The map is [`parse_self_report`] over the region, and it is
-/// empty where every field reads undefined, the artifact's word that nothing is defined.
-/// Every reader that asks "did this artifact give an account" reads this:
-/// `report::self_report_entries` for `measure`, `detect` and the per-probe warning,
-/// `report::FactStore::macro_view` and the facts-key binder for the replay rules.
+/// a whole line, and at least one field between them, every line read
+/// ([`self_report_fields`]). The map is empty where every field reads undefined, the
+/// artifact's word that nothing is defined. Every reader that asks whether an artifact gave
+/// an account reads this.
 pub fn self_report_account(text: &str) -> Option<BTreeMap<String, String>> {
+    self_report_listing(text).map(|fields| {
+        fields
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value?)))
+            .collect()
+    })
+}
+
+/// The account's every field in order, the undefined ones kept as `None`: the fields
+/// [`self_report_account`] reads, by the same parse, so the two never differ on whether a
+/// section gives an account. An undefined field is the artifact's word about a macro as much
+/// as a defined one is.
+pub fn self_report_listing(text: &str) -> Option<Vec<(String, Option<String>)>> {
     let region = marked_region(text)?;
     let fields = self_report_fields(&region)?;
-    (!fields.is_empty()).then(|| defined(fields))
+    (!fields.is_empty()).then(|| {
+        fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.map(str::to_owned)))
+            .collect()
+    })
 }
 
 /// Whether `text` holds a report closed by its end line that the reader refuses to read
 /// whole ([`self_report_fields`]): a V2 report with a line of neither form, a blank line, a
-/// name given twice or a second marker, or a V1 report with a second marker. The reason
-/// `report::SelfReportAbsence` gives for such a section names this rather than a missing
-/// marker.
+/// name given twice or a second marker, or a V1 report with a second marker. Such a section's
+/// absence reason names this rather than a missing marker.
 pub fn self_report_malformed(text: &str) -> bool {
     report_region(text)
         .is_some_and(|region| region.terminated && self_report_fields(region.text).is_none())

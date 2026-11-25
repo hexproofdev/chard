@@ -1,28 +1,27 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! What `chard measure` does with a `--probe` selection it cannot honour.
-//!
-//! Through the binary, because the refusal is a property of the command line rather than
-//! of the measurement: the selection is settled before the compiler is touched, so these
-//! need the built `chard` and nothing else. A repeated id, if accepted, would produce a run
-//! that counts one probe's checks twice against two identical observations and reports
-//! itself whole.
 
-use std::path::PathBuf;
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
+
 use std::process::Command;
 
 use serde_json::Value;
 
 mod common;
 
-fn chard_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("chard")
-}
+use common::chard_binary;
 
 /// Run `chard measure` with `args` and return the exit status and the JSON it printed.
 fn measure(args: &[&str]) -> (Option<i32>, Value) {
@@ -38,7 +37,6 @@ fn measure(args: &[&str]) -> (Option<i32>, Value) {
     (output.status.code(), parsed)
 }
 
-/// A repeated `--probe` is refused as the caller's mistake, before anything runs.
 #[test]
 fn a_repeated_probe_is_refused_as_user_input() {
     if !common::require_binary(
@@ -77,7 +75,6 @@ fn a_repeated_probe_is_refused_as_user_input() {
     );
 }
 
-/// An unknown `--probe` is refused the same way, and the refusal names the id.
 #[test]
 fn an_unknown_probe_is_refused_as_user_input() {
     if !common::require_binary(&chard_binary(), "that an unknown --probe is refused") {

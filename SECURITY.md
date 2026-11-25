@@ -11,6 +11,7 @@ repository's **Security** tab, then **Report a vulnerability**.
 gap chard shows you in someone else's software is not one; take it to the project concerned.
 
 To assist triage, please include:
+
 - A clear description of the issue and its potential impact.
 - Steps to reproduce or a proof of concept, if available.
 - The affected commit hash.
@@ -19,6 +20,7 @@ To assist triage, please include:
 ## Disclosure Policy
 
 As a reporter, you can expect:
+
 - A prompt acknowledgment of your report (within 72 hours).
 - A transparent dialog and timely fix for valid issues.
 - Disclosure at the fix or at 90 days, whichever comes first.

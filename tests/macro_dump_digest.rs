@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A `-dM -E` dump's digest does not depend on where `--workdir` points.
-//!
-//! gcc lists its macros in the order of its identifier table, and the path it was given is
-//! entered in that table, so a path whose hash collides with a macro's moves that macro to
-//! another place in the list. The map `compile::macro_dump` parses is sorted and never sees
-//! the order, but a digest of the stdout as printed does. `compile::macro_dump` runs the
-//! driver in the work directory with the file named by its name alone; the cause and the
-//! measurement are in its comment. The published digest is over the sorted lines
-//! (`compile::dump_digest`); the first test below holds the printed order itself, and the
-//! second holds the sorted digest across an
-//! added `-D`, which moves the order and no other line; the third holds the digest to the
-//! shell recipe the schema gives for it; the fourth holds the dump's source to its driver's
-//! language, so a C++ driver under `-Werror` is not refused the file.
-//!
-//! Two arms, against the real `gcc` and `g++` when the host has them. The first calls
-//! `macro_dump` over many differently named work directories, and repeatedly in one, and
-//! requires one digest. The second is its discrimination: the same source dumped by absolute
-//! path must produce more than one digest across those directories,
-//! or the first arm could not have failed and is announced as unexercised. A gcc whose order
-//! does not depend on the path would otherwise pass the first arm without being tested.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,8 +57,15 @@ fn scratch(label: &str) -> PathBuf {
 /// The SHA-256 of the dump as printed (not `compile::dump_digest`), so the printed order is
 /// part of what the first test holds.
 fn digest_in(driver: &Path, work: &Path) -> String {
-    let (_, record) = compile::macro_dump(driver, lang_of(driver), &[], true, work, "order")
-        .expect("the dump runs");
+    let (_, record) = compile::macro_dump(
+        driver,
+        lang_of(driver),
+        &[],
+        compile::DumpUnit::LibcHeaders,
+        work,
+        "order",
+    )
+    .expect("the dump runs");
     assert_eq!(record.exit_status, 0, "the dump exits 0: {}", record.stderr);
     sha256_hex(record.stdout.as_bytes())
 }
@@ -146,7 +147,7 @@ fn a_macro_dump_digest_does_not_depend_on_the_work_directory() {
                 "this driver listed its macros in one order for every path, so the arm above could not have failed here",
             );
         }
-        std::fs::remove_dir_all(&root).ok();
+        common::removed(std::fs::remove_dir_all(&root), &root);
     }
 }
 
@@ -154,11 +155,6 @@ fn a_macro_dump_digest_does_not_depend_on_the_work_directory() {
 /// macros around them.
 const EXTRA_MACROS: usize = 64;
 
-/// A dump under a profile `-D` and the dump without it share every line but the one the
-/// `-D` adds, and `compile::dump_digest` gives the shared lines one digest whatever order
-/// gcc printed them in. The discrimination arm: the shared lines as printed, digested
-/// without sorting, must differ for at least one name, or the first assertion could not
-/// have failed and the arm is announced as unexercised.
 #[test]
 fn a_macro_dump_digest_does_not_move_with_a_profile_define() {
     let verifies = "that a macro dump's digest moves only where a line does";
@@ -184,8 +180,15 @@ fn a_macro_dump_digest_does_not_move_with_a_profile_define() {
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
                 .replace('+', "p")
         ));
-        let (_, plain) = compile::macro_dump(driver, lang_of(driver), &[], true, &root, "plain")
-            .expect("the dump runs");
+        let (_, plain) = compile::macro_dump(
+            driver,
+            lang_of(driver),
+            &[],
+            compile::DumpUnit::LibcHeaders,
+            &root,
+            "plain",
+        )
+        .expect("the dump runs");
         assert_eq!(plain.exit_status, 0, "the dump exits 0: {}", plain.stderr);
         let mut reordered = 0_usize;
         for n in 0..EXTRA_MACROS {
@@ -194,7 +197,7 @@ fn a_macro_dump_digest_does_not_move_with_a_profile_define() {
                 driver,
                 lang_of(driver),
                 &[format!("-D{name}=1")],
-                true,
+                compile::DumpUnit::LibcHeaders,
                 &root,
                 &format!("extra{n}"),
             )
@@ -232,12 +235,10 @@ fn a_macro_dump_digest_does_not_move_with_a_profile_define() {
                 "no added name moved another macro in this driver's list, so the arm above could not have failed here",
             );
         }
-        std::fs::remove_dir_all(&root).ok();
+        common::removed(std::fs::remove_dir_all(&root), &root);
     }
 }
 
-/// The digest is the schema's shell recipe: `LC_ALL=C sort` over the dump with its final
-/// newline removed, then SHA-256. Run over a real dump where the host has `gcc` and `sort`.
 #[test]
 fn a_macro_dump_digest_is_the_schemas_shell_recipe() {
     let verifies = "that a macro dump's digest is LC_ALL=C sort over its lines";
@@ -246,8 +247,15 @@ fn a_macro_dump_digest_is_the_schemas_shell_recipe() {
         return;
     };
     let root = scratch("recipe");
-    let (_, record) =
-        compile::macro_dump(&driver, Lang::C, &[], true, &root, "recipe").expect("the dump runs");
+    let (_, record) = compile::macro_dump(
+        &driver,
+        Lang::C,
+        &[],
+        compile::DumpUnit::LibcHeaders,
+        &root,
+        "recipe",
+    )
+    .expect("the dump runs");
     assert_eq!(record.exit_status, 0, "the dump exits 0: {}", record.stderr);
     let mut child = Command::new(sort)
         .env_clear()
@@ -272,17 +280,9 @@ fn a_macro_dump_digest_is_the_schemas_shell_recipe() {
         "sort ends its output with a newline"
     );
     assert_eq!(compile::dump_digest(&record.stdout), sha256_hex(&bytes));
-    std::fs::remove_dir_all(&root).ok();
+    common::removed(std::fs::remove_dir_all(&root), &root);
 }
 
-/// A dump's source carries its driver's language, so `clang++` under `-Werror` runs it.
-///
-/// Given a dump named `macros-<tag>.c`, `clang++` warns "treating 'c' input as 'c++' when in
-/// C++ mode" (`-Wdeprecated`), and under a profile carrying `-Werror` the C++ probe's dump
-/// exits 1, so its macro-channel checks withhold (measured on Fedora 44 x86_64, clang
-/// 22.1.8). The `.c` name is run beside the C++ one as the discrimination: it must fail under
-/// `clang++ -Werror`, or this test could not have failed and the arm is announced as
-/// unexercised. The C dump under `clang -Werror` keeps its `.c` name and exits 0.
 #[test]
 fn a_cxx_dump_is_a_cxx_source_and_runs_under_clang_werror() {
     let verifies = "that the C++ macro dump's source is C++, so clang++ -Werror runs it";
@@ -292,18 +292,31 @@ fn a_cxx_dump_is_a_cxx_source_and_runs_under_clang_werror() {
     };
     let root = scratch("werror");
     let werror = ["-Werror".to_owned()];
+    // A probe's own unit includes the self-report header beside it, as in a work directory.
+    std::fs::write(
+        root.join(chard::probe::SELFREPORT_HEADER_NAME),
+        chard::probe::SELFREPORT_HEADER,
+    )
+    .expect("writing the self-report header");
     let mut fed = 0_usize;
-    for (driver, lang, suffix) in [(&clangxx, Lang::Cxx, "cpp"), (&clang, Lang::C, "c")] {
-        for with_headers in [false, true] {
-            let tag = format!("werror-{suffix}-{with_headers}");
-            let (macros, record) =
-                compile::macro_dump(driver, lang, &werror, with_headers, &root, &tag)
-                    .expect("the dump runs");
+    for (driver, lang, suffix, probe) in [
+        (&clangxx, Lang::Cxx, "cpp", "cxx-stdlib-assertions"),
+        (&clang, Lang::C, "c", "exceptions"),
+    ] {
+        let source = chard::probe::find(probe).expect("the probe").source;
+        for (unit_name, unit) in [
+            ("empty", compile::DumpUnit::Empty),
+            ("headers", compile::DumpUnit::LibcHeaders),
+            ("probe", compile::DumpUnit::Source(source)),
+        ] {
+            let tag = format!("werror-{suffix}-{unit_name}");
+            let (macros, record) = compile::macro_dump(driver, lang, &werror, unit, &root, &tag)
+                .expect("the dump runs");
             fed += 1;
             assert_eq!(
                 record.exit_status,
                 0,
-                "{} -Werror over the {suffix} dump (headers {with_headers}) exits 0: {}",
+                "{} -Werror over the {suffix} dump ({unit_name}) exits 0: {}",
                 driver.display(),
                 record.stderr
             );
@@ -315,7 +328,10 @@ fn a_cxx_dump_is_a_cxx_source_and_runs_under_clang_werror() {
             );
         }
     }
-    assert_eq!(fed, 4, "both drivers, with and without the libc headers");
+    assert_eq!(
+        fed, 6,
+        "both drivers, over the empty unit, the libc headers and a probe's own"
+    );
     // The discriminating shape: the C++ driver handed a `.c` source under -Werror.
     let old = root.join("macros-old.c");
     std::fs::write(&old, "").expect("writing the old-shape source");
@@ -337,17 +353,9 @@ fn a_cxx_dump_is_a_cxx_source_and_runs_under_clang_werror() {
             "this clang++ does not warn on a .c input in C++ mode, so a .c name would have passed and the arm above could not have failed here",
         );
     }
-    std::fs::remove_dir_all(&root).ok();
+    common::removed(std::fs::remove_dir_all(&root), &root);
 }
 
-/// The two call sites the suffix rests on pass their driver's language: a run under
-/// `clang -Werror` builds the C++ probe's dumps from `.cpp` files and the profile's C++ dump
-/// exits 0, through the binary, so a caller that passed C for the C++ driver fails here.
-///
-/// `measure::Gatherer::gather` passes the probe's language and `toolchain::dump_with` the
-/// C++ driver's; the test above holds `compile::macro_dump` itself. `-Werror` goes in
-/// `--cxxflags` alone so the profile's C++ dump is taken (it is only where the two lists
-/// differ) and the C dumps carry no `-Werror`.
 #[test]
 fn the_cxx_probe_and_the_profiles_cxx_dump_pass_cxx_through_the_binary() {
     let verifies = "that measure's C++ dumps are .cpp sources under clang -Werror";
@@ -357,7 +365,7 @@ fn the_cxx_probe_and_the_profiles_cxx_dump_pass_cxx_through_the_binary() {
     }
     let root = scratch("binary");
     let out = root.join("report.json");
-    let run = Command::new(env!("CARGO_BIN_EXE_chard"))
+    let run = Command::new(common::chard_binary())
         .args([
             "measure",
             "--cc",
@@ -416,5 +424,224 @@ fn the_cxx_probe_and_the_profiles_cxx_dump_pass_cxx_through_the_binary() {
         }
     }
     assert!(dumps > 0, "the C++ probe published a macro dump record");
-    std::fs::remove_dir_all(&root).ok();
+    common::removed(std::fs::remove_dir_all(&root), &root);
+}
+
+#[test]
+fn a_probe_dump_preprocesses_the_probes_own_unit_under_its_builds_words() {
+    let verifies = "that a probe's macro dump is its own unit under its build's words";
+    if on_path("gcc").is_none() || on_path("g++").is_none() {
+        common::refuse("gcc or g++ not on PATH", verifies);
+        return;
+    }
+    let root = scratch("own-unit");
+    let work = root.join("work");
+    let out = root.join("report.json");
+    let run = Command::new(common::chard_binary())
+        .args(["measure", "--cc", "gcc", "--profile", "bare"])
+        .args(["--probe", "toolchain-macros", "--probe", "exceptions"])
+        .args(["--probe", "cxx-stdlib-assertions", "--workdir"])
+        .arg(&work)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("running chard");
+    assert!(
+        run.status.success(),
+        "chard measure exited {:?}: {}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("the report")).expect("JSON");
+    let (mut fed, mut compared, mut macro_checks) = (0_usize, 0_usize, 0_usize);
+    for o in report["observations"].as_array().expect("observations") {
+        let probe_id = o["probe"].as_str().expect("an observation names its probe");
+        let source = chard::probe::find(probe_id).expect("a corpus probe").source;
+        // Every macro-channel check the run measured compared two views: its dump ran and
+        // read, and its macros came from the artifact.
+        if o["channel"] == "macro" {
+            macro_checks += 1;
+        }
+        if o["channel"] == "macro" && o["verdict"] != "unsupported" {
+            assert_eq!(
+                o["evidence"]["macro_dump"]["exit_status"],
+                serde_json::json!(0),
+                "{}: the dump ran",
+                o["check"]
+            );
+            assert_eq!(
+                o["evidence"]["macro_source"], "compiled-artifact",
+                "{}: the macros are the artifact's, so the views were compared",
+                o["check"]
+            );
+            compared += 1;
+        }
+        let builds = [
+            (&o["evidence"]["macro_dump"], &o["build"]),
+            (
+                &o["controls"]["positive"]["macro_dump"],
+                &o["controls"]["positive"]["build"],
+            ),
+            (
+                &o["controls"]["negative"]["macro_dump"],
+                &o["controls"]["negative"]["build"],
+            ),
+        ];
+        for (dump, build) in builds.into_iter().filter(|(d, _)| !d.is_null()) {
+            fed += 1;
+            hold_dump_record(&o["check"], dump, build, &work, source);
+        }
+    }
+    // The frame: every macro-channel check of the three probes in the corpus was published,
+    // and each measured one compared its views.
+    let expected = macro_checks_of(&["toolchain-macros", "exceptions", "cxx-stdlib-assertions"]);
+    eprintln!(
+        "{macro_checks} macro check(s) of {expected}, {compared} compared, {fed} dump record(s)"
+    );
+    assert_eq!(macro_checks, expected, "every macro check was published");
+    assert!(
+        compared > 0 && fed >= compared,
+        "{compared} compared, {fed} dump records"
+    );
+    let disagreements: Vec<&serde_json::Value> = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("disagree about"))
+        })
+        .collect();
+    assert!(disagreements.is_empty(), "{disagreements:?}");
+    common::removed(std::fs::remove_dir_all(&root), &root);
+}
+
+#[test]
+fn a_probe_dump_leaves_out_its_builds_link_words() {
+    let verifies = "that a probe's macro dump leaves out its build's link words";
+    if on_path("gcc").is_none() {
+        common::refuse("gcc not on PATH", verifies);
+        return;
+    }
+    let root = scratch("link-words");
+    let out = root.join("report.json");
+    let run = Command::new(common::chard_binary())
+        .args(["measure", "--cc", "gcc", "--profile", "explicit"])
+        .args(["--flags", "-O2 -Wl,-z,now"])
+        .args([
+            "--probe",
+            "toolchain-macros",
+            "--probe",
+            "exceptions",
+            "--workdir",
+        ])
+        .arg(root.join("work"))
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("running chard");
+    assert!(
+        run.status.success(),
+        "chard measure exited {:?}: {}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("the report")).expect("JSON");
+    let (mut linked, mut dumps) = (0_usize, 0_usize);
+    for o in report["observations"].as_array().expect("observations") {
+        // The control arms are built on the clean footing, without the profile's `-O2`.
+        let arms = [
+            (&o["evidence"], true),
+            (&o["controls"]["positive"], false),
+            (&o["controls"]["negative"], false),
+        ];
+        for (arm, measured) in arms {
+            let dump = &arm["macro_dump"];
+            if dump.is_null() {
+                continue;
+            }
+            dumps += 1;
+            let words = argv_of(dump);
+            assert!(
+                !measured || words.contains(&"-O2"),
+                "{}: {words:?}",
+                o["check"]
+            );
+            assert!(!words.contains(&"-Wl,-z,now"), "{}: {words:?}", o["check"]);
+        }
+        let build = if o["evidence"]["macro_dump"].is_null() {
+            &serde_json::Value::Null
+        } else {
+            &o["build"]
+        };
+        if o["probe"] == "toolchain-macros" && !build.is_null() {
+            linked += 1;
+            let built = argv_of(build);
+            assert!(built.contains(&"-Wl,-z,now"), "{}: {built:?}", o["check"]);
+        }
+    }
+    eprintln!("{dumps} dump record(s), {linked} linked build(s) carrying the link word");
+    assert!(
+        dumps > 0 && linked > 0,
+        "{dumps} dumps, {linked} linked builds"
+    );
+    common::removed(std::fs::remove_dir_all(&root), &root);
+}
+
+/// The words of a published build record's `argv`.
+fn argv_of(record: &serde_json::Value) -> Vec<&str> {
+    record["argv"]
+        .as_array()
+        .expect("an argv")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
+}
+
+/// One dump record of `check` against its build's: the dump's source in `work` is the
+/// probe's `source` byte for byte, the dump carries no output word, and the build and the
+/// dump both carry the run witness's forced include.
+fn hold_dump_record(
+    check: &serde_json::Value,
+    dump: &serde_json::Value,
+    build: &serde_json::Value,
+    work: &Path,
+    source: &str,
+) {
+    let words = argv_of(dump);
+    let name = words.last().copied().unwrap_or_default();
+    let copied = std::fs::read_to_string(work.join(name)).expect("the dump's source");
+    assert_eq!(copied, source, "{check}: {name} is the probe's own source");
+    for word in ["-c", "-o", "-shared"] {
+        assert!(!words.contains(&word), "{check}: {word} on {words:?}");
+    }
+    let witness = |argv: &[&str]| {
+        argv.windows(2)
+            .any(|w| w == ["-include", "chard_run_witness.h"])
+    };
+    assert!(
+        witness(&argv_of(build)),
+        "{check}: the build carries the witness"
+    );
+    assert!(
+        witness(&words),
+        "{check}: the dump carries it too: {words:?}"
+    );
+}
+
+/// The macro-channel checks the corpus declares for the probes `ids`.
+fn macro_checks_of(ids: &[&str]) -> usize {
+    ids.iter()
+        .map(|id| {
+            chard::probe::find(id)
+                .expect("a corpus probe")
+                .checks
+                .iter()
+                .filter(|c| c.channel() == chard::probe::Channel::Macro)
+                .count()
+        })
+        .sum()
 }

@@ -3,62 +3,52 @@
 #
 # Assert on one chard report the way a reader would, and print the numbers first.
 #
-# `make sweep` measures the corpus under several compilers and profiles with
-# `--fail-on-missing`, whose exit status says only that something was withheld. This
-# script reads the report the measurement wrote and prints its denominators before it
-# judges anything: checks attempted against the corpus total, every verdict's count,
-# and each withheld verdict by cause and by check. A failure therefore names the cell,
-# which an exit status cannot.
+# `make sweep` measures the corpus with `--fail-on-missing`, whose exit status says only that
+# something was withheld. This script prints the report's denominators before it judges
+# anything (checks attempted against the corpus total, every verdict's count, each withheld
+# verdict by cause and by check), so a failure names the cell.
 #
 # Five things fail it, in the order they are established:
 #
-#   1. a core limit other than 0, or a core file under the cell's workdir. The sweep
-#      recipe runs `ulimit -c 0` first and passes the limit it then reads back; the
-#      section below says what the search can and cannot see under each `core_pattern`.
-#   2. no report, or a quarantined one: exit 2 is a chard error, exit 3 is a report that
-#      contradicted itself and was written beside the requested path as
-#      `<report>.contradicted`. Either is a chard defect.
-#   3. an incomplete run: `checks_attempted` below the corpus total, or
-#      `all_checks_attempted` false. The corpus total is read from the report itself and
-#      compared against the total the caller expects, because a report that miscounts
-#      its own corpus cannot vouch for its coverage.
-#   4. a withheld verdict the cell's expectation file does not list, or a listed one the
-#      run did not produce. An earned limitation (`unsupported`, `not-applicable`)
-#      passes; `probe-invalid`, `indeterminate`, `build-failed` and `run-failed` are
-#      withheld verdicts, and each is held to the expectation file described below. The
-#      counts of each kind are held to the report's own `coverage.withholding`, so a
-#      limitation verdict no gating rule earns fails the cell.
-#   5. a measurement exit status that disagrees with the report: `--fail-on-missing`
-#      exits 1 exactly when `all_verdicts_published` is false.
+#   1. a core limit other than 0, or a core file under the cell's workdir; the section below
+#      says what the search can and cannot see under each `core_pattern`.
+#   2. no report, or a quarantined one: exit 2 is a chard error, exit 3 a report that
+#      contradicted itself, written as `<report>.contradicted`. Either is a chard defect.
+#   3. an incomplete run: `checks_attempted` below the corpus total, `all_checks_attempted`
+#      false, or a corpus total other than the caller's, because a report that miscounts its
+#      own corpus cannot vouch for its coverage.
+#   4. a withheld verdict (`probe-invalid`, `indeterminate`, `build-failed`, `run-failed`)
+#      the cell's expectation file does not list, or a listed one the run did not produce; an
+#      earned limitation (`unsupported`, `not-applicable`) passes. The counts of each kind
+#      must match the report's own `coverage.withholding`, so a limitation no rule earns fails.
+#   5. a measurement exit status that disagrees with the report (the last check below).
 #
-# The expectation file. Some cells withhold by design on the toolchain CI runs: a
-# control that needs a flag the runner's gcc lacks, a probe that cannot discriminate on
-# clang. Each cell has a file `<expected dir>/<label>.txt`, where `<label>` is the
-# report's basename without `.json` (`gcc-bare`), holding one line per withheld verdict
-# the cell is expected to carry:
+# The expectation file, `<expected dir>/<label>.txt` with `<label>` the report's basename
+# without `.json` (`gcc-bare`), holds one line per withheld verdict the cell is expected to
+# carry on the toolchain CI runs:
 #
 #     <check id>  <verdict>  <reason, free text to the end of the line>
 #
-# Blank lines and lines starting with `#` are comments, and the verdict is one of the
-# four withheld verdicts. The file is checked in both directions, so it changes only on
-# purpose: a withheld verdict absent from the file fails the cell, and a listed check
-# that published a verdict, or withheld a different one, fails the cell too. A missing
-# or empty file expects nothing, so every withheld verdict fails. A file whose header
-# says UNREVIEWED is a candidate this script wrote and is refused until reviewed, as is
-# a line whose reason still carries the candidate's placeholder.
+# Blank lines and `#` lines are comments. The file is checked in both directions, so it
+# changes only on purpose, and a missing or empty one expects nothing. Without `--expected`
+# there is no directory and no file, so every withheld verdict fails the cell. A file with an
+# UNREVIEWED header line, a candidate this script wrote, is refused until reviewed, as is a
+# line whose reason still carries the candidate's placeholder.
 #
-# `--candidate <dir>` writes the observed withheld set as `<dir>/<label>.txt` with an
-# UNREVIEWED header and the report's own cause in the reason column, so the first run on
-# a new toolchain produces the file a reviewer edits and commits. Writing it never
-# changes the verdict of the run that wrote it.
+# `--candidate <dir>` writes the observed withheld set as `<dir>/<label>.txt`, UNREVIEWED
+# and with the report's own cause as each reason, for a reviewer to edit and commit on a new
+# toolchain. Writing it never changes the verdict of the run that wrote it.
 #
 # Usage: scripts/sweep-gate.sh [--expected <dir>] [--candidate <dir>]
 #                              --core-limit <ulimit -c> --workdir <dir>
 #                              <report.json> <expected corpus total> <measure exit status>
 #
-# `--core-limit` and `--workdir` are required: a gate that was not told the limit or where
-# the probes ran cannot say that no core was left, and passing without saying so is the
-# silence this script exists to refuse.
+# `--core-limit` and `--workdir` are required: a gate not told the limit or where the probes
+# ran cannot say that no core was left, and passing without saying so is the silence this
+# script refuses. Exit 0 when the cell holds, 1 when it fails, 2 for an unknown option, a
+# missing `--core-limit` or `--workdir`, or no jq. A positional argument or an option's value
+# that is missing or empty fails bash's `${n:?}` expansion instead, which prints the usage
+# and exits 1.
 
 set -euo pipefail
 
@@ -68,18 +58,37 @@ export LC_ALL=C
 
 usage='usage: sweep-gate.sh [--expected <dir>] [--candidate <dir>] --core-limit <ulimit -c> --workdir <dir> <report.json> <corpus total> <measure exit status>'
 
-expected_dir=tests/sweep-expected
+expected_dir=
 candidate_dir=
 core_limit=
 core_workdir=
 while [ $# -gt 0 ]; do
   case "$1" in
-    --expected) expected_dir=${2:?$usage}; shift 2 ;;
-    --candidate) candidate_dir=${2:?$usage}; shift 2 ;;
-    --core-limit) core_limit=${2:?$usage}; shift 2 ;;
-    --workdir) core_workdir=${2:?$usage}; shift 2 ;;
-    --) shift; break ;;
-    -*) echo "sweep-gate: unknown option $1" >&2; echo "$usage" >&2; exit 2 ;;
+    --expected)
+      expected_dir=${2:?$usage}
+      shift 2
+      ;;
+    --candidate)
+      candidate_dir=${2:?$usage}
+      shift 2
+      ;;
+    --core-limit)
+      core_limit=${2:?$usage}
+      shift 2
+      ;;
+    --workdir)
+      core_workdir=${2:?$usage}
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "sweep-gate: unknown option $1" >&2
+      echo "$usage" >&2
+      exit 2
+      ;;
     *) break ;;
   esac
 done
@@ -94,13 +103,15 @@ fi
 
 label=$(basename "$report" .json)
 fail=0
-bad()  { printf 'FAIL  %s: %s\n' "$label" "$*"; fail=1; }
+bad() {
+  printf 'FAIL  %s: %s\n' "$label" "$*"
+  fail=1
+}
 good() { printf 'ok    %s: %s\n' "$label" "$*"; }
 note() { printf '      %s\n' "$*"; }
 count() { printf '%s\n' "$1" | grep -c . || true; }
 
-# Every observation whose verdict was withheld, and every one that earned a limitation,
-# each piped through the jq expression given as the argument.
+# The withheld and the earned observations, each through the jq expression given.
 withheld() {
   jq -r '.observations[]
          | select(.verdict | IN("indeterminate","probe-invalid","build-failed","run-failed"))
@@ -111,9 +122,8 @@ earned() {
          | select(.verdict == "unsupported" or .verdict == "not-applicable")
          | '"$1" "$report"
 }
-# The cause a withheld observation recorded, in the order the report's fields carry it,
-# and the detector's own reason where a verdict was withheld at detector level, which
-# records no cause in `controls`. Whitespace runs are folded and the text is cut short,
+# The cause a withheld observation recorded, or the detector's own reason where the verdict
+# was withheld at detector level, which records no cause in `controls`; folded and cut short,
 # because the reason is a sentence and this is a column.
 cause_of='(.controls.withheld_because // .build_rejection // .gating.rule
            // (.evidence.observed // "" | gsub("[[:space:]]+"; " ") | .[:96] | select(. != ""))
@@ -122,28 +132,22 @@ cause_of='(.controls.withheld_because // .build_rejection // .gating.rule
 printf '\n== %s (chard measure exited %s)\n' "$label" "$measure_rc"
 
 # ------------------------------------------------------------------------ 1. cores
-# Several probes abort by design, and `run::execute` cannot lower RLIMIT_CORE for them:
-# the crate denies `unsafe_code`, and a `prlimit` or `ulimit; exec` wrapper, though it
-# execs the probe in its own process, would put a program chard did not build in front of
-# every probe (see the comment on `run::execute`). So the sweep recipe lowers the limit
-# for chard and every child with `ulimit -c 0` before it measures, and hands this gate the
-# limit it reads back. Any other limit fails the cell, and so does a core file anywhere
-# under the cell's workdir, which holds every probe's working directory. A core file is
-# known by its content, an ELF header in either byte order whose e_type is ET_CORE,
-# because its name is whatever `core_pattern` makes it.
+# Several probes abort by design, and `run::execute` cannot lower RLIMIT_CORE for them (its
+# comment says why), so the sweep recipe runs `ulimit -c 0` before it measures and hands this
+# gate the limit it reads back. Any other limit fails the cell, as does a core file under the
+# workdir, which holds every probe's working directory. A core is known by its content, since
+# its name is whatever `core_pattern` makes it.
 #
-# `core_pattern` decides what the search can see, and the gate prints it for that
-# reason. A relative pattern writes a core into the crashing probe's working directory,
-# inside the workdir, so the search sees every core the kernel wrote. An absolute one
-# writes it elsewhere. A pipe hands every crash to a program whatever the limit, and the
-# program decides what to keep: on Fedora 44 x86_64 (2026-09-28), systemd-coredump under
-# a limit of 0 logged "Resource limits disable core dumping" and recorded storage `none`
-# for a program that called abort(), and under an unlimited one stored the core. Under an
-# absolute pattern or a pipe an empty search is not evidence that nothing was kept, and
-# the gate's line says so.
+# `core_pattern` decides what the search can see, so the gate prints it. A relative pattern
+# writes a core inside the workdir, where the search sees it; an absolute one writes it
+# elsewhere. A pipe hands every crash to a program whatever the limit, and the program
+# decides what to keep: on Fedora 44 x86_64 (2026-09-28), systemd-coredump under a limit of 0
+# logged "Resource limits disable core dumping" and recorded storage `none` for a program that
+# called abort(), and under an unlimited one stored the core. Under an absolute pattern or a
+# pipe an empty search is not evidence that nothing was kept, and the gate's line says so.
 #
-# This section runs before the report is read, so a missing report does not hide a core,
-# and runs without jq, which only the count of runs that ended on a signal needs.
+# This section runs before the report is read, so a missing report does not hide a core, and
+# without jq, which only the count of runs that ended on a signal needs.
 core_header() { od -An -tx1 -N18 "$1" 2>/dev/null | tr -d ' \n' || true; }
 if [ -r /proc/sys/kernel/core_pattern ]; then
   core_pattern=$(cat /proc/sys/kernel/core_pattern)
@@ -182,8 +186,10 @@ else
     # e_ident is 16 bytes: the magic, the class, then the data byte (01 little-endian,
     # 02 big-endian); e_type follows in that byte order, and ET_CORE is 4.
     case $(core_header "$file") in
-      7f454c46??01????????????????????0400|7f454c46??02????????????????????0004)
-        cores="$cores$file"$'\n' ;;
+      7f454c46??01????????????????????0400 | 7f454c46??02????????????????????0004)
+        cores="$cores$file"$'\n'
+        ;;
+      *) ;;
     esac
   done < <(find "$core_workdir" -type f -print0)
   core_count=$(count "$cores")
@@ -255,10 +261,9 @@ if [ "$(jq -r '.coverage.all_checks_attempted' "$report")" != "true" ]; then
 fi
 
 # ---------------------------------------------------- 4. what was withheld, by name
-# Earned limitations are listed for the reader and do not fail the gate; withheld
-# verdicts are listed and are held to the expectation below. The list is the point: a
-# red lane that does not say which cell is red sends the reader to open the report and
-# count by hand, and the CI lane keeps no report to open.
+# Earned limitations are listed and do not fail the gate; withheld verdicts are listed and
+# held to the expectation below. The CI lane keeps no report, so this list is how its log
+# says which cell is red.
 earned_rows=$(earned '.check' | grep -c . || true)
 if [ "$earned_rows" -gt 0 ]; then
   note "$earned_rows earned limitation(s):"
@@ -269,10 +274,9 @@ if [ "$withheld_rows" -gt 0 ]; then
   note "$withheld_rows withheld verdict(s):"
   withheld '"        \(.check): \(.verdict) [\('"$cause_of"')]"'
 fi
-# The two lists above sort by the verdict word; the report sorts by the verdict and the
-# gating rule beside it (`report::Standing`), so an `unsupported` or `not-applicable` no
-# rule earns is listed here as earned and is in the report's instrument set. The counts
-# must agree, or a withholding has escaped the expectation below.
+# The lists above sort by the verdict word, the report by the verdict and its gating rule
+# (`report::Standing`), so a limitation no rule earns is earned here and withheld there. The
+# counts must agree, or a withholding has escaped the expectation below.
 if ! jq -e '.coverage.withholding.earned_limitations.count | numbers' "$report" >/dev/null 2>&1; then
   bad "coverage.withholding has no earned_limitations count: a report of the shape before earned limitations were counted apart, to be measured again with this build"
 elif [ "$earned_rows" != "$earned_count" ] || [ "$withheld_rows" != "$withheld_count" ]; then
@@ -287,20 +291,22 @@ elif [ "$earned_rows" != "$earned_count" ] || [ "$withheld_rows" != "$withheld_c
 fi
 
 # ---------------------------------------- 5. the withheld set against the expectation
-# Both lists are `<check> <verdict>` lines, sorted, so `comm` can take the difference in
-# each direction. The expected list is empty when the file is missing, empty or an
-# unreviewed candidate, which makes every withheld verdict unexpected. `expect_state`
-# stays `reviewed` only for a file that exists, is reviewed and has no defective line;
-# the cell's last word below requires it.
+# The expected list is empty for a missing, empty or unreviewed file, so every withheld
+# verdict is then unexpected. `expect_state` stays `reviewed` only for a reviewed file with no
+# defective line, and the cell's last word below requires it.
 is_entry='!/^[[:space:]]*(#|$)/'
 # The `$2` is awk's second field, so the quotes are single on purpose.
 # shellcheck disable=SC2016
 is_withheld_verdict='$2 ~ /^(indeterminate|probe-invalid|build-failed|run-failed)$/'
-expected_file=$expected_dir/$label.txt
+expected_file=
+[ -z "$expected_dir" ] || expected_file=$expected_dir/$label.txt
 observed=$(withheld '"\(.check) \(.verdict)"' | sort)
 expected=
 expect_state=reviewed
-if [ ! -e "$expected_file" ]; then
+if [ -z "$expected_file" ]; then
+  expect_state=missing
+  note "no --expected directory; every withheld verdict fails"
+elif [ ! -e "$expected_file" ]; then
   expect_state=missing
   note "no expectation file at $expected_file; every withheld verdict fails until one is committed"
 elif grep -q '^# UNREVIEWED' "$expected_file"; then
@@ -342,21 +348,21 @@ if [ -n "$matched" ]; then
   while read -r check verdict; do
     reason=$(awk -v c="$check" "$is_entry"' && $1 == c {$1 = ""; $2 = ""; sub(/^[[:space:]]+/, ""); print; exit}' "$expected_file")
     note "  $check: $verdict ($reason)"
-  done <<< "$matched"
+  done <<<"$matched"
 fi
 if [ -n "$unexpected" ]; then
   bad "$(count "$unexpected") withheld verdict(s) the expectation does not list:"
   while read -r check verdict; do
     cause=$(jq -r --arg c "$check" 'first(.observations[] | select(.check == $c) | '"$cause_of"')' "$report")
     note "  $check: $verdict [$cause]"
-  done <<< "$unexpected"
+  done <<<"$unexpected"
 fi
 if [ -n "$stale" ]; then
   bad "$(count "$stale") expected withheld verdict(s) this run did not produce; change or delete each line on purpose:"
   while read -r check verdict; do
     actual=$(jq -r --arg c "$check" 'first(.observations[] | select(.check == $c) | .verdict) // "no observation at all"' "$report")
     note "  $check: expected $verdict, this run reported $actual"
-  done <<< "$stale"
+  done <<<"$stale"
 fi
 
 if [ -n "$candidate_dir" ]; then
@@ -368,9 +374,9 @@ if [ -n "$candidate_dir" ]; then
     echo "# Observed: toolchain $toolchain, libc $(jq -r '.environment.libc.impl' "$report"), profile $profile, chard $(jq -r '.run.harness_version + " (" + .run.harness_revision + ")"' "$report"), $(jq -r '.run.started_utc' "$report")."
     echo "# One line per withheld verdict: <check> <verdict> <reason>. The reason column below is the"
     echo "# cause the report recorded; replace each with the reviewed reason, delete the UNREVIEWED"
-    echo "# line, and commit the file as $expected_file."
+    echo "# line, and keep the file as ${expected_file:-<expected dir>/$label.txt}."
     withheld '"\(.check) \(.verdict) cause: "+'"$cause_of"'+" (unreviewed)"'
-  } > "$candidate"
+  } >"$candidate"
   note "observed withheld set written as an UNREVIEWED candidate to $candidate ($withheld_rows line(s))"
 fi
 
@@ -382,13 +388,39 @@ else
   bad "$withheld_rows verdict(s) withheld and the cell's expectation ($expect_state) does not account for them; the cells are listed above"
 fi
 
-# The exit status and the report must agree: `--fail-on-missing` exits 1 exactly when
-# `all_verdicts_published` is false. A disagreement is a chard defect.
+# The exit status and the report must agree: `--fail-on-missing` exits 1 or 4 exactly when
+# `all_verdicts_published` is false, and 4 exactly when every check was attempted and every
+# unsettled check reads `indeterminate` under a machine-limit or target-limit rule, at least
+# one a machine limit. The rule ids are `MACHINE_LIMITS` and `TARGET_LIMITS` in src/main.rs,
+# held to them by a unit test there. A disagreement either way is a chard defect; a cell
+# exiting 4 is still judged by its expectation file.
+machine_rules='["cpu-lacks-shadow-stack","machine-lacks-bti","machine-lacks-pac","cpu-shows-no-fpac"]'
+target_rules='["no-check-on-target","arch-outside-table"]'
+machine_limited=$(jq -r --argjson m "$machine_rules" --argjson t "$target_rules" '
+  [.observations[]
+   | select((.verdict | IN("on","off","partial")) | not)
+   | select(((.verdict | IN("unsupported","not-applicable")) and (.gating | type == "object")) | not)
+  ] as $unsettled
+  | (.coverage.all_checks_attempted == true)
+    and ($unsettled | length > 0)
+    and ($unsettled | all(.verdict == "indeterminate" and (.gating.rule as $r | ($m + $t) | index($r) != null)))
+    and ($unsettled | any(.gating.rule as $r | $m | index($r) != null))' "$report")
+published=$(jq -r '.coverage.all_verdicts_published' "$report")
 case "$measure_rc" in
-  0) [ "$(jq -r '.coverage.all_verdicts_published' "$report")" = "true" ] \
-       || bad "chard measure exited 0 while the report says a verdict was withheld" ;;
-  1) [ "$(jq -r '.coverage.all_verdicts_published' "$report")" = "false" ] \
-       || bad "chard measure exited 1 (coverage gate) while the report says nothing was withheld" ;;
+  0) [ "$published" = "true" ] \
+    || bad "chard measure exited 0 while the report says a verdict was withheld" ;;
+  1)
+    [ "$published" = "false" ] \
+      || bad "chard measure exited 1 (coverage gate) while the report says nothing was withheld"
+    [ "$machine_limited" = "false" ] \
+      || bad "chard measure exited 1 while every shortfall the report holds is a machine or target limit, at least one a machine limit, which is exit 4"
+    ;;
+  4)
+    [ "$published" = "false" ] \
+      || bad "chard measure exited 4 (coverage gate, machine limits) while the report says nothing was withheld"
+    [ "$machine_limited" = "true" ] \
+      || bad "chard measure exited 4 (coverage gate, machine limits) while the report holds a shortfall that is no machine or target limit, or no machine limit"
+    ;;
   *) bad "chard measure exited $measure_rc" ;;
 esac
 

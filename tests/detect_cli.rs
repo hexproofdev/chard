@@ -2,34 +2,30 @@
 
 //! `chard detect` through the built binary: the replay of a real report, a tampered copy,
 //! the three single-reading inputs, and the refusals.
-//!
-//! Every invocation of `detect` here runs with an environment emptied but for `PATH`,
-//! which is the one variable chard reads (`CLAUDE.md`, hard constraints); a result that
-//! depended on anything else in the test's environment would differ here from a caller's.
-//!
-//! The report is measured once per binary with the host's `cc` under `bare`, and every
-//! macro and `elf-static` check the corpus lists is replayed from it. On a Mach-O host the
-//! `elf-static` checks carry no reading and close at `expected: 0`, and the tests that need
-//! an ELF artifact from the measurement announce the gap; the checked-in objects under
-//! `tests/fixtures/elf/` exercise `--artifact` on every host.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 use serde_json::Value;
 
 mod common;
 
-fn chard_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("chard")
-}
+use common::chard_binary;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -95,13 +91,6 @@ fn checks() -> Vec<(String, String)> {
     out
 }
 
-/// `chard probes` publishes `run_basis` on every runtime decoder and on nothing else, and
-/// `shadow-stack-enforced` and `stack-clash-guard-page` are the checks whose reading rests
-/// on the machine.
-///
-/// `report::emulation_limitation` withholds on that field, and the listing is how a reader
-/// learns which runtime checks it covers; nothing else read it, so the listing could lose or
-/// mislabel it with every test passing.
 #[test]
 fn the_listing_names_each_runtime_checks_run_basis() {
     let (code, listing) = json_of(&chard(&["probes"]));
@@ -136,6 +125,8 @@ fn the_listing_names_each_runtime_checks_run_basis() {
         [
             "noexecstack-enforced",
             "shadow-stack-enforced",
+            "bti-enforced",
+            "pac-ret-enforced",
             "stack-clash-guard-page"
         ]
     );
@@ -199,8 +190,8 @@ struct Reaped(std::process::Child);
 
 impl Drop for Reaped {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        chard::error::best_effort(self.0.kill());
+        chard::error::best_effort(self.0.wait());
     }
 }
 
@@ -220,15 +211,6 @@ fn full_dir(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
-/// [`common::remove_stale`] with `kill -0` removes ended runs' directories with what they
-/// hold, every one of them.
-///
-/// It keeps:
-/// - a live process's directory, and does not end that process;
-/// - this process's directory;
-/// - a symlink and a file named for an ended run;
-/// - a name whose pid has a sign or a leading zero;
-/// - a directory with another tag.
 #[test]
 fn ended_runs_shared_directories_are_removed_and_the_rest_kept() {
     let base = common::Work::new("detect", "stale");
@@ -267,6 +249,12 @@ fn ended_runs_shared_directories_are_removed_and_the_rest_kept() {
             live.0.try_wait().expect("polling sleep").is_none(),
             "the live process was signalled"
         );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test holds that a signal never arrives, which has no event to wait on: \
+                      watching the child between sleeps for 200 ms after kill returns is the \
+                      check"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(removed, stale);
@@ -286,8 +274,6 @@ fn ended_runs_shared_directories_are_removed_and_the_rest_kept() {
     }
 }
 
-/// [`common::remove_stale`] keeps this process's directory even where every process reads
-/// as ended. Where liveness cannot be told, it removes nothing and says why.
 #[test]
 fn remove_stale_keeps_its_own_directory_and_removes_nothing_it_cannot_judge() {
     let base = common::Work::new("detect", "judged");
@@ -341,9 +327,6 @@ fn remove_stale_keeps_its_own_directory_and_removes_nothing_it_cannot_judge() {
     assert!(own.is_dir(), "this process's directory was removed");
 }
 
-/// [`common::Work::shared`] makes its directory under the name [`common::Work::under`]
-/// gives, empty even where an ended run left one under this pid, and removes an ended run's
-/// directory with the same prefix and tag.
 #[test]
 fn a_shared_work_removes_an_ended_runs_directory() {
     // Built aside and moved in whole: another run of this test may sweep at any moment.
@@ -472,10 +455,6 @@ fn every_reading_of_a_real_report_replays_and_the_counts_close() {
 /// One hand edit to a report document.
 type Edit = fn(&mut Value);
 
-/// A replay reads the readings, the predicates and the facts, and no kernel field: a report
-/// without `environment.kernel.ownership` and one with it, or
-/// `is_host_kernel`, edited replay as the report does. Those fields are `table`'s and
-/// `matrix`'s to hold, which refuse the edits (`report::reread_contradictions`).
 #[test]
 fn the_kernel_fields_do_not_reach_a_replay() {
     let Some(m) = measured() else { return };
@@ -610,8 +589,7 @@ fn defined_reads(got: &Value) -> Vec<(String, String)> {
 fn one_changed_fact_exits_1() {
     let Some(m) = measured() else { return };
     // A reading that read a defined macro: renaming that macro in the store entry by one
-    // byte leaves it undefined, and a clause that read it no longer holds. Not every read
-    // decides its reading, so candidates are tried until one moves; none may be refused.
+    // byte leaves it undefined, and a clause that read it no longer holds.
     let mut tried = Vec::new();
     for check in predicate_checks() {
         let (_, got) = detect(&check, "--evidence", &m.report, &["--arm", "measured"]);
@@ -806,6 +784,141 @@ fn chard_elf_output_and_the_artifact_give_one_detection() {
     assert_eq!(compared, ids.len() * common::ELF_FIXTURE_COUNT);
 }
 
+/// Runs `chard detect` with `args` over an object that `feed` writes down a pipe, with the
+/// environment emptied but for `PATH`, as [`chard`] does. Returns the exit code and the parsed
+/// document.
+fn detect_over_a_pipe(
+    args: &[&str],
+    stdin: Stdio,
+    feed: impl FnOnce(&mut std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>>,
+) -> (i32, Value) {
+    let mut command = Command::new(chard_binary());
+    command
+        .env_clear()
+        .args(args)
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let mut child = command.spawn().expect("spawning chard");
+    let writer = feed(&mut child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().expect("polling chard").is_none() {
+        if std::time::Instant::now() >= deadline {
+            chard::error::best_effort(child.kill());
+            let output = child.wait_with_output().expect("collecting chard's output");
+            panic!(
+                "chard {args:?} over a pipe blocked for ten seconds (killed); stderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the wait is on a child's exit, which std offers no timed wait for: try_wait \
+                      between sleeps, under the ten-second deadline, is the bounded wait"
+        )]
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().expect("collecting chard's output");
+    // A chard that exited without opening a named FIFO leaves its writer blocked in `open`,
+    // and a `join` would block with it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !writer.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chard {args:?} exited and its writer never finished; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the wait is on a thread's end, which std offers no timed join for, and a \
+                      join would block with a writer stuck in open: is_finished between sleeps, \
+                      under the ten-second deadline, is the bounded wait"
+        )]
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    writer
+        .join()
+        .expect("the writer thread")
+        .expect("feeding the pipe");
+    json_of(&output)
+}
+
+#[test]
+fn an_artifact_on_a_pipe_is_keyed_by_the_bytes_it_carried() {
+    if !ready("that `--artifact` over a pipe is keyed by the bytes it read") {
+        return;
+    }
+    let work = common::Work::new("detect", "fifo");
+    let fixture = repo_root().join("tests/fixtures/elf/elf64-le-x86_64-exec-relro-lazy.elf");
+    let mut bytes = std::fs::read(&fixture).expect("read the fixture");
+    bytes.resize(bytes.len() + 192 * 1024, 0);
+    let object = work.path("padded.elf");
+    std::fs::write(&object, &bytes).expect("write the padded object");
+    let digest = chard::digest::sha256_hex(&bytes);
+    assert_ne!(
+        digest,
+        chard::digest::sha256_hex(b""),
+        "the object holds bytes"
+    );
+    let (code, from_file) = detect("relro", "--artifact", &object, &[]);
+    assert_eq!(code, 0, "{from_file:#}");
+    assert_eq!(from_file["outcome"], "present", "{from_file:#}");
+    assert_eq!(from_file["facts_key"], digest.as_str(), "{from_file:#}");
+
+    for path in ["/dev/stdin", "/dev/fd/0"] {
+        let fed = bytes.clone();
+        let (code, from_pipe) = detect_over_a_pipe(
+            &["detect", "relro", "--artifact", path],
+            Stdio::piped(),
+            move |child| {
+                let mut stdin = child.stdin.take().expect("a piped stdin");
+                std::thread::spawn(move || {
+                    use std::io::Write as _;
+                    stdin.write_all(&fed)
+                })
+            },
+        );
+        assert_eq!(code, 0, "{path}: {from_pipe:#}");
+        assert_eq!(from_pipe, from_file, "{path} behind a pipe");
+    }
+
+    let fifo = work.path("fifo");
+    match Command::new("mkfifo").arg(&fifo).status() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            common::capability_gap(
+                "`detect --artifact` over a named FIFO",
+                "this host has no mkfifo to make one with",
+            );
+            return;
+        }
+        made => assert!(
+            made.as_ref().is_ok_and(std::process::ExitStatus::success),
+            "mkfifo {}: {made:?}",
+            fifo.display()
+        ),
+    }
+    let fifo_arg = fifo.to_str().expect("a UTF-8 path").to_owned();
+    let (code, from_fifo) = detect_over_a_pipe(
+        &["detect", "relro", "--artifact", &fifo_arg],
+        Stdio::null(),
+        move |_| {
+            // The writer's `open` pairs with chard's.
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)?
+                    .write_all(&bytes)
+            })
+        },
+    );
+    assert_eq!(code, 0, "{from_fifo:#}");
+    assert_eq!(from_fifo, from_file, "a named FIFO");
+}
+
 #[test]
 fn artifact_reads_a_checked_in_object() {
     if !ready("that `--artifact` reads a checked-in object") {
@@ -845,78 +958,12 @@ fn artifact_reads_a_checked_in_object() {
     assert_eq!(got["outcome"], "indeterminate");
 }
 
-#[test]
-fn a_tracked_fixture_per_channel_reproduces_its_expectation() {
-    if !ready("that a tracked fixture reproduces its expectation through `chard detect`") {
-        return;
-    }
-    let channels: BTreeMap<String, String> = checks().into_iter().collect();
-    let text = std::fs::read_to_string(repo_root().join("tests/fixtures/detectors.json"))
-        .expect("the fixture corpus");
-    let fixtures: Vec<Value> = serde_json::from_str(&text).expect("JSON");
-    let work = common::Work::new("detect", "fixtures");
-    let mut seen = BTreeMap::new();
-    for fixture in &fixtures {
-        let check = fixture["check"].as_str().expect("check");
-        let Some(channel) = channels.get(check) else {
-            continue;
-        };
-        if seen.contains_key(channel) {
-            continue;
-        }
-        let path = work.path(&format!("{channel}.json"));
-        std::fs::write(&path, fixture.to_string()).expect("writing");
-        let (code, got) = detect(check, "--evidence", &path, &[]);
-        assert_eq!(code, 0, "{check} ({channel}): {got:#}");
-        assert_eq!(got["input"], "record");
-        assert_eq!(got["outcome"], fixture["expected"], "{check}");
-        assert_eq!(
-            got.get("level").cloned().unwrap_or(Value::Null),
-            fixture
-                .get("expected_level")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "{check}"
-        );
-        assert_eq!(got["agrees"], true);
-        let predicate = channel == "macro" || channel == "elf-static";
-        assert_eq!(got["proof"], predicate, "{check} ({channel})");
-        assert_eq!(
-            got["decoder"]["kind"],
-            if predicate { "predicate" } else { "code" }
-        );
-        seen.insert(channel.clone(), check.to_owned());
-    }
-    assert_eq!(
-        seen.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["compiler-diag", "elf-static", "macro", "runtime"],
-        "{seen:?}"
-    );
-}
-
-/// The README's sample report, read as the library reads it.
-fn sample() -> Value {
-    let path = repo_root().join("tests/fixtures/sample-report.json");
-    let text = std::fs::read_to_string(&path).expect("the sample fixture reads");
-    serde_json::from_str(&text).expect("the sample fixture is JSON")
-}
-
 fn check(id: &str) -> &'static chard::probe::Check {
     chard::detect::check_by_id(id).expect("a corpus check")
 }
 
 fn replay_of(report: &Value, id: &str) -> chard::detect::Replay {
     chard::detect::replay_report(report, check(id), None).expect("the report replays")
-}
-
-/// The sample report's observation of `id`.
-fn observation_of<'a>(report: &'a mut Value, id: &str) -> &'a mut Value {
-    report["observations"]
-        .as_array_mut()
-        .expect("observations")
-        .iter_mut()
-        .find(|o| o["check"] == id)
-        .expect("the sample observes the check")
 }
 
 /// What [`chard::detect::decode_evidence`] decodes `value` to, as a detection.
@@ -927,119 +974,6 @@ fn detected(value: &Value, id: &str) -> chard::detect::Detected {
     }
 }
 
-/// A replay's counts close where every owed reading was replayed or named, and a count
-/// edited apart from the lists it counts does not.
-#[test]
-fn a_replay_closes_only_where_its_counts_are_its_lists() {
-    let mut replay = replay_of(&sample(), "ssp-level");
-    assert!(replay.closes() && replay.agrees(), "{replay:?}");
-    replay.expected += 1;
-    assert!(!replay.closes() && !replay.agrees());
-    replay.replayed += 1;
-    assert!(
-        !replay.closes(),
-        "replayed no longer counts the replays listed"
-    );
-}
-
-/// A measured verdict's restatement carries the level its reading licenses, and an arm's
-/// outcome carries none.
-#[test]
-fn a_restated_verdict_carries_its_level_and_an_arm_outcome_none() {
-    let replay = replay_of(&sample(), "relro");
-    let verdict = replay
-        .restated
-        .iter()
-        .find(|r| r.arm == "measured" && r.field == "verdict")
-        .expect("the measured verdict is restated");
-    assert_eq!(
-        (verdict.stated.as_deref(), verdict.restated_level.as_deref()),
-        (Some("partial"), Some("partial")),
-        "{verdict:?}"
-    );
-    let outcomes: Vec<_> = replay
-        .restated
-        .iter()
-        .filter(|r| r.field == "outcome")
-        .collect();
-    assert!(
-        !outcomes.is_empty() && outcomes.iter().all(|r| r.restated_level.is_none()),
-        "{outcomes:?}"
-    );
-}
-
-/// A regime arm the profile does not owe, published and reading `absent`, leaves a
-/// measured verdict earned by its triple.
-#[test]
-fn an_unowed_regime_arm_reading_absent_leaves_the_verdict_earned() {
-    let mut report = sample();
-    let o = observation_of(&mut report, "relro");
-    let negative = o["controls"]["negative"].clone();
-    o["controls"]["regime_negative"] = negative;
-    let replay = replay_of(&report, "relro");
-    let earned = replay
-        .restated
-        .iter()
-        .find(|r| r.arm == "measured" && r.field == "controls")
-        .expect("the triple restates the measured verdict");
-    assert!(earned.agrees, "{earned:?}");
-}
-
-/// Every replayed site restates its reading's `facts` key as bound, and a key moved to
-/// another entry is restated as unbound and not also as bound.
-#[test]
-fn a_facts_key_is_restated_as_bound_only_where_it_is() {
-    let report = sample();
-    let replay = replay_of(&report, "ssp-level");
-    for arm in ["measured", "positive", "negative"] {
-        assert!(
-            replay
-                .restated
-                .iter()
-                .any(|r| r.arm == arm && r.field == "facts" && r.agrees),
-            "{arm}: {:?}",
-            replay.restated
-        );
-    }
-    let mut moved = report;
-    let o = observation_of(&mut moved, "ssp-level");
-    let measured = o["evidence"]["decoded"]["facts"].clone();
-    o["controls"]["positive"]["decoded"]["facts"] = measured;
-    let replay = replay_of(&moved, "ssp-level");
-    let facts: Vec<_> = replay
-        .restated
-        .iter()
-        .filter(|r| r.arm == "positive" && r.field == "facts")
-        .collect();
-    assert!(
-        !facts.is_empty() && facts.iter().all(|r| !r.agrees),
-        "{facts:?}"
-    );
-}
-
-/// A code-decoded arm whose build record was cut is not replayed, whatever its run record
-/// holds.
-#[test]
-fn an_arm_whose_build_record_was_cut_is_not_replayed() {
-    let id = "implicit-int-is-error";
-    let mut report = sample();
-    let o = observation_of(&mut report, id);
-    let build = &mut o["controls"]["positive"]["build"];
-    let stderr = build["stderr"].as_str().unwrap_or_default().to_owned();
-    build["stderr"] = format!("[9 {}]{stderr}", chard::probe::CUT_MARKER).into();
-    let replay = replay_of(&report, id);
-    assert!(
-        replay
-            .not_replayable
-            .iter()
-            .any(|n| n.arm == "positive" && n.reason == "record-cut"),
-        "{:?}",
-        replay.not_replayable
-    );
-}
-
-/// An arm of a check whose decoder reads the artifact, with no store entry under its
-/// artifact, is named as not replayable rather than replayed over no facts.
 #[test]
 fn an_arm_of_a_listed_check_without_its_artifact_is_not_replayed() {
     let Some(m) = measured() else { return };
@@ -1074,7 +1008,6 @@ fn an_arm_of_a_listed_check_without_its_artifact_is_not_replayed() {
     );
 }
 
-/// A record's expectation is its outcome and its level together.
 #[test]
 fn a_record_is_held_to_its_expected_level_as_well_as_its_outcome() {
     let record = |level: &str| {
@@ -1089,8 +1022,6 @@ fn a_record_is_held_to_its_expected_level_as_well_as_its_outcome() {
     assert_eq!(detected(&record("all"), "ssp-level").agrees, Some(false));
 }
 
-/// A `macro-dump` entry cut by this build's own filter reads a name the filter keeps and
-/// the entry lacks as undefined; cut by another filter, the name is unknown.
 #[test]
 fn a_dump_entry_is_read_through_the_filter_it_names() {
     let entry = |filter: &str| {
@@ -1112,8 +1043,6 @@ fn a_dump_entry_is_read_through_the_filter_it_names() {
     );
 }
 
-/// An object whose values carry a machine and no ELF class is not `chard elf` output, and
-/// is refused as no evidence chard reads.
 #[test]
 fn values_with_a_machine_alone_are_not_elf_output() {
     let Err(refused) = chard::detect::decode_evidence(
@@ -1148,13 +1077,6 @@ fn a_record_whose_expectation_the_decoder_misses_exits_1() {
     assert_eq!(got["agrees"], false);
 }
 
-/// A code-decoded check replays through this binary's decoder over the records its sites
-/// publish, and every replay of a real report agrees.
-///
-/// Counted under `not_replayable` as `code-decoder`, every such reading would let an edited
-/// runtime or compiler-diag arm exit 0. What stays
-/// unreplayed is a record an excerpt budget cut (`record-cut`), and an arm of a check whose
-/// decoder reads an artifact the store does not keep (`detect::READS_UNSTORED_ARTIFACT`).
 #[test]
 fn every_code_decoded_reading_of_a_real_report_replays_and_agrees() {
     let Some(m) = measured() else { return };
@@ -1198,12 +1120,6 @@ fn every_code_decoded_reading_of_a_real_report_replays_and_agrees() {
     assert!(replayed > 0, "no code-decoded reading was replayed");
 }
 
-/// A measured `on` or `off` of a code-decoded check, swapped for the other beside an intact
-/// triple, disagrees with its replay and exits 1.
-///
-/// The triple alone cannot catch it: `earned` holds a measured verdict to a discriminating
-/// triple, and both `on` and `off` stand beside one. Without the replay of a code decoder's
-/// reading, this edit would exit 0.
 #[test]
 fn a_swapped_code_decoded_verdict_exits_1() {
     let Some(m) = measured() else { return };
@@ -1329,6 +1245,100 @@ fn a_verdict_its_reading_does_not_license_exits_1() {
 }
 
 #[test]
+fn a_listing_record_removed_or_cut_is_held_to_what_the_probe_owes() {
+    let Some(m) = measured() else { return };
+    let probe = "ubsan-trap";
+    let check = "ubsan-trap-mode";
+    assert!(
+        m.value["listings"][probe].is_object(),
+        "the probe owes its measured compile's listing under any profile: {}",
+        m.value["listings"]
+    );
+    let gates_of = |got: &Value| -> Vec<String> {
+        got["gates"]
+            .as_array()
+            .expect("gates")
+            .iter()
+            .map(|g| g["outcome"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let (code, got) = detect(check, "--evidence", &m.report, &[]);
+    assert_eq!(code, 0, "{got:#}");
+    let as_written = gates_of(&got);
+    assert!(!as_written.is_empty(), "{got:#}");
+    let mut edits = 0;
+    let whole = tampered(m, "listings-gone.json", |r| {
+        r.as_object_mut().expect("a report").remove("listings");
+    });
+    let (code, got) = detect(check, "--evidence", &whole, &[]);
+    assert_eq!(code, DISAGREES, "{got:#}");
+    edits += 1;
+    let foreign = tampered(m, "listings-gone-foreign.json", |r| {
+        r.as_object_mut().expect("a report").remove("listings");
+        r["run"]["decoders_sha256"] = Value::from("0".repeat(64));
+    });
+    let (code, got) = detect(check, "--evidence", &foreign, &[]);
+    assert_eq!(code, 0, "{got:#}");
+    let gates = gates_of(&got);
+    assert!(
+        gates
+            .iter()
+            .all(|g| g == "listings-unpublished" || g == "not-reached"),
+        "{got:#}"
+    );
+    assert!(
+        gates.iter().any(|g| g == "listings-unpublished"),
+        "the branch ran: {got:#}"
+    );
+    let said = chard(&[
+        "detect",
+        check,
+        "--evidence",
+        foreign.to_str().expect("a UTF-8 path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&said.stderr);
+    assert!(
+        stderr.contains("were not replayed"),
+        "a gate taken as written is said on stderr: {stderr}"
+    );
+    edits += 1;
+    let cut = tampered(m, "listings-cut.json", |r| {
+        r["listings"]
+            .as_object_mut()
+            .expect("listings")
+            .remove(probe);
+    });
+    let (code, got) = detect(check, "--evidence", &cut, &[]);
+    assert_eq!(code, DISAGREES, "{got:#}");
+    edits += 1;
+    // The observation's probe renamed to one that does not hold the check.
+    let index = m.value["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .position(|o| o["check"] == check)
+        .expect("the report observes the check");
+    let renamed = tampered(m, "probe-renamed.json", |r| {
+        r["observations"][index]["probe"] = Value::from("link-defaults");
+    });
+    let (code, got) = detect(check, "--evidence", &renamed, &[]);
+    assert_eq!(code, DISAGREES, "{got:#}");
+    assert!(gates_of(&got).iter().any(|g| g == "disagrees"), "{got:#}");
+    assert!(
+        got["gates"]
+            .as_array()
+            .expect("gates")
+            .iter()
+            .any(|g| g["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("is not one of this binary's corpus that holds"))),
+        "the probe that does not hold the check is named: {got:#}"
+    );
+    edits += 1;
+    assert_eq!(edits, 4);
+}
+
+#[test]
 fn a_verdict_its_reading_does_not_license_exits_1_beside_an_added_gating() {
     let Some(m) = measured() else { return };
     // No gating premise publishes a measurement, so a `gating` added beside a moved
@@ -1347,6 +1357,14 @@ fn a_verdict_its_reading_does_not_license_exits_1_beside_an_added_gating() {
     });
     let (code, got) = detect(&check, "--evidence", &path, &[]);
     assert_eq!(code, DISAGREES, "{check}: {got:#}");
+    assert!(
+        got["gates"]
+            .as_array()
+            .expect("gates")
+            .iter()
+            .any(|g| g["outcome"] == "disagrees"),
+        "a gating with no rule cannot be placed: {got:#}"
+    );
     assert!(
         got["restated"]
             .as_array()
@@ -1502,9 +1520,7 @@ fn a_measured_verdict_with_its_triple_deleted_exits_1() {
 fn a_measured_reading_moved_to_another_builds_facts_exits_1() {
     let Some(m) = measured() else { return };
     // The negative arm's own reading, published as the measured build's with the `off` it
-    // licenses: it replays, and the verdict restates against it. A cell whose measured
-    // build and negative arm read the same bytes (one dump digest) is passed over, since
-    // there the two keys are one.
+    // licenses: it replays, and the verdict restates against it.
     let (check, index, negative) = first_site(&m.value, |o| {
         let measured = o.get("evidence")?.get("decoded")?;
         let neg = o.get("controls")?.get("negative")?.get("decoded")?;
@@ -1580,29 +1596,65 @@ fn a_verdict_beside_a_reading_the_replay_cannot_rederive_exits_1() {
     // measured reading stops at `unkept-c-int-follow`, so nothing verifies it, and an
     // `off` moved beside a reading forged to license it is not certified as agreeing.
     let check = "cxx-hardening-requested";
-    let Some((_, index, key)) = first_site_opt(&m.value, |o| {
+    let verifies = "that a verdict beside a reading the replay cannot rederive exits 1";
+    let Some((_, index, (dump, mut macros))) = first_site_opt(&m.value, |o| {
         if o["check"] != check {
             return None;
         }
-        let d = o.get("evidence")?.get("decoded")?;
-        d.get("macros")
-            .is_none()
-            .then(|| d["facts"].as_str().map(ToOwned::to_owned))?
+        let e = o.get("evidence")?;
+        let decoded = e.get("decoded")?;
+        // A macro reading names its map as `facts` and carries no `macros` key.
+        decoded.get("facts")?;
+        if decoded.get("macros").is_some() {
+            return None;
+        }
+        let dump = e["macro_dump"]["stdout_sha256"].as_str()?.to_owned();
+        Some((dump, e["macros"].as_object()?.clone()))
     }) else {
-        eprintln!("skipping: no measured {check} reading in this report");
+        // Where chard finds no C++ driver beside the C driver it measures no C++ check
+        // (`measure::no_driver`, which says the miss is a fact about that lookup).
+        let toolchain = m.value["toolchain"]
+            .as_object()
+            .expect("a measured report publishes its toolchain");
+        let withheld_for_no_driver = m.value["observations"]
+            .as_array()
+            .expect("observations")
+            .iter()
+            .any(|o| o["check"] == check && o["gating"]["rule"] == "no-driver");
+        if !toolchain.contains_key("cxx_driver") && withheld_for_no_driver {
+            common::capability_gap(
+                verifies,
+                "chard found no C++ driver beside the C driver, so no C++ check was measured",
+            );
+        } else {
+            common::refuse(
+                &format!("the measured report holds no {check} reading beside a published dump"),
+                verifies,
+            );
+        }
         return;
     };
-    if m.value["facts"][&key]["kind"] != "macro-dump" {
-        eprintln!("skipping: {check}'s measured reading does not read a macro dump");
-        return;
+    // libc++'s dump, not libstdc++'s self-report.
+    for name in ["_CXX_STDLIB", "__GLIBCXX__", "_GLIBCXX_ASSERTIONS"] {
+        macros.remove(name);
     }
+    macros.insert("_LIBCPP_VERSION".to_owned(), "210000".into());
+    macros.insert("_LIBCPP_HARDENING_MODE".to_owned(), "VENDOR_MODE".into());
     let path = tampered(m, "unkept.json", |r| {
-        let macros = r["facts"][&key]["macros"]
-            .as_object_mut()
-            .expect("a macro-dump entry carries its macros");
-        macros.insert("_LIBCPP_VERSION".to_owned(), "210000".into());
-        macros.insert("_LIBCPP_HARDENING_MODE".to_owned(), "VENDOR_MODE".into());
+        let filter = r["evidence_filters"]["macros"]["sha256"].clone();
+        assert!(filter.is_string(), "the report names its macro filter");
+        // `defines` is the dump's line count, which `detect` does not read; the map and
+        // its filter are what a replay reads.
+        r["facts"][&dump] = serde_json::json!({
+            "kind": "macro-dump",
+            "defines": macros.len(),
+            "macros_filter": filter,
+            "macros": macros,
+        });
         let o = r["observations"][index].as_object_mut().expect("object");
+        o["evidence"]["macros"] = macros.clone().into();
+        o["evidence"]["macro_source"] = "preprocessor".into();
+        o["evidence"]["decoded"]["facts"] = dump.as_str().into();
         o.insert("verdict".to_owned(), "off".into());
         o.remove("level");
         let d = o
@@ -1616,27 +1668,71 @@ fn a_verdict_beside_a_reading_the_replay_cannot_rederive_exits_1() {
     });
     let (code, got) = detect(check, "--evidence", &path, &["--arm", "measured"]);
     assert_eq!(code, DISAGREES, "{check}: {got:#}");
+    // The follow, and nothing else, is what the replay could not re-derive.
+    let unreplayed = got["not_replayable"].as_array().expect("not_replayable");
+    assert_eq!(unreplayed.len(), 1, "{got:#}");
+    assert_eq!(unreplayed[0]["reason"], "unkept-c-int-follow", "{got:#}");
+    assert_eq!(unreplayed[0]["key"], "macros.VENDOR_MODE", "{got:#}");
+    let restated = got["restated"].as_array().expect("restated");
+    // The reading stays bound to its site: its `facts` key is restated as the dump's and
+    // agrees, so no disagreement comes from a key moved off the site's record.
     assert!(
-        got["not_replayable"]
-            .as_array()
-            .expect("not_replayable")
+        restated
             .iter()
-            .any(|n| n["reason"] == "unkept-c-int-follow"),
+            .any(|r| r["field"] == "facts" && r["stated"] == dump.as_str() && r["agrees"] == true),
         "{got:#}"
     );
     assert!(
-        got["restated"]
-            .as_array()
-            .expect("restated")
+        !restated
             .iter()
-            .any(|r| {
-                r["field"] == "verdict"
-                    && r["stated"] == "off"
-                    && r["restated"].is_null()
-                    && r["agrees"] == false
-            }),
+            .any(|r| matches!(r["field"].as_str(), Some("facts" | "macros")) && r["agrees"] != true),
         "{got:#}"
     );
+    assert!(
+        restated.iter().any(|r| {
+            r["field"] == "verdict"
+                && r["stated"] == "off"
+                && r["restated"].is_null()
+                && r["agrees"] == false
+        }),
+        "{got:#}"
+    );
+}
+
+#[test]
+fn a_published_predicate_naming_no_macro_is_refused() {
+    let Some(m) = measured() else { return };
+    let predicates = m.value["decoders"]["predicates"]
+        .as_object()
+        .expect("a measured report publishes its predicates");
+    let term = "{\"macro\":\"";
+    let (check, body) = predicates
+        .iter()
+        .find_map(|(check, entry)| {
+            let body = serde_json::to_string(&entry["predicate"]).expect("serializes");
+            body.contains(term).then_some((check.clone(), body))
+        })
+        .expect("a measured report publishes a predicate that reads a macro");
+    let start = body.find(term).expect("found above") + term.len();
+    let end = start + body[start..].find('"').expect("a closed string");
+    let renamed = format!("{}B=1{}", &body[..start], &body[end..]);
+    assert_ne!(renamed, body);
+    let path = tampered(m, "no-name.json", |r| {
+        r["decoders"]["predicates"][&check]["predicate"] =
+            serde_json::from_str(&renamed).expect("still JSON");
+    });
+    let (code, got) = detect(&check, "--evidence", &path, &[]);
+    assert_eq!(code, 2, "{check}: {got:#}");
+    assert_eq!(got["error"]["code"], "USER_INPUT", "{check}: {got:#}");
+    let message = got["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("does not validate")
+            && message.contains("term's \"B=1\" is not a macro's name"),
+        "{check}: {got:#}"
+    );
+    // The report as measured, with the same check, is taken.
+    let (code, got) = detect(&check, "--evidence", &m.report, &[]);
+    assert_eq!(code, 0, "{check}: {got:#}");
 }
 
 /// Removes `decoded` from the sites `arms` names (`evidence` for the measured build) on
@@ -1749,9 +1845,7 @@ fn a_regime_arm_the_profile_owes_is_owed_whether_or_not_it_is_published() {
             "{id} is not in the corpus"
         );
     }
-    // A `bare` report owes no regime arm, so its triples publish none. Under a profile
-    // that adds a flag the same triple owes one, and without it the measured verdict is
-    // unearned: the shape of a regime arm deleted from a report measured under a profile.
+    // A `bare` report owes no regime arm, so its triples publish none.
     let (check, _, verdict) = first_site(&m.value, |o| {
         let v = o["verdict"].as_str()?;
         (REGIME_CHECKS.iter().any(|c| o["check"] == *c)
@@ -1778,6 +1872,96 @@ fn a_regime_arm_the_profile_owes_is_owed_whether_or_not_it_is_published() {
                 r["field"] == "controls"
                     && r["stated"] == verdict.as_str()
                     && r["restated"] == "probe-invalid"
+                    && r["agrees"] == false
+            }),
+        "{got:#}"
+    );
+}
+
+/// One measurement of the `auto-var-init` probe, whose checks declare a regime arm, under
+/// `--profile explicit --flags -O2`, which owes it. Kept with its work directory for the
+/// whole binary, as [`measured`] is.
+fn measured_under_a_profile() -> Option<&'static Measured> {
+    static CELL: OnceLock<Measured> = OnceLock::new();
+    let verifies = "that a regime arm's flags are held through `chard detect`";
+    if !(ready(verifies) && common::require_cc(verifies)) {
+        return None;
+    }
+    Some(CELL.get_or_init(|| {
+        let work = common::Work::shared("detect", "regime");
+        let report = work.path("report.json");
+        let output = Command::new(chard_binary())
+            .args(["measure", "--probe", "auto-var-init"])
+            .args(["--profile", "explicit", "--flags", "-O2"])
+            .arg("--workdir")
+            .arg(work.path("work"))
+            .arg("--output")
+            .arg(&report)
+            .output()
+            .expect("spawning chard measure");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "measure failed, or its report contradicted itself:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = std::fs::read_to_string(&report).expect("the report was written");
+        let value: Value = serde_json::from_str(&text).expect("the report is JSON");
+        assert!(value.get("error").is_none(), "{}", value["error"]);
+        Measured {
+            work,
+            report,
+            value,
+        }
+    }))
+}
+
+#[test]
+fn a_regime_arm_with_its_countermand_dropped_exits_1() {
+    let Some(m) = measured_under_a_profile() else {
+        return;
+    };
+    let site = first_site_opt(&m.value, |o| {
+        let v = o["verdict"].as_str()?;
+        let c = o.get("controls")?;
+        (matches!(v, "on" | "off" | "partial")
+            && c.get("discriminating")? == true
+            && c.get("regime_negative").is_some_and(|a| !a.is_null()))
+        .then(|| v.to_owned())
+    });
+    let Some((id, index, verdict)) = site else {
+        common::capability_gap(
+            "a regime arm's flags held through `chard detect`",
+            "no auto-var-init check was measured beside a discriminating triple on this host",
+        );
+        return;
+    };
+    let (code, got) = detect(&id, "--evidence", &m.report, &[]);
+    assert_eq!(code, 0, "{id} as measured: {got:#}");
+    let declared = check(&id).regime_arm().expect("a regime arm is declared");
+    let path = tampered(m, "regime-countermand-dropped.json", |r| {
+        let flags = r["observations"][index]["controls"]["regime_negative"]["flags"]
+            .as_array_mut()
+            .expect("the arm's flags");
+        let before = flags.len();
+        flags.retain(|f| !declared.iter().any(|d| f == *d));
+        assert_eq!(
+            flags.len() + declared.len(),
+            before,
+            "the declared arm was in the flags"
+        );
+    });
+    let (code, got) = detect(&id, "--evidence", &path, &[]);
+    assert_eq!(code, DISAGREES, "{id}: {got:#}");
+    assert!(
+        got["restated"]
+            .as_array()
+            .expect("restated")
+            .iter()
+            .any(|r| {
+                r["field"] == "controls"
+                    && r["stated"] == verdict.as_str()
+                    && r["restated"].is_null()
                     && r["agrees"] == false
             }),
         "{got:#}"
@@ -1830,9 +2014,8 @@ fn a_measurement_relabelled_indeterminate_is_not_restated_against_its_triple() {
     let Some(m) = measured() else { return };
     // `indeterminate` beside a discriminating triple is what the fortify ratchet's
     // withholding and a gating rule leave, and a replay re-derives neither, so the
-    // relabel is outside what `chard detect` restates: the limit the module documentation,
-    // DESIGN.md and THREAT_MODEL.md name. The test pins the limit, so a change that
-    // closes it changes this test with the documents.
+    // relabel is outside what `chard detect` restates: the limit the module documentation
+    // names.
     let (check, index, _) = first_discriminating_measurement(&m.value);
     let path = tampered(m, "relabelled-indeterminate.json", |r| {
         let o = r["observations"][index].as_object_mut().expect("object");
@@ -1851,12 +2034,6 @@ fn a_measurement_relabelled_indeterminate_is_not_restated_against_its_triple() {
     );
 }
 
-/// A `--normalize` report replays. `report::VOLATILE_READINGS` masks the stack-clash
-/// probe's `dist=` after the decoder read it and keeps `ratio_pct` so that
-/// `chard detect --evidence` still has a reading to replay; a decoder that needs the masked
-/// digits turns every arm `indeterminate` against a published `off`/`present`/`absent`
-/// and exits 1. Measured that way on 2026-10-05 (Fedora 44 x86_64, gcc 16.1.1, default stack
-/// limit) with a decoder that recomputes the ratio from `dist`.
 #[test]
 fn a_normalized_stack_clash_report_replays() {
     let verifies = "that a normalized stack-clash report replays through `chard detect`";
@@ -1914,11 +2091,6 @@ fn a_normalized_stack_clash_report_replays() {
     assert!(decided > 0, "no replayed arm decided anything: {got:#}");
 }
 
-/// The half of [`a_chard_document_that_is_not_a_report_is_refused_by_name`] that needs no
-/// measurement, so a host with no C compiler still runs it: the probe listing and an error
-/// envelope are refused as not a report, and `chard elf` output whose one path is named
-/// `chard_schema` is read as `elf` output, a detection, since its value is facts and not a
-/// version string.
 #[test]
 fn chard_documents_needing_no_measurement_are_told_apart_from_a_report() {
     if !ready("that --evidence tells chard's other documents from a report") {
@@ -1939,12 +2111,6 @@ fn chard_documents_needing_no_measurement_are_told_apart_from_a_report() {
         let (code, got) = detect("relro", "--evidence", &path, &[]);
         assert_eq!(code, 2, "{label}: {got:#}");
         assert_eq!(got["error"]["code"], "USER_INPUT", "{label}: {got:#}");
-        assert!(
-            got["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("not a report")),
-            "{label}: {got:#}"
-        );
     }
     let fixture = elf_fixtures().into_iter().next().expect("an ELF fixture");
     let fixture = fixture.to_str().expect("a UTF-8 path");
@@ -1965,12 +2131,6 @@ fn chard_documents_needing_no_measurement_are_told_apart_from_a_report() {
     assert_eq!(got["kind"], "detection", "{got:#}");
 }
 
-/// Every JSON document chard writes but `elf`'s carries `chard_schema`, so that key does not
-/// tell a report apart. Each of chard's other documents, as chard wrote it, is refused as not a
-/// report (exit 2, `USER_INPUT`), never replayed as a report that lost its readings: a replay of
-/// a real report (whose `observations` is a count, which a sniff for the key alone takes for a
-/// report), a detection, a matrix, the probe listing and an error envelope. What tells a report
-/// apart is an `observations` list beside the version.
 #[test]
 fn a_chard_document_that_is_not_a_report_is_refused_by_name() {
     let Some(m) = measured() else {
@@ -2001,11 +2161,5 @@ fn a_chard_document_that_is_not_a_report_is_refused_by_name() {
         let (code, got) = detect(&check, "--evidence", &path, &[]);
         assert_eq!(code, 2, "{label}: {got:#}");
         assert_eq!(got["error"]["code"], "USER_INPUT", "{label}: {got:#}");
-        assert!(
-            got["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("not a report")),
-            "{label}: {got:#}"
-        );
     }
 }

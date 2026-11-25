@@ -2,28 +2,24 @@
 #
 # The advisory lane, on a schedule rather than in the gate.
 #
-# `cargo audit` reads a live database. Its verdict is a function of the world on the day
-# it runs, not of the commit it runs against, so a green commit can turn red with no diff
-# to explain it. That is genuinely useful information -- and it is information about the
-# ecosystem rather than about the change under review, so it must not gate a pull
-# request. `make check` stays reproducible from the commit; this reports separately.
+# `cargo audit` reads a live database, so its verdict is a function of the day it runs, not of
+# the commit: news about the ecosystem, not about the change under review, so it gates no
+# pull request and `make check` stays reproducible from the commit.
 
+---
 name: audit
 
 on:
   schedule:
-    # Weekly. chard has four direct dependencies and 30 packages in Cargo.lock, so the
-    # graph moves slowly; daily would be noise without being earlier in any useful way.
+    # Weekly: a graph of four direct dependencies moves slowly.
     - cron: '17 6 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Queue rather than cancel, unlike ci.yml. A superseded gate run answers a commit nobody is
-# looking at any more; a superseded audit run does not, because its subject is the advisory
-# database on the day it runs. Overlap is only reachable by dispatching one by hand while the
-# cron is mid-flight, and the cost of that is a duplicate read.
+# Queue rather than cancel, unlike ci.yml: an audit run's subject is the advisory database on
+# the day it runs, so a later run does not supersede it.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -35,10 +31,9 @@ jobs:
     timeout-minutes: 30
     steps:
       # Pinned and credential-free for the reasons given in ci.yml.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      # From crates.io, not a third-party action -- same reasoning as ci.yml, and it costs
-      # less here: this job is weekly and on no one's critical path.
+      # From crates.io, not a third-party action, for the reason ci.yml gives for cargo-deny.
       - run: cargo install cargo-audit --locked
       - run: cargo audit

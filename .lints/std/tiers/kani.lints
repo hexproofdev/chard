@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier kani: a workspace or package that holds Kani proof harnesses under #[cfg(kani)].
+# Kani compiles with its own bundled nightly (cargo-kani 0.67.0: nightly-2025-11-21, rustc 1.93), not
+# the repository's pin; a crate with harnesses declares rust-version at that rustc so incompatible_msrv
+# refuses newer std APIs. A repository with other custom cfgs sets this key in .lints/local instead.
+# Workspace or package only: check-cfg has no crate-attribute form.
+rust.unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }

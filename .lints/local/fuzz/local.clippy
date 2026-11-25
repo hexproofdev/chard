@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# The fuzz workspace's own clippy.toml settings, merged by assemble.sh into the generated
+# fuzz/clippy.toml.
+
+# The root's words, for the reasons .lints/local/root/local.clippy gives: clippy reads the
+# fuzz workspace's generated clippy.toml instead of the root's, and the targets' doc comments
+# name the architecture a measurement ran on as chard's do.
+doc-valid-idents = ["OpenSSF", "OpenBSD", "AlmaLinux", "x86_64", "AmpereOne", ".."]

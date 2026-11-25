@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Drive the measurement loop directly, without the CLI.
-//!
-//! This file could not exist until the loop moved into the library. It had lived in the
-//! binary crate root, so the control-triple wiring, the coverage denominator and the
-//! profile-versus-control distinction were reachable only by running a sweep and reading
-//! the JSON, which meant every claim about them was verified by a person looking at
-//! output, three times in one session.
-//!
-//! What is asserted here is the part a report cannot show you: not that a verdict is
-//! right on this machine, which depends on whoever packaged the compiler, but that the
-//! *control triple did its job*: that a forced-on build and a forced-off build actually
-//! discriminated before any verdict was trusted. A green run on a hardened toolchain and
-//! a green run on a bare one must both pass, because the property under test is the
-//! instrument's, not the distribution's.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::time::Duration;
 
@@ -27,26 +27,13 @@ use chard::toolchain;
 
 /// A work directory that is removed when the test ends.
 /// Can this machine drive the measurement loop? Checked once, at the top of each test.
-///
-/// The one legitimate reason it cannot is the absence of a C compiler, which is a
-/// property of the environment and knowable before any work starts. Anything that goes
-/// wrong after that (a toolchain that detects but will not build, a probe that vanishes
-/// from the corpus) is a real failure and panics.
-///
-/// Returns `false` only when the operator opted into skipping; otherwise
-/// [`common::refuse`] panics.
 fn can_run(verifies: &str) -> bool {
     common::require_cc(verifies)
 }
 
 /// A failure that arrived after [`can_run`] said the machine was capable.
-///
-/// Not a skip: a compiler is present, so whatever went wrong here is chard's.
 fn cannot_run(reason: &str) -> ! {
-    panic!(
-        "cannot drive the measurement loop ({reason}).\n\nA C compiler is present — \
-         `can_run` checked — so this is a real failure, not an unrunnable machine."
-    );
+    panic!("cannot drive the measurement loop ({reason}) with a C compiler present");
 }
 
 fn profile_with_flags(cflags: &[&str]) -> Profile {
@@ -71,11 +58,6 @@ fn bare_profile() -> Profile {
 
 /// Stand up a work directory, toolchain and driver for one probe, and hand them to a
 /// closure.
-///
-/// The setup is a dozen lines that every test here needs and that no test is about, and
-/// the borrows make it awkward to return: `Driver` holds the toolchain and the work
-/// directory, and the work directory deletes itself on drop. A closure keeps all three
-/// alive for exactly as long as the body needs them.
 fn with_bench<T>(
     probe_id: &str,
     tag: &str,
@@ -90,6 +72,22 @@ fn with_bench<T>(
 /// for the host's `cc` itself.
 fn with_bench_on<T>(
     wrapper: Option<&str>,
+    probe_id: &str,
+    tag: &str,
+    profile: &Profile,
+    body: impl FnOnce(&Driver<'_>, &'static probe::Probe, &Conditions<'_>) -> T,
+) -> T {
+    with_bench_as(wrapper, None, true, probe_id, tag, profile, body)
+}
+
+/// [`with_bench_on`] with the execution mode the operator would assert (`None` leaves it
+/// to what chard observes) and with or without the run's witness. A run without one is
+/// what a macOS run is (`measure::Driver::witness`), stood up here on any host so that
+/// what the loop does with an artifact the reader refused, there, has a live reading.
+fn with_bench_as<T>(
+    wrapper: Option<&str>,
+    execution: Option<env::ExecutionMode>,
+    witnessed: bool,
     probe_id: &str,
     tag: &str,
     profile: &Profile,
@@ -117,7 +115,7 @@ fn with_bench_on<T>(
         Ok(t) => t,
         Err(e) => cannot_run(&format!("no usable C toolchain: {e}")),
     };
-    let environment = env::detect(toolchain.headers_dump(), None, None, None)
+    let environment = env::detect(toolchain.headers_dump(), execution, None, None)
         .expect("no attestation was supplied, so classification cannot fail");
 
     std::fs::write(
@@ -140,13 +138,147 @@ fn with_bench_on<T>(
         target_arch: &target_arch,
         profile_is_clean: Conditions::profile_is_clean(profile),
     };
+    let witness = chard::compile::RunWitness::derived_in(["measurement-loop"], work.dir())
+        .expect("writing the run-witness header");
     let driver = Driver {
         toolchain: &toolchain,
         workdir: work.dir(),
         timeout: Duration::from_secs(60),
         structured: None,
+        witness: witnessed.then_some(&witness),
     };
     body(&driver, probe, &conditions)
+}
+
+/// The real driver builds everything, and where it linked an executable the wrapper moves
+/// it aside and writes a shell script that execs it in its place, so the probe runs as
+/// built while chard's reader refuses the artifact it is handed.
+const SCRIPT_IN_PLACE_OF_THE_EXECUTABLE: &str = r#"out=""; link=1; prev=""
+for a in "$@"; do
+  case "$a" in -c|-S|-E|-fsyntax-only|-shared|-M|-MM|-dM) link=0;; esac
+  [ "$prev" = "-o" ] && out="$a"
+  case "$a" in -o?*) out="${a#-o}";; esac
+  prev="$a"
+done
+"$REAL" "$@" || exit $?
+if [ "$link" = 1 ] && [ -n "$out" ] && [ "$out" != "-" ] && [ -f "$out" ]; then
+  mv "$out" "$out.real"
+  printf '#!/bin/sh\nLINE\nexec "%s" "$@"\n' "$(realpath "$out.real")" > "$out"
+  chmod +x "$out"
+fi
+exit 0"#;
+
+/// A probe's observations over builds whose executable is a script the reader refuses
+/// ([`SCRIPT_IN_PLACE_OF_THE_EXECUTABLE`], the script running `line` before the probe), on
+/// a run with no witness and the kernel asserted the host's, so a `needs_vm` check reaches
+/// its run.
+fn over_a_refused_record(probe_id: &str, tag: &str, line: &str) -> Vec<report::Observation> {
+    let script = SCRIPT_IN_PLACE_OF_THE_EXECUTABLE.replace("LINE", line);
+    with_bench_as(
+        Some(&script),
+        Some(env::ExecutionMode::Host),
+        false,
+        probe_id,
+        tag,
+        &bare_profile(),
+        |driver, probe, conditions| measure::run_probe(driver, probe, conditions).observations,
+    )
+}
+
+/// What a check's run reading rests on, by the check's id.
+fn run_basis(check: &str) -> Option<probe::RunBasis> {
+    probe::CORPUS
+        .iter()
+        .flat_map(|p| p.checks.iter())
+        .find(|c| c.id == check)
+        .and_then(probe::Check::run_basis)
+}
+
+#[test]
+fn a_machine_reading_over_a_refused_artifact_is_withheld_on_a_run_without_a_witness() {
+    if !can_run("that an artifact the reader refuses withholds a machine reading") {
+        return;
+    }
+    let (mut machine, mut program) = (0, 0);
+    for probe_id in ["stack-clash", "stack-exec-runtime", "ub-null-check"] {
+        for o in over_a_refused_record(probe_id, &format!("refused-{probe_id}"), ":") {
+            let rule = o.gating.as_ref().map(|g| g.rule.id);
+            assert_ne!(
+                rule,
+                Some("artifact-lacks-run-witness"),
+                "{}: a run with no witness withheld for one",
+                o.check
+            );
+            match run_basis(&o.check) {
+                Some(probe::RunBasis::Machine) => {
+                    machine += 1;
+                    assert_eq!(o.verdict, Verdict::Indeterminate, "{}", o.check);
+                    assert_eq!(rule, Some("run-under-emulation"), "{}", o.check);
+                    let reason = &o.gating.as_ref().expect("a gating").reason;
+                    assert!(
+                        reason.contains("the reader refused it")
+                            && reason.contains("not an ELF file"),
+                        "{}: the reason quotes the reader's refusal: {reason}",
+                        o.check
+                    );
+                }
+                Some(probe::RunBasis::Program) => {
+                    program += 1;
+                    assert_ne!(rule, Some("run-under-emulation"), "{}", o.check);
+                }
+                None => {}
+            }
+        }
+    }
+    assert!(
+        machine >= 2 && program >= 1,
+        "{machine} machine reading(s) and {program} program reading(s) over refused records"
+    );
+}
+
+#[test]
+fn a_translation_line_off_macos_settles_nothing_on_a_run_without_a_witness() {
+    if !can_run("that a translation line off macOS settles nothing") {
+        return;
+    }
+    if cfg!(target_os = "macos") {
+        common::capability_gap(
+            "a translation line off macOS",
+            "this host is macOS, where the line is the instrument and settles the reading",
+        );
+        return;
+    }
+    let mut machine = 0;
+    for probe_id in ["stack-clash", "stack-exec-runtime"] {
+        let line = r#"echo "CHARD-TRANSLATION 0""#;
+        for o in over_a_refused_record(probe_id, &format!("translation-{probe_id}"), line) {
+            if run_basis(&o.check) != Some(probe::RunBasis::Machine) {
+                continue;
+            }
+            let opens_with_the_line = o
+                .run
+                .as_ref()
+                .is_some_and(|run| run.stdout.starts_with("CHARD-TRANSLATION 0"));
+            if !opens_with_the_line {
+                continue;
+            }
+            machine += 1;
+            assert_eq!(o.verdict, Verdict::Indeterminate, "{}", o.check);
+            let gating = o.gating.as_ref().expect("a gating");
+            assert_eq!(gating.rule.id, "run-under-emulation", "{}", o.check);
+            assert!(
+                gating.reason.contains("the reader refused it")
+                    && !gating.reason.contains("proc_translated"),
+                "{}: the reason without the line's clause: {}",
+                o.check,
+                gating.reason
+            );
+        }
+    }
+    assert!(
+        machine >= 1,
+        "no machine reading ran with the line in its stdout"
+    );
 }
 
 /// Measure one probe end to end, through the library, under a given profile.
@@ -164,25 +296,6 @@ fn run(probe_id: &str, tag: &str) -> Vec<report::Observation> {
     run_with(probe_id, tag, &bare_profile())
 }
 
-/// Every control arm that was built publishes what built it.
-///
-/// The triple is the trust mechanism, and a report that published only an arm's flags, a
-/// three-valued outcome and a prose excerpt, with the argv, exit status and artifact digest
-/// kept inside the harness, would ask to be believed about it. An `off` rests on the negative arm
-/// having demonstrated absence, so a reader who doubts that needs the arm's own build line, and
-/// `probe-invalid` is a verdict *about* the arms.
-///
-/// Publishing both arms grows a report, on the bare profile, from 203,645 to 254,040 bytes on
-/// Darwin with Apple clang 21, and under `openssf-tldr` from 409,308 to 499,419 bytes on
-/// Fedora 44 x86_64 with gcc 16.1.1, a little under a quarter in both. Retaining each arm's full
-/// `evidence` instead costs about two thirds again, which is why that stays on the withheld arms
-/// alone.
-///
-/// Asserted over the arms that were built rather than over all of them: an arm whose
-/// build never happened has nothing to publish, and `outcome: None` is how it says so.
-/// The probe is a `compiler-diag` one because that channel answers on every host chard
-/// runs on; the canary's arms are `elf-static` and produce nothing to examine where the
-/// compiler emits Mach-O.
 #[test]
 fn every_control_arm_that_was_built_publishes_what_built_it() {
     if !can_run("that every control arm publishes its own build record") {
@@ -205,8 +318,7 @@ fn every_control_arm_that_was_built_publishes_what_built_it() {
             }
             let build = arm.build.as_ref().unwrap_or_else(|| {
                 panic!(
-                    "{}'s {name} arm reported `{:?}` with no build record, so the outcome \
-                     cannot be checked against what produced it",
+                    "{}'s {name} arm reported `{:?}` with no build record",
                     obs.check, arm.outcome
                 )
             });
@@ -225,18 +337,6 @@ fn every_control_arm_that_was_built_publishes_what_built_it() {
     eprintln!("measurement_loop: {examined} control arm(s) carry the line that built them");
 }
 
-/// Every control arm publishes the flags that built it, and its build line agrees.
-///
-/// `controls.*.flags` is the field a reader uses to interpret an arm's `outcome`. It used
-/// to leave `decide` empty and be filled in afterwards by the loop, and an arm the loop
-/// forgot read as the clean build; the flags now arrive with the detection as a
-/// `report::ArmInput`. What is held here is what the loop publishes against what the
-/// corpus declares: the plain arms carry exactly the check's control lists, the regime
-/// arm carries the profile's flags followed by the arm the check declares, and every flag an arm
-/// claims is in its build's argv or named in `dropped_flags`, the reconciliation the
-/// dropped-flag test performs for the profile. The compiler-diag probe answers on every
-/// host and floors the count; the canary supplies elf-static arms where the host emits
-/// ELF, and `auto-var-init` under a hardened profile supplies the regime arm.
 #[test]
 fn every_control_arm_publishes_the_flags_that_built_it() {
     if !can_run("that every control arm publishes the flags that built it") {
@@ -271,8 +371,7 @@ fn every_control_arm_publishes_the_flags_that_built_it() {
             );
             assert_eq!(
                 controls.negative.flags, check.negative,
-                "{}: the negative arm claims flags other than the declared control \
-                 (empty exactly when the clean build stood in)",
+                "{}: the negative arm claims flags other than the declared control",
                 obs.check
             );
             let mut arms = vec![
@@ -286,8 +385,7 @@ fn every_control_arm_publishes_the_flags_that_built_it() {
                 assert_eq!(
                     arm.flags,
                     measure::variant_flags(profile, probe.lang, declared),
-                    "{}: the regime arm claims flags other than the profile plus the \
-                     declared arm",
+                    "{}: the regime arm claims flags other than the profile plus the declared arm",
                     obs.check
                 );
                 regime_examined = regime_examined.saturating_add(1);
@@ -300,8 +398,7 @@ fn every_control_arm_publishes_the_flags_that_built_it() {
                 for flag in &arm.flags {
                     assert!(
                         build.argv.contains(flag) || build.dropped_flags.contains(flag),
-                        "{}'s {name} arm claims `{flag}` and its build neither passed it nor \
-                         names it dropped. argv={:?} dropped={:?}",
+                        "{}'s {name} arm claims `{flag}`, in neither argv={:?} nor dropped={:?}",
                         obs.check,
                         build.argv,
                         build.dropped_flags
@@ -332,16 +429,6 @@ fn every_control_arm_publishes_the_flags_that_built_it() {
     );
 }
 
-/// `zero-call-used-regs` owes a regime arm, and the arm reads `absent` under the guide's own
-/// flags.
-///
-/// The arm is the profile followed by `-fzero-call-used-regs=skip`, which wins last on the
-/// line; no profile flag is known to clear the registers by another route (the check's
-/// comment names the one measured not to), so under `-O2 -fzero-call-used-regs=used-gpr`,
-/// what `openssf-tldr` carries on x86_64 and aarch64, the arm is built, reads `absent`, and
-/// the verdict stays `on`. Under `bare` nothing is owed and no arm is built. The arm's
-/// withholding branch is `report::decide`'s and is held by its unit tests; no confounder is
-/// known to exercise it here.
 #[test]
 fn the_zero_call_used_regs_regime_arm_is_built_under_a_profile_and_reads_absent() {
     if !can_run(
@@ -414,17 +501,6 @@ fn the_zero_call_used_regs_regime_arm_is_built_under_a_profile_and_reads_absent(
     );
 }
 
-/// A verdict is only trusted when the controls discriminated, and the report says so.
-///
-/// The stack canary is the probe used because it is measurable through two channels on
-/// every toolchain chard supports, and because its controls are unambiguous:
-/// `-fstack-protector-all` must produce the observable and `-fno-stack-protector` must
-/// not. If those two ever stop disagreeing, no `off` from this check means anything.
-///
-/// Deliberately not asserted: which verdict this machine produces. That is a property of
-/// whoever packaged the compiler (Fedora's bare `cc` emits no canary, Ubuntu's does)
-/// and a test that pinned it would fail on a correctly-working chard measuring a
-/// different distribution.
 #[test]
 fn a_trusted_verdict_carries_controls_that_actually_discriminated() {
     if !can_run("that a trusted verdict rests on controls that actually discriminated") {
@@ -465,8 +541,7 @@ fn a_trusted_verdict_carries_controls_that_actually_discriminated() {
     }
 
     // Without this the test passes on a machine that produced no measurements at all,
-    // having verified nothing. The canary is measurable on every toolchain chard
-    // supports, so zero here is a harness fault rather than a distribution's choice.
+    // having verified nothing.
     if common::ELF_HOST {
         assert!(
             examined > 0,
@@ -480,13 +555,6 @@ fn a_trusted_verdict_carries_controls_that_actually_discriminated() {
     }
 }
 
-/// Every check handed in comes back, whatever happened to it.
-///
-/// The coverage block counts checks against observations, and a check that vanished
-/// mid-loop would shrink the numerator and the denominator together: an incomplete
-/// measurement that looks complete. Each check must produce exactly one observation,
-/// including the ones gated out, which is why `not-applicable` and `unsupported` are
-/// verdicts rather than omissions.
 #[test]
 fn every_check_handed_in_produces_exactly_one_observation() {
     if !can_run("that every check handed in comes back, so coverage cannot shrink silently") {
@@ -509,12 +577,6 @@ fn every_check_handed_in_produces_exactly_one_observation() {
     }
 }
 
-/// A check gated out by architecture or libc is reported, not dropped, and says why.
-///
-/// Unlike the invariants above, this one cannot guarantee a sample: whether anything is
-/// gated depends on the host's architecture and libc, and on x86_64 with glibc most
-/// probes gate nothing. So it asserts the property where it applies and says plainly
-/// that finding none is a valid outcome rather than a silent pass.
 #[test]
 fn a_gated_check_is_reported_with_its_reason() {
     if !can_run("that a gated check is reported with its reason rather than dropped") {
@@ -535,20 +597,6 @@ fn a_gated_check_is_reported_with_its_reason() {
     }
 }
 
-/// A flag the harness removes is named in the build that removed it.
-///
-/// `profile.cflags` records what the operator asked for. `LinkMode::conflicts_with` then
-/// removes what cannot coexist with the probe's output kind (`-pie` and its siblings against
-/// `-shared`). Unrecorded, that removal leaves the report naming a flag list some of its
-/// builds did not use, and a reader comparing `cflags` against `build.argv` cannot tell a
-/// deliberate resolution from a harness bug.
-///
-/// This is the sibling of an `extra_flags` that *appends* over a stated choice, as with
-/// `-fPIC`. Both are the same failure, a report naming a flag list it did not measure, which
-/// is the thing chard exists to detect, occurring in chard.
-///
-/// The assertion is the reconciliation, not the mechanism: everything in `cflags` either
-/// reached `argv` or is named in `dropped_flags`.
 #[test]
 fn a_flag_the_harness_drops_is_recorded_in_the_build_that_dropped_it() {
     if !can_run("that a dropped profile flag is named in the build record") {
@@ -569,8 +617,7 @@ fn a_flag_the_harness_drops_is_recorded_in_the_build_that_dropped_it() {
     .expect("writing the self-report header");
     std::fs::write(work.dir().join(probe.source_name), probe.source).expect("writing probe source");
 
-    // `-pie` cannot coexist with `-shared`, so the harness must drop it. `-O2` must
-    // survive, or the test would pass on a harness that dropped everything.
+    // `-pie` cannot coexist with `-shared`, so the harness must drop it.
     let profile = profile_with_flags(&["-pie", "-O2"]);
     let target_arch = toolchain
         .target_arch()
@@ -582,11 +629,14 @@ fn a_flag_the_harness_drops_is_recorded_in_the_build_that_dropped_it() {
         target_arch: &target_arch,
         profile_is_clean: Conditions::profile_is_clean(&profile),
     };
+    let witness = chard::compile::RunWitness::derived_in(["measurement-loop"], work.dir())
+        .expect("writing the run-witness header");
     let driver = Driver {
         toolchain: &toolchain,
         workdir: work.dir(),
         timeout: Duration::from_secs(60),
         structured: None,
+        witness: Some(&witness),
     };
 
     let observations = measure::run_probe(&driver, probe, &conditions).observations;
@@ -597,8 +647,7 @@ fn a_flag_the_harness_drops_is_recorded_in_the_build_that_dropped_it() {
 
     assert!(
         build.dropped_flags.iter().any(|f| f == "-pie"),
-        "`-pie` conflicts with `-shared` and was removed, but the build does not say so. \
-         cflags={:?} dropped={:?} argv={:?}",
+        "`-pie` beside `-shared` is not named dropped: cflags={:?} dropped={:?} argv={:?}",
         profile.cflags,
         build.dropped_flags,
         build.argv
@@ -614,30 +663,13 @@ fn a_flag_the_harness_drops_is_recorded_in_the_build_that_dropped_it() {
     for flag in &profile.cflags {
         assert!(
             build.argv.contains(flag) || build.dropped_flags.contains(flag),
-            "`{flag}` is in profile.cflags but reached neither the build nor dropped_flags, \
-             so the report names a flag list it did not measure. argv={:?} dropped={:?}",
+            "`{flag}` of profile.cflags is in neither argv={:?} nor dropped={:?}",
             build.argv,
             build.dropped_flags
         );
     }
 }
 
-/// A build the *profile* broke is labelled as such, and a build that succeeded is not
-/// labelled at all.
-///
-/// `build-failed` beside an `exit_status: 0` build record is a contradiction a reader
-/// cannot resolve, and `build-failed` with no reason at all leaves a bare failure in every
-/// cell, on Darwin twenty-three of them, whose single shared cause is reachable only by
-/// opening each build's stderr. The classifier itself is unit-tested;
-/// what is asserted here is that the loop attaches it, and attaches it only where the
-/// verdict says the build is why.
-///
-/// This arm returns before the first `driver.gather`, so no control is compiled for it.
-///
-/// On every channel: the compiler-diagnostic checks (`warn-all`, and `pic-shared-link`,
-/// whose regime arm the same refusal fails) read the measured build's stderr as their
-/// observable, and must withhold on a refused build rather than read it;
-/// `Variant::sufficient_for_measured` says why they are held to the profile too.
 #[test]
 fn a_profile_that_will_not_compile_names_itself_in_every_cell_it_broke() {
     if !can_run("that a build broken by the profile is labelled with the flag that broke it") {
@@ -693,15 +725,6 @@ fn a_profile_that_will_not_compile_names_itself_in_every_cell_it_broke() {
     }
 }
 
-/// The regime-matched control arm is built when, and only when, all three of its
-/// conditions hold.
-///
-/// The arm re-runs the negative control on top of the profile, to establish that a
-/// runtime signal seen in the measured build is attributable to the flag rather than to
-/// the regime around it: `-fstack-protector-strong` makes uninitialized locals read as
-/// zero, which is also what `-ftrivial-auto-var-init=zero` produces. Building it when it
-/// is not wanted costs a compile and a run per check; not building it when it is wanted
-/// removes the only constraint standing between a regime artefact and a published `on`.
 #[test]
 fn the_regime_control_is_built_exactly_when_all_three_conditions_hold() {
     if !can_run("that the regime-matched control arm is built exactly when it is wanted") {
@@ -728,8 +751,7 @@ fn the_regime_control_is_built_exactly_when_all_three_conditions_hold() {
     }
     assert!(
         required > 0,
-        "no check in this probe still requires a regime control, so this test asserts \
-         nothing — the corpus has moved"
+        "no check in this probe requires a regime control, so this test asserts nothing"
     );
 
     // The same checks under a clean profile: the arm would duplicate the profile-free
@@ -758,17 +780,6 @@ fn the_regime_control_is_built_exactly_when_all_three_conditions_hold() {
     }
 }
 
-/// A macro the flag list defined itself measures the flag list, and is withheld.
-///
-/// The control triple cannot catch this and is not failing when it happens: forced on
-/// shows the macro, forced off does not, so the detector is demonstrably working. What
-/// the triple establishes is that chard can *see* the macro, not that the compiler is
-/// the one that set it. `-D__SSP_STRONG__=3` in a supplied flag list satisfies every
-/// control and publishes `on (strong)` over a binary with no canary, the false `on`
-/// `THREAT_MODEL.md` defends against first.
-///
-/// Host-independent: the profile forces the macro, so what the machine's own `cc` defines
-/// does not enter into it.
 #[test]
 fn a_macro_the_flag_list_forged_is_withheld_rather_than_published() {
     if !can_run("that a macro supplied by the flag list is not published as the compiler's") {
@@ -814,23 +825,6 @@ fn a_macro_the_flag_list_forged_is_withheld_rather_than_published() {
     );
 }
 
-/// A `_FORTIFY_SOURCE` request above the guide's `3` is `on` at its own number, end to end.
-///
-/// Under the one shared ranking table `4` was a word the table lacked, so it fell to string
-/// equality against `3` and the cell read `partial`: a request above the ask graded as
-/// below it. The scale is numeric now (`probe::FORTIFY_LEVELS`), so the request reads `on`
-/// with level `4`, and `fortify-effective` beside it reports what the C library settled,
-/// which is the check that says whether `4` bought anything.
-///
-/// The profile defines `_FORTIFY_SOURCE` itself and is still measured rather than
-/// withheld as `macro-supplied-by-profile`: `spoofed_macros` matches only the macros the
-/// compiler defines (`__SSP_STRONG__`, `__USE_FORTIFY_LEVEL`, `__PIE__` and their kin),
-/// and `_FORTIFY_SOURCE` is the operator's own request, which is what this check reads.
-///
-/// Host-independent on the request: the macro channel answers on every host chard runs on.
-/// The effective level is asserted only as a word on the same scale, because Apple's
-/// `<secure/_common.h>` clamps it at `2`, glibc settles `3`, and a musl without
-/// fortify-headers declines the request altogether.
 #[test]
 fn a_fortify_request_above_the_guide_reads_on_at_its_own_number() {
     if !can_run("that a fortify request above the guide's level is on at its own number") {
@@ -899,21 +893,12 @@ fn a_fortify_request_above_the_guide_reads_on_at_its_own_number() {
     );
 }
 
-/// An observation carries the macros its own channel reads, and no others.
-///
-/// The evidence is what a reader reproduces a verdict from, so a macro-channel
-/// observation has to carry the macro state and an elf-static one must not: attaching the
-/// dump to every observation would put a hundred irrelevant macros beside a verdict taken
-/// from a program header, and dropping it from the macro ones leaves a verdict its own
-/// evidence cannot support.
 #[test]
 fn an_observation_carries_the_evidence_its_channel_was_read_from() {
     if !can_run("that an observation's evidence matches the channel its verdict came from") {
         return;
     }
-    // Only observations that reached the end of `run_check` have evidence to carry. A
-    // check gated as inapplicable (`gcs-macro` on x86_64) returns before the controls
-    // are attached, and `controls` is the field that says which of the two happened.
+    // Only observations that reached the end of `run_check` have evidence to carry.
     let mut macro_checks = 0;
     for observation in run("toolchain-macros", "evidence-macro") {
         if observation.controls.is_none() {
@@ -922,8 +907,7 @@ fn an_observation_carries_the_evidence_its_channel_was_read_from() {
         macro_checks += 1;
         assert!(
             observation.evidence.macros.is_some(),
-            "{}: a macro-channel verdict with no macros in its evidence cannot be \
-             reproduced from it",
+            "{}: a macro-channel verdict with no macros in its evidence",
             observation.check
         );
     }
@@ -957,12 +941,6 @@ fn an_observation_carries_the_evidence_its_channel_was_read_from() {
     }
 }
 
-/// Every observation's build resolves in the store, a macro reading taken from the
-/// artifact is the filter over the `.chard.report` its stored facts carry, and no stored
-/// fact names the work directory.
-///
-/// There is one copy of the self-report, inside the stored `elf` entry, and what is held is the
-/// claim a reader re-derives from it: the inline macros are the published filter over it.
 #[test]
 fn every_observation_build_resolves_in_the_store_and_its_self_report_gives_its_macros() {
     if !can_run("that every observation's build has a store entry") {
@@ -1042,9 +1020,6 @@ fn every_observation_build_resolves_in_the_store_and_its_self_report_gives_its_m
 /// Every evaluated arm of a check that reads artifacts resolves in the store, counted: the
 /// arms the triple evaluated (`outcome` present) fed against the arms whose every
 /// reference resolved.
-///
-/// The arms are the part of a run a report can describe least. With their `ElfFacts`
-/// unpublished, and their macros published only where the triple withheld, an `off` would
 /// rest on a negative arm whose artifact the report does not describe. The wrapper
 /// turns `-fstack-protector-strong` into `-fno-stack-protector`, so `ssp-level`'s positive
 /// arm is silent and its triple withholds, and the count covers a withheld triple beside
@@ -1154,17 +1129,6 @@ exec "$REAL" "$@""#;
     );
 }
 
-/// Every macro and `elf-static` observation that built its triple publishes its measured
-/// reading, and every arm with an outcome publishes its own, counted: the readings the
-/// loop fed against the readings it published.
-///
-/// A reading that was only a sentence in `observed` or an arm's `detail` would leave an `off`
-/// resting on a negative arm whose reading nothing could replay.
-/// `decoded-reading-disagrees-with-facts` replays each one against the store; this
-/// holds the loop to publishing them on a real compiler. On a Mach-O host the
-/// `elf-static` checks return before their triple, so the count there is the macro
-/// channel's, and `cxx-stdlib-assertions` feeds its `elf-static` reading where the C++
-/// probe links an ELF artifact.
 #[test]
 fn every_predicate_reading_the_loop_took_is_published() {
     if !can_run("that every predicate reading a triple took is published as a value") {
@@ -1230,14 +1194,6 @@ fn every_predicate_reading_the_loop_took_is_published() {
     );
 }
 
-/// `gather` collects a macro dump only for a probe that has a macro-channel check, and
-/// prefers the compiled artifact's own report over a separate preprocessor job.
-///
-/// `-dM -E` is driven by `*cpp_options` and code generation by `*cc1_options`, so a spec
-/// file patching one and not the other makes them disagree; and the artifact is the side
-/// that decides what the code does. Reading the section is also what makes the swap
-/// visible: relabelling the source while assigning an empty map would report the stronger
-/// provenance over the weaker evidence.
 #[test]
 fn gather_reads_macros_only_where_a_check_needs_them_and_prefers_the_artifact() {
     if !can_run("that gather collects macros only where a check reads them") {
@@ -1263,8 +1219,7 @@ fn gather_reads_macros_only_where_a_check_needs_them_and_prefers_the_artifact() 
                 );
                 assert!(
                     !variant.macros.is_empty(),
-                    "the source was relabelled `compiled-artifact` over an empty map, so the \
-                 provenance claims more than the evidence carries"
+                    "the source was relabelled `compiled-artifact` over an empty map"
                 );
             } else {
                 common::capability_gap(
@@ -1291,14 +1246,6 @@ fn gather_reads_macros_only_where_a_check_needs_them_and_prefers_the_artifact() 
     );
 }
 
-/// A build that exits 0 and writes nothing leaves no artifact, and no fabricated reason
-/// for one.
-///
-/// `-fsyntax-only` is the honest way to reach it (a caller can ask for it through
-/// `--profile explicit`) and a wrapper that swallows `-o` is the hostile one. Both the
-/// ELF read and the run must be skipped: reaching for a file that is not there produces
-/// an `elf_error`, which reports a harness fault chard did not have and sends a reader
-/// looking for an unreadable artifact that was never written.
 #[test]
 fn a_build_that_produced_no_artifact_is_not_read_as_an_unreadable_one() {
     if !can_run("that a build producing no artifact is not reported as an unreadable one") {
@@ -1339,25 +1286,6 @@ fn a_build_that_produced_no_artifact_is_not_read_as_an_unreadable_one() {
 }
 
 /// One compiler stream measured under two work directories publishes one excerpt.
-///
-/// The decoder tests pin the cut against hand-built evidence; this one pins that a real
-/// measurement hands the detectors the directory the cut is made relative to. A gather
-/// path that dropped it, or built its variant without it, would cut the captured stream
-/// again, and the excerpt would move with `--workdir` (`probe::Evidence::published` has
-/// the fleet measurement that found it). The probe's own stream is under the excerpt
-/// budget once its paths are made relative, and the compiler is handed
-/// the source by its file name and quotes no work directory at all (`compile::build`);
-/// the wrapper appends lines naming the source by its absolute path, so every build of
-/// the probe is over budget whatever the directory, and the work directory is in the
-/// stream the cut is made from. Under directories that differ in length by 120 characters, the published
-/// `observed` strings and the positive arm's `detail` carry a cut marker and are
-/// byte-identical. Measured on 2026-10-01 on macOS arm64 with Apple clang: with
-/// `Driver::gather` handing the detectors no work directory, the test fails on the
-/// positive arm's `detail`, which then counts 3298 characters omitted under the shorter
-/// directory and 6697 under the longer. The counts include the temporary directories'
-/// paths, whose length differs between runs, so another run reads other figures; a
-/// review's run of the same break read 3323 and 6723. With the `detail` assertion also
-/// disabled, that review's run failed on `observed`, whose cut under the longer directory
 /// left a fragment of the directory's name that the byte-equality assertion catches and
 /// the `contains` check on the whole directory does not.
 #[test]
@@ -1409,7 +1337,7 @@ exit $status
         "the two work directories differ in length: {short_dir} {long_dir}"
     );
     assert!(!short.is_empty(), "the probe returned no observation");
-    let marker = chard::probe::CUT_MARKER;
+    let marker = probe::CUT_MARKER;
     for ((check, observed, detail), (_, long_observed, long_detail)) in short.iter().zip(&long) {
         assert!(
             detail.contains(marker),

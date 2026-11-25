@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier all: every crate in every repository.
+rust.unsafe_code = "deny"                      # a site that needs unsafe carries #[expect(unsafe_code, reason)] and is on the unsafe allowlist
+rust.unsafe_op_in_unsafe_fn = "deny"           # warn-only on edition 2024; deny for 2021 crates too
+rust.unused = { level = "deny", priority = -1 }
+rust.unfulfilled_lint_expectations = "deny"    # a stale #[expect] breaks the gate
+rust.unused_qualifications = "deny"
+rust.unused_lifetimes = "deny"
+rust.redundant_lifetimes = "deny"
+rust.unit_bindings = "deny"
+rust.ambiguous_negative_literals = "deny"
+rust.macro_use_extern_crate = "deny"
+clippy.all = { level = "deny", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }  # fatal in the gate under -D warnings; warn so a local build still links
+clippy.unwrap_used = "deny"
+clippy.expect_used = "deny"
+clippy.panic = "deny"
+clippy.unreachable = "deny"
+clippy.todo = "deny"
+clippy.unimplemented = "deny"
+clippy.indexing_slicing = "deny"
+clippy.string_slice = "deny"
+clippy.panic_in_result_fn = "deny"
+clippy.missing_assert_message = "deny"         # ignores test functions by design
+clippy.fallible_impl_from = "deny"             # nursery; a From that can panic is a TryFrom
+clippy.unused_result_ok = "deny"
+clippy.let_underscore_must_use = "deny"
+clippy.map_err_ignore = "deny"
+clippy.mem_forget = "deny"
+clippy.dbg_macro = "deny"
+clippy.rest_pat_in_fully_bound_structs = "deny"
+clippy.wildcard_dependencies = "deny"
+clippy.incompatible_msrv = "deny"
+clippy.lint_groups_priority = "deny"
+clippy.allow_attributes = "deny"               # outer #[allow] becomes #[expect]; inner #![allow] is the gate's job
+clippy.allow_attributes_without_reason = "deny"
+clippy.let_underscore_untyped = "deny"         # restriction; `let _: T = ..` names what is dropped
+clippy.ignore_without_reason = "deny"          # an #[ignore] says why
+cargo.unused_dependencies = "deny"             # cargo's own lint, stable since 1.100; never flags dev-dependencies; older cargo warns "unused manifest key" and enforces nothing

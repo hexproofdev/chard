@@ -2,37 +2,10 @@
 //! The structured compiler-diagnostics decoder over arbitrary text: `structured::decode`
 //! reads the SARIF document a side build under `--structured-diagnostics` prints on stderr,
 //! and `structured::severity_of` and `structured::compare` turn its findings into the
-//! readings and outcomes a report publishes. The stderr is the compiler's (THREAT_MODEL.md,
+//! readings and outcomes a report publishes. The stderr is the compiler's (`THREAT_MODEL.md`,
 //! "The operator chose the toolchain"), so a failure here is a defect in chard's reader and
 //! not an attack; but a decoder that reads a document other than the one the compiler wrote
-//! publishes a comparison of the prose decoder against something no compiler said.
-//!
-//! The input is the stderr: the bytes decoded as UTF-8 lossily, as `compile` reads a
-//! build's stderr. Held for every input:
-//!
-//! - `decode` returns without a panic, and returns the same reading twice;
-//! - the text around the document is not read. A line of text ahead of the input (clang's
-//!   unstable-format warning) leaves the reading exactly as it was, a refusal's sentence
-//!   included; and where the input decodes, text after it (clang's `N error generated.`)
-//!   leaves the findings as they were, since the document is the first value and it closed;
-//! - the findings are what the document says: written back as a document of one run whose
-//!   results carry each finding's level and message, in order, they decode to themselves;
-//! - `severity_of` answers in the vocabulary the comparison publishes (`error`, `warning`,
-//!   `note`, `none`; any other level reads as `warning`), with the level of the first finding
-//!   whose message carries a needle, case folded by `to_lowercase`; answers `None` exactly
-//!   when none does; and answers for a needle taken from a finding's own message;
-//! - `compare`, for every prose reading the prose decoder gives and none, publishes a
-//!   structured reading in `STRUCTURED_READINGS` and an outcome in `OUTCOMES`: `undecodable`
-//!   with the reason where the stream did not decode, otherwise `agree` exactly when the two
-//!   readings are the same word, the structured one being `severity_of`'s or `absent`.
-//!
-//! The comparison against the authoritative prose decoder, which is `pub(crate)` and not
-//! reached from here, is the seeds' part: `seed.rs` writes every stderr of
-//! `tests/fixtures/detectors.json` that carries a `runs` key and holds each to decode to at
-//! least one finding with a level SARIF names, since each is a document a real gcc or clang
-//! printed and the decoder's reading of a real one is what `--structured-diagnostics`
-//! publishes. The tracked seeds under `seeds/structured_diag/` are two of them and the shapes
-//! `structured.rs`'s unit tests use.
+//! publishes a comparison against something no compiler said.
 
 #![no_main]
 
@@ -72,6 +45,10 @@ fn needle_of(message: &str) -> String {
         .collect()
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn check_severity(findings: &[Finding], needles: &[&str]) {
     let read = severity_of(findings, needles);
     assert_eq!(
@@ -84,8 +61,6 @@ fn check_severity(findings: &[Finding], needles: &[&str]) {
             SEVERITIES.contains(&level),
             "severity_of answered {level:?}"
         );
-        // The first finding carrying a needle answers, its level in the four words, every
-        // level SARIF does not name read as `warning`.
         let first = findings
             .iter()
             .find(|f| {
@@ -144,7 +119,8 @@ fn check_compare(capture: &Capture, needles: &[&str]) {
             Err(reason) => {
                 assert_eq!(
                     (arm.structured, arm.outcome),
-                    ("undecodable", "undecodable")
+                    ("undecodable", "undecodable"),
+                    "an undecodable capture's arm"
                 );
                 assert_eq!(arm.reason.as_deref(), Some(reason.as_str()), "the reason");
             }
@@ -156,7 +132,13 @@ fn check_compare(capture: &Capture, needles: &[&str]) {
                     "compare's structured reading is not severity_of's"
                 );
                 let agree = arm.prose == arm.structured;
-                assert_eq!(arm.outcome, if agree { "agree" } else { "disagree" });
+                assert_eq!(
+                    arm.outcome,
+                    if agree { "agree" } else { "disagree" },
+                    "the outcome of prose {:?} and structured {:?}",
+                    arm.prose,
+                    arm.structured
+                );
             }
         }
     }
@@ -203,6 +185,10 @@ fuzz_target!(|data: &[u8]| {
     check_severity(&findings, &needles);
     check_severity(&findings, &[]);
 
+    #[expect(
+        clippy::expect_used,
+        reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+    )]
     let capture = Capture {
         flag: structured::format_flag(chard::toolchain::Kind::Clang).expect("clang has one"),
         findings: read,

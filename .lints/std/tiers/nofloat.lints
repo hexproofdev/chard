@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier nofloat: crates that must be float-free.
+clippy.float_arithmetic = "deny"

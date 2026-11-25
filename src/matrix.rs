@@ -1,78 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Cross-tabulating many reports without pretending the distribution is the key.
-//!
-//! A table with one column per distribution encodes an assumption that is wrong
-//! often enough to matter: that the distribution is what explains the number. Every
-//! result this project has produced says otherwise.
-//!
-//! `-Werror=implicit-function-declaration` is an error under gcc 16 and a warning
-//! under gcc 13.3 — that is a **compiler version** boundary at GCC 14, and it has
-//! nothing to do with Fedora or Ubuntu. Ubuntu's clang gets PIE and nothing else
-//! while Ubuntu's gcc gets everything, so within one distribution the **compiler**
-//! explains more than the distribution does. The fortify rungs that separate level 2
-//! from level 1 read `unsupported` under Alpine's fortify-headers and are measurable
-//! under glibc, which is the **libc**. Fortify is inert without `-O` on every
-//! distribution alive, which is the **optimization level**. And the
-//! compiler-versus-build-system split is the **profile**.
-//!
-//! So the cell key is a tuple (distribution, release, compiler kind, compiler
-//! version, libc, architecture, profile, execution mode, what established that mode,
-//! and image), and this module joins on it. Reports are the atomic facts; a table is a
-//! view over them.
-//!
-//! ## Naming the axis that explains a flag
-//!
-//! Beyond tabulating, the interesting question is *which* variable accounts for a
-//! flag's variation. The test used here is deliberately strict: an axis explains a
-//! flag when every group of observations sharing that axis value agrees on the
-//! verdict. If `compiler_version` explains a flag, then all gcc-13 observations
-//! agree with each other and all gcc-16 observations agree with each other,
-//! whatever distribution or profile they came from.
-//!
-//! Several axes can explain the same flag when the inputs are too few to separate
-//! them — two reports differing in both distribution and compiler make those axes
-//! indistinguishable — so the explanation lists every axis that fits and the
-//! caller is told how many inputs it had. That is a real limitation of the data
-//! rather than an ambiguity to be resolved by picking one.
-//!
-//! ## Fitting is not explaining
-//!
-//! "Some axis partitions the observations consistently" is a weaker claim than "that
-//! axis causes the difference", and the finer the axis, the more cheaply it satisfies
-//! the first. `compiler_version` is the trap: it took a distinct value on almost
-//! every configuration in the LTS sweep, so it partitioned nearly everything, and
-//! reporting it made Ubuntu's *patched driver* look like upstream GCC behaviour.
-//!
-//! Two guards, both reusing the standard already applied to a single axis — that a
-//! group of one is an identifier while a group of many is a pattern:
-//!
-//! - [`Variance::confounded_with`] names axes whose partition these inputs cannot
-//!   separate from the explaining one, requiring two cross-links rather than one
-//!   before it will call them separable.
-//! - [`Variance::explained_by_combination`] reports a pair of axes when the pair
-//!   holds more agreeing observations in one group than any single axis manages.
-//!   That is what recovers `distro` × `compiler` — the actual mechanism — for the
-//!   flags Ubuntu patches into gcc.
-//!
-//! A pair is only offered when both its axes are separable from the single
-//! explanation. `-Werror=implicit-function-declaration` is why: it flips at GCC 14,
-//! `libc` is confounded with `compiler_version` because each release ships its own
-//! glibc, and `compiler` × `libc` scored better than `compiler_version` while being a
-//! restatement of it under the libc's name — which a reader would take to mean the C
-//! library decides whether an undeclared call is an error. An axis already reported as
-//! inseparable cannot contribute a genuinely different explanation, so it is excluded
-//! from the pair search, and that flag falls back to `compiler_version` with the
-//! confound stated.
-//!
-//! **What this still cannot express.** The axes are categorical, and some flags flip on
-//! an *ordered* threshold. The honest attribution for the flag above is "compiler
-//! version ≥ 14", and no partition of version strings says that. What the fields do
-//! convey is `explained_by: [compiler_version]` together with
-//! `confounded_with: {compiler_version: [libc]}` — the right axis, plus an explicit
-//! statement that these inputs cannot separate it from one that moves in lockstep.
-//! Recognising the boundary as a threshold, rather than as an unordered partition,
-//! still requires knowing that it is one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,9 +8,9 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 
-/// `chard_schema` in a matrix: the major version of `schema/chard-matrix.schema.json`. The rule
-/// the CLI's contract states holds from chard's first publication, and every shape is `1` there.
-pub const MATRIX_SCHEMA_VERSION: &str = "1";
+/// `chard_schema` in a matrix: the major version of `schema/chard-matrix.schema.json`, which
+/// changes under the rule the CLI's contract states.
+pub const MATRIX_SCHEMA_VERSION: &str = "2";
 
 /// The `execution_basis` of a report that carries no `mode_evidence.basis` (one written before
 /// the field existed), a word outside that field's enumeration so it never reads as a basis.
@@ -99,7 +27,11 @@ pub const AXES: &[&str] = &[
     "compiler",
     "compiler_version",
     "libc",
+    // The architecture the toolchain built for, `toolchain.target.arch` ([`arch_of`]).
     "arch",
+    // The machine the run had, beside the architecture: one image's toolchain on two machines of
+    // one architecture (an Oracle Cloud A1 and an A2) answers the runtime checks differently.
+    "machine",
     "profile",
     "execution",
     // Beside the mode it qualifies: `host` on the default and an asserted `host` are two inputs.
@@ -116,26 +48,18 @@ pub struct CellKey {
     pub compiler: String,
     pub compiler_version: String,
     pub libc: String,
+    /// The architecture every arch-gated decision was taken under, `toolchain.target.arch`,
+    /// marked [`CONTRADICTED`] where the report's own witnesses disagree with it (`arch_of`).
     pub arch: String,
+    /// The machine the run had, `env::machine_of` over the report: what names its CPU, then
+    /// the features that gate a mechanism (`features:bti,paca,pacg`), `unread` where the report
+    /// carries no `environment.cpu`.
+    pub machine: String,
     pub profile: String,
     pub execution: String,
     /// `environment.execution.mode_evidence.basis`: what established `execution`.
-    ///
-    /// Without it a report on the default (`host` on `assumed-host`) and an asserted
-    /// `--execution host` report of one configuration collide into one cell, though the default
-    /// withholds the checks that declare `needs_vm` where the assertion measures them, and the
-    /// two differ in `run.inputs_sha256`. [`UNPUBLISHED_BASIS`] for a report that carries none:
-    /// read as an empty string, which `axes` and the label skip, such a report beside one with a
-    /// basis would be a second cell no label told apart.
     pub execution_basis: String,
     /// The image the measurement ran in.
-    ///
-    /// Without it two Gentoo portage profiles collide into one cell, and the flag they disagree
-    /// about comes back `varies: false`, "the same everywhere in this input set", while three of
-    /// six inputs say `off`. Treating them as one configuration measured twice, a
-    /// reproducibility check, does not apply: these are two specimens, and a key without the
-    /// field that distinguishes them cannot tell. Two reports of one key are refused, or the
-    /// later replaces the cell whole ([`Repeated`]).
     pub image: String,
 }
 
@@ -148,6 +72,7 @@ impl CellKey {
             "compiler_version" => &self.compiler_version,
             "libc" => &self.libc,
             "arch" => &self.arch,
+            "machine" => &self.machine,
             "profile" => &self.profile,
             "execution" => &self.execution,
             "execution_basis" => &self.execution_basis,
@@ -197,6 +122,61 @@ fn text(v: &Value, path: &[&str]) -> String {
     cur.as_str().unwrap_or("").to_owned()
 }
 
+/// The `arch` axis of a report, for a matrix cell and a table column alike:
+/// `toolchain.target.arch`, the architecture every arch-gated decision was taken under, with
+/// [`CONTRADICTED`] appended where one of the report's own witnesses of the target disagrees
+/// with it, and empty where the report carries none. Uncontradicted means no witness in the
+/// report names another, not that one corroborates it.
+pub(crate) fn arch_of(report: &Value) -> String {
+    let arch = text(report, &["toolchain", "target", "arch"]);
+    // `profile_macros_cxx` is left out: it witnesses the C++ probes alone, so a run whose C
+    // probes were built for `arch` is not contradicted by it, and a C++ check its `disagrees`
+    // withheld is caught by the gating rule below.
+    let disagrees = [
+        &["agreement"][..],
+        &["abi", "agreement"],
+        &["macros", "agreement"],
+        &["profile_macros", "agreement"],
+    ]
+    .iter()
+    .any(|path| {
+        let mut full = vec!["toolchain", "target"];
+        full.extend_from_slice(path);
+        text(report, &full) == "disagrees"
+    });
+    // The gate's own word: a check withheld because a witness contradicted the target.
+    let withheld = report
+        .get("observations")
+        .and_then(Value::as_array)
+        .is_some_and(|observations| {
+            observations.iter().any(|o| {
+                o.get("gating")
+                    .and_then(|g| g.get("rule"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|rule| CONTRADICTING_RULES.contains(&rule))
+            })
+        });
+    let contradicted = disagrees || withheld;
+    if contradicted && !arch.is_empty() {
+        format!("{arch}{CONTRADICTED}")
+    } else {
+        arch
+    }
+}
+
+/// Appended to an `arch` its own report contradicts: a `disagrees` under `toolchain.target`'s
+/// `agreement`, `abi.agreement`, `macros.agreement` or `profile_macros.agreement`, or an
+/// observation withheld under a rule of `CONTRADICTING_RULES`. A `gcc` wrapper adding
+/// `-m32` answers `-dumpmachine` with `x86_64-redhat-linux` while its macro dump defines
+/// `__i386__`; one answering `sparc64-linux-gnu` built x86_64 artifacts, every witness read
+/// `unmapped`, and four checks were withheld (gcc 16.2.1, Fedora 44 x86_64). Keyed apart from
+/// the uncontradicted architecture, and never `known`.
+pub const CONTRADICTED: &str = " (contradicted)";
+
+/// The `gating.rule`s under which a check is withheld because the run's target was
+/// contradicted.
+const CONTRADICTING_RULES: [&str; 2] = ["target-arch-contradicted", "target-abi-contradicted"];
+
 /// The `libc` axis is `environment.libc.impl` and `version` run together, which is the
 /// spelling `env::Libc::tag` gives the libc half of `toolchain.id`; this one reads the
 /// parsed report, since a matrix is built from files, and `env.rs`'s unit test pins the
@@ -214,7 +194,8 @@ fn key_of(report: &Value) -> CellKey {
         } else {
             format!("{libc_impl}{libc_version}")
         },
-        arch: text(report, &["environment", "kernel", "arch"]),
+        arch: arch_of(report),
+        machine: crate::env::machine_of(report),
         profile: text(report, &["profile", "id"]),
         execution: text(report, &["environment", "execution", "mode"]),
         execution_basis: match text(
@@ -238,43 +219,12 @@ fn ownership_of(report: &Value) -> String {
 }
 
 /// A cell of the cross-tabulation: one configuration, and what it measured.
-///
-/// ## Why there is no `representative` field
-///
-/// Not every point in the axis cross-product describes a real consumer. Ubuntu can build musl
-/// programs — the packages exist — but essentially nothing in the archive is built that way, so an
-/// (ubuntu, musl) cell is an artifact of what was installable rather than a configuration anyone
-/// ships. A `representative` flag saying so would need a source for that judgement, and the two
-/// at hand both fail.
-///
-/// A hand-maintained table of distribution ids mapped to libc names has the two failure modes a
-/// table has: it goes out of date, so a distribution in this project's own dataset and absent
-/// from the table reads `representative: true` with no note, right by luck; and it answers from
-/// a *list* rather than from the specimen, so it cannot tell a distribution's own compiler from
-/// one installed over it.
-///
-/// What the package manager says owns the invoked driver has the right shape, but chard asks
-/// package managers nothing, by design. Every cell would read `representative: false` with a
-/// note about a query this tool does not perform, on every matrix, for every reader.
-///
-/// A third answer would need a third source of evidence, and there is none in a report: the
-/// question is about the archive a compiler came from, and chard reads artifacts it built. It is
-/// answerable, but from the distribution's package metadata rather than from here. So the cell
-/// states what was measured, and whether that configuration is one anyone ships is left to a
-/// reader who has `key` in front of them.
 #[derive(Debug, Clone, Serialize)]
 pub struct Cell {
     pub key: CellKey,
     pub label: String,
     /// `environment.kernel.ownership`: whose kernel the cell's run had (`own`, `borrowed`,
     /// `unsettled`), or [`UNPUBLISHED_OWNERSHIP`].
-    ///
-    /// Beside the key, not in it: the word is a function of `execution` and
-    /// `execution_basis`, which `report::reread_contradictions` holds it to before a report
-    /// reaches here, so as an axis it would split no cell and vary only where they do, and
-    /// as a key field a report without it would be a second cell under the same label.
-    /// A cell holds one report ([`Repeated`]), so it is that report's word, or
-    /// [`UNPUBLISHED_OWNERSHIP`] where the report publishes none.
     pub kernel_ownership: String,
     /// flag -> verdict, with the level appended where a graded mechanism has one.
     pub flags: BTreeMap<String, String>,
@@ -283,15 +233,16 @@ pub struct Cell {
     /// without it reads the wrong way round; `table` inverts such a row and its legend
     /// says so, and here the word stands beside the verdict instead.
     pub polarity: BTreeMap<String, String>,
+    /// flag -> the observation's `gating.rule`, for every flag in `flags` whose observation
+    /// carries one: why a verdict is `unsupported`, `not-applicable` or a withheld
+    /// `indeterminate`. A `?` the machine could not answer (`machine-lacks-bti`) and one the
+    /// toolchain's run left unread read alike without it. Absent where no flag carries one.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub gating: BTreeMap<String, String>,
 }
 
 /// Whether `fine` is a refinement of `coarse` by construction rather than by
 /// accident of the input set.
-///
-/// A compiler version belongs to exactly one compiler, and a release to exactly one
-/// distribution, in every possible input set. Reporting those as confounds would be
-/// true and useless, and — worse — would bury the confounds that are contingent and
-/// therefore fixable by measuring one more configuration.
 fn is_structural_refinement(fine: &str, coarse: &str) -> bool {
     matches!(
         (fine, coarse),
@@ -299,15 +250,60 @@ fn is_structural_refinement(fine: &str, coarse: &str) -> bool {
     )
 }
 
+/// Whether a change of `coarse` moves `fine` with it by construction: a compiler version is a
+/// version of one compiler, and a release one distribution's release, so a change of compiler or
+/// distribution is one change named at two levels of detail.
+fn moves_with(fine: &str, coarse: &str) -> bool {
+    matches!(
+        (fine, coarse),
+        ("compiler_version", "compiler") | ("release", "distro")
+    )
+}
+
+/// Whether an axis value says what the configuration had. An empty value (a field the report
+/// lacks; `image` aside, where empty is a run outside any image), `unread` (`machine` without
+/// `environment.cpu`), [`UNPUBLISHED_BASIS`], the libc `unknown` and an architecture its own
+/// witnesses contradict ([`CONTRADICTED`]) do not: two of them may name one value or two.
+fn known(axis: &str, value: &str) -> bool {
+    match value {
+        "" => axis == "image",
+        "unread" | "unknown" | UNPUBLISHED_BASIS => false,
+        v => !v.ends_with(CONTRADICTED),
+    }
+}
+
+/// Whether two configurations are a controlled comparison of `axis`: both name a [`known`]
+/// value of it and the values differ, and every other axis of the key is known and equal on
+/// both, or moves with `axis` ([`moves_with`]).
+fn controls(axis: &str, one: &CellKey, two: &CellKey) -> bool {
+    let (was, now) = (one.axis(axis), two.axis(axis));
+    known(axis, was)
+        && known(axis, now)
+        && was != now
+        && AXES.iter().all(|other| {
+            let held = one.axis(other);
+            *other == axis
+                || moves_with(other, axis)
+                || (held == two.axis(other) && known(other, held))
+        })
+}
+
+/// The value a cell groups under on `axis`: its value where [`known`], and otherwise one of
+/// its own (`index` is the cell's place), so two cells whose values are unknown never form a
+/// group: two `unread` machines, or two contradicted architectures, may be one or two. Nor is
+/// an axis consistent over a cell whose value is unknown ([`build_with`]): that cell may be of
+/// any group, one whose verdict differs among them.
+fn group_value(axis: &str, key: &CellKey, index: usize) -> String {
+    match key.axis(axis) {
+        value if known(axis, value) => value.to_owned(),
+        _ => format!("\u{1}unknown {index}"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Variance {
     pub varies: bool,
     /// How many configurations actually carried this flag, against how many are in the input set.
-    ///
-    /// Published because `varies` alone cannot distinguish "measured everywhere and identical" from
-    /// "measured in one place" or "measured nowhere", and the note asserted the first for all three.
-    /// A reader had to sum the `verdicts` lists and compare against `len(cells)` themselves, which
-    /// is exactly the arithmetic a gate must not leave to its reader.
     pub observed_in: usize,
     /// Configurations in the input set, so `observed_in` has a denominator beside it.
     pub of_configurations: usize,
@@ -316,44 +312,20 @@ pub struct Variance {
     /// Axes under which every group agrees. Empty when nothing explains it.
     pub explained_by: Vec<String>,
     /// `grouped` when at least one axis value covers two or more agreeing
-    /// observations; `controlled` when the axis is merely the only thing that
-    /// changed, which is weaker; `none` when nothing fits.
+    /// observations; `controlled` when no group has two members but two configurations that
+    /// read the flag differently compare the axis alone (`controls`: every other axis of the
+    /// key known and unchanged, but those that move with it), which is weaker; `none` when
+    /// nothing fits.
     pub strength: String,
-    /// Axes whose partition these inputs cannot separate from the explaining one,
-    /// because every value of the explainer occurs under exactly one value of the
-    /// other. Reported per explaining axis as `explainer -> [coarser axes]`.
-    ///
-    /// This is the vacuous-explanation problem one level subtler than the
-    /// one-report-per-distro case. `compiler_version` grouped two observations at a
-    /// time and partitioned `-fstack-protector-strong` perfectly, so it was reported
-    /// as the explanation — but every gcc version in the input set was unique to one
-    /// distribution (Ubuntu shipped 15.2.0, Fedora 15.2.1), which makes
-    /// "the compiler version explains it" indistinguishable from "the distribution's
-    /// patch explains it". A reader takes the former to mean upstream GCC behaviour,
-    /// which was the exact opposite of the truth.
-    ///
-    /// Separating them needs one observation pair sharing a compiler version across
-    /// two distributions. Such pairs do occur — clang 21.1.8 appeared on both Fedora
-    /// 43 and Ubuntu 26.04 — so this is a property of the input set, not a permanent
-    /// limit, and naming it is what tells a reader which configuration to add.
+    /// Axes whose partition these inputs cannot separate from the explaining one, because
+    /// fewer than two values of the explainer occur under more than one value of the other.
+    /// Reported per explaining axis as `explainer -> [coarser axes]`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub confounded_with: BTreeMap<String, Vec<String>>,
-    /// A pair of axes that explains the variation with a *coarser* partition than
-    /// any single axis manages.
-    ///
-    /// Needed because "some axis partitions the data consistently" and "that axis
-    /// causes the difference" are not the same claim, and the finer the axis the
-    /// more cheaply it satisfies the first. `-fstack-protector-strong` in the LTS
-    /// sweep is on for Ubuntu's gcc and off for all fifteen other configurations.
-    /// `compiler_version` partitions that perfectly across fifteen groups — but only
-    /// because Ubuntu happened to ship 15.2.0 where Fedora shipped 15.2.1. The pair
-    /// `distro` × `compiler` partitions it across eight, and is the actual mechanism:
-    /// Ubuntu patches its gcc driver.
-    ///
-    /// Coarseness is the tie-break because a partition with fewer, larger groups
-    /// survives more opportunities to be contradicted. It is the same standard as
-    /// `groups_something`, applied to the choice between competing explanations
-    /// rather than to a single one.
+    /// A pair of axes that explains the variation and holds a larger agreeing group than any
+    /// single explaining axis: the finer an axis, the more cheaply it partitions the data, and
+    /// a version string unique to each distribution fits where `distro` × `compiler`, a
+    /// distribution patching its compiler's driver, is the mechanism.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explained_by_combination: Option<Vec<String>>,
     pub note: String,
@@ -364,11 +336,9 @@ pub struct Matrix {
     pub chard_schema: String,
     /// Every axis and the distinct values seen for it.
     pub axes: BTreeMap<String, Vec<String>>,
-    /// Axes with exactly one value across the whole input set.
-    ///
-    /// Stated explicitly because they bound what the table can support: a matrix
-    /// where `arch` is invariant says nothing whatsoever about other
-    /// architectures, and a reader should not have to infer that from absence.
+    /// Axes with exactly one value across the whole input set, stated because they bound what
+    /// the table supports: a matrix where `arch` is invariant says nothing about other
+    /// architectures.
     pub invariant_axes: Vec<String>,
     pub varying_axes: Vec<String>,
     pub cells: Vec<Cell>,
@@ -379,8 +349,7 @@ pub struct Matrix {
 }
 
 fn verdict_of(report: &Value, flag: &str) -> Option<String> {
-    // One observation per flag: `probe::tests::every_check_has_a_distinct_flag` holds that,
-    // and it is the invariant that replaced `report::rollup`'s conflict path.
+    // One observation per flag: `probe::tests::every_check_has_a_distinct_flag` holds that.
     let cell = report
         .get("observations")?
         .as_array()?
@@ -393,6 +362,18 @@ fn verdict_of(report: &Value, flag: &str) -> Option<String> {
         }
         _ => verdict.to_owned(),
     })
+}
+
+/// The `gating.rule` of the observation of `flag`, the one [`verdict_of`] reads.
+fn gating_of<'a>(report: &'a Value, flag: &str) -> Option<&'a str> {
+    report
+        .get("observations")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("flag").and_then(Value::as_str) == Some(flag))?
+        .get("gating")?
+        .get("rule")?
+        .as_str()
 }
 
 /// The `polarity` of the observation of `flag`, the one [`verdict_of`] reads.
@@ -408,24 +389,15 @@ fn polarity_of<'a>(report: &'a Value, flag: &str) -> Option<&'a str> {
 
 /// What [`build_with`] does with a report of a configuration an earlier report in the set
 /// already holds: one whose every [`CellKey`] axis is the earlier one's.
-///
-/// Never a merge. Writing the later report's verdicts over the earlier's flag by flag lets a cell
-/// hold verdicts no one run measured together. Measured with gcc 16.1.1 on Fedora 44 x86_64: a
-/// full run, and a `--probe link-defaults` run through a wrapper adding `-no-pie` that keys
-/// alike, merged that way made one cell of 72 flags, the two the runs read differently as the
-/// wrapper run read them and the rest as the plain run did, and the disagreement, which is
-/// what measuring one configuration twice is for, went unreported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeated {
     /// Refuse the set, naming every report that repeats an earlier one and the first report
     /// of its configuration: `chard matrix` without `--replace-repeated`.
     Refuse,
-    /// The later report's cell replaces the earlier's whole (its verdicts, polarities, flags
-    /// and `kernel.ownership`, nothing of the earlier kept), under a warning that names both
-    /// reports, every flag both carry whose verdict or polarity differs, a differing
-    /// `kernel.ownership`, and every flag only one of the two carries: `chard matrix
-    /// --replace-repeated`. A third report of the configuration replaces the second's cell, and
-    /// its warning compares it with the second.
+    /// The later report's cell replaces the earlier's whole, nothing of the earlier kept, under
+    /// a warning that names both reports and everything the two read differently: `chard
+    /// matrix --replace-repeated`. A third report of the configuration replaces the second's
+    /// cell, and its warning compares it with the second.
     Replace,
 }
 
@@ -437,6 +409,8 @@ struct Held<'a> {
     verdicts: BTreeMap<String, String>,
     /// flag -> polarity, beside each verdict that carries one.
     polarity: BTreeMap<String, String>,
+    /// flag -> `gating.rule`, beside each verdict that carries one.
+    gating: BTreeMap<String, String>,
     /// Every flag the report carries, with a verdict or without.
     flags: BTreeSet<String>,
     ownership: String,
@@ -448,6 +422,7 @@ impl<'a> Held<'a> {
             name,
             verdicts: BTreeMap::new(),
             polarity: BTreeMap::new(),
+            gating: BTreeMap::new(),
             flags: BTreeSet::new(),
             ownership: ownership_of(report),
         };
@@ -461,6 +436,9 @@ impl<'a> Held<'a> {
                 if let Some(p) = polarity_of(report, flag) {
                     held.polarity.insert(flag.to_owned(), p.to_owned());
                 }
+                if let Some(rule) = gating_of(report, flag) {
+                    held.gating.insert(flag.to_owned(), rule.to_owned());
+                }
             }
         }
         held
@@ -469,9 +447,9 @@ impl<'a> Held<'a> {
 
 /// The warning [`Repeated::Replace`] writes where `now` replaces `was` as the `unit` (a
 /// matrix's cell, a table's column) of the configuration `described`: both reports, then every
-/// flag both carry whose verdict (or its absence) or polarity differs, the `kernel.ownership`
-/// words where they differ, every flag only `was` carried, which leaves the `unit` with it, and
-/// every flag only `now` carries, which joins it.
+/// flag both carry whose verdict (or its absence), polarity or gating rule differs, the
+/// `kernel.ownership` words where they differ, every flag only `was` carried, which leaves the
+/// `unit` with it, and every flag only `now` carries, which joins it.
 fn replacement(described: &str, unit: &str, was: &Held, now: &Held) -> String {
     let verdict = |held: &Held, flag: &str| {
         held.verdicts
@@ -483,14 +461,33 @@ fn replacement(described: &str, unit: &str, was: &Held, now: &Held) -> String {
         .intersection(&now.flags)
         .filter_map(|flag| {
             let polarity_moved = was.polarity.get(flag) != now.polarity.get(flag);
-            if was.verdicts.get(flag) == now.verdicts.get(flag) && !polarity_moved {
+            let gating_moved = was.gating.get(flag) != now.gating.get(flag);
+            if was.verdicts.get(flag) == now.verdicts.get(flag) && !polarity_moved && !gating_moved
+            {
                 return None;
             }
-            // The polarity is said where it moved, and only there.
-            let read = |held: &Held| match (polarity_moved, held.polarity.get(flag)) {
-                (false, _) => verdict(held, flag),
-                (true, Some(p)) => format!("{} with polarity {p}", verdict(held, flag)),
-                (true, None) => format!("{} with no polarity", verdict(held, flag)),
+            // The polarity and the gating rule are said where they moved, and only there.
+            let read = |held: &Held| {
+                let mut read = verdict(held, flag);
+                if polarity_moved {
+                    match held.polarity.get(flag) {
+                        Some(p) => {
+                            read.push_str(" with polarity ");
+                            read.push_str(p);
+                        }
+                        None => read.push_str(" with no polarity"),
+                    }
+                }
+                if gating_moved {
+                    match held.gating.get(flag) {
+                        Some(rule) => {
+                            read.push_str(" under gating.rule ");
+                            read.push_str(rule);
+                        }
+                        None => read.push_str(" under no gating rule"),
+                    }
+                }
+                read
             };
             Some(format!(
                 "`{flag}` {} in {} and {} in {}",
@@ -507,7 +504,7 @@ fn replacement(described: &str, unit: &str, was: &Held, now: &Held) -> String {
         now.name, was.name, was.name
     )];
     parts.push(if differ.is_empty() {
-        "The two read every flag both carry alike, verdict and polarity".to_owned()
+        "The two read every flag both carry alike, verdict, polarity and gating rule".to_owned()
     } else {
         format!(
             "{} flag(s) both carry read differently: {}",
@@ -584,16 +581,9 @@ pub fn build(reports: &[(String, Value)]) -> Result<Matrix> {
 ///
 /// Errors when a document is not a chard report, and under [`Repeated::Refuse`] when two
 /// reports are of one configuration: a [`crate::error::UserError`] naming every repeat.
-///
-/// # Panics
-///
-/// Where a cell's polarity map was not made beside its verdicts, which the loop that makes
-/// both rules out.
-#[allow(
+#[expect(
     clippy::too_many_lines,
-    reason = "one derivation: ingest, find the varying axes, then per flag decide which \
-              axis accounts for it. The axis analysis depends on the axis discovery that \
-              precedes it, and splitting them would hide that ordering."
+    reason = "one derivation: ingest, find the varying axes."
 )]
 pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Matrix> {
     if reports.is_empty() {
@@ -631,23 +621,17 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
                 AXES.join(", "),
                 repeats.join("\n  ")
             ),
-            "leave out all but one report of each configuration, or pass --replace-repeated \
-             to keep the later report's whole cell, with every flag the two read differently \
-             named in the matrix's warnings",
+            "leave out all but one report of each configuration, or pass --replace-repeated",
         )
         .into());
     }
 
     // The flags are those of the reports the cells hold, so a replaced report's leave with it.
     let flags: BTreeSet<String> = held.values().flat_map(|h| h.flags.clone()).collect();
-    let mut cells: BTreeMap<CellKey, BTreeMap<String, String>> = BTreeMap::new();
-    let mut polarities: BTreeMap<CellKey, BTreeMap<String, String>> = BTreeMap::new();
-    let mut ownership: BTreeMap<CellKey, String> = BTreeMap::new();
-    for (key, h) in held {
-        cells.insert(key.clone(), h.verdicts);
-        polarities.insert(key.clone(), h.polarity);
-        ownership.insert(key, h.ownership);
-    }
+    // Each cell's verdicts, read in place: the published cells are made from `held` itself at the
+    // end, so a cell's polarity, gating and ownership are its own report's by construction.
+    let cells: BTreeMap<&CellKey, &BTreeMap<String, String>> =
+        held.iter().map(|(key, h)| (key, &h.verdicts)).collect();
 
     // Which axes actually move.
     let mut axes: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -686,29 +670,27 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
         }
         let varies = verdicts.len() > 1;
 
-        // An axis explains the flag when every group sharing an axis value agrees
-        // AND the axis actually groups something.
-        //
-        // The second condition is not a nicety. An axis that takes a distinct value
-        // for every observation — one report per distribution, say — satisfies
-        // "every group agrees" vacuously, because every group has one member. It is
-        // then an identifier for the observation rather than an explanation of it,
-        // and reporting it would let a table claim the distribution explains a
-        // compiler-version boundary purely because the inputs happened to be one
-        // report per distribution.
+        // An axis explains the flag when every group sharing an axis value agrees AND the
+        // axis groups something: an axis with a distinct value per observation (one report
+        // per distribution, say) agrees vacuously, an identifier of the observation rather
+        // than an explanation of it.
         let mut explained_by = Vec::new();
         let mut vacuous = Vec::new();
         if varies {
             for axis in &varying {
-                let mut by_value: BTreeMap<&str, (BTreeSet<&String>, usize)> = BTreeMap::new();
-                for (key, got) in &cells {
+                let mut by_value: BTreeMap<String, (BTreeSet<&String>, usize)> = BTreeMap::new();
+                for (index, (key, got)) in cells.iter().enumerate() {
                     if let Some(v) = got.get(flag) {
-                        let slot = by_value.entry(key.axis(axis)).or_default();
+                        let slot = by_value.entry(group_value(axis, key, index)).or_default();
                         slot.0.insert(v);
                         slot.1 = slot.1.saturating_add(1);
                     }
                 }
-                let consistent = by_value.values().all(|(verdicts, _)| verdicts.len() == 1);
+                let unknown_member = cells
+                    .iter()
+                    .any(|(key, got)| got.contains_key(flag) && !known(axis, key.axis(axis)));
+                let consistent =
+                    !unknown_member && by_value.values().all(|(verdicts, _)| verdicts.len() == 1);
                 let groups_something = by_value.values().any(|(_, n)| *n >= 2);
                 if consistent && groups_something {
                     explained_by.push(axis.clone());
@@ -718,54 +700,52 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
             }
         }
 
-        // A vacuously-consistent axis is still the answer when it is the only thing
-        // that changed: two reports differing solely in libc are a controlled
-        // comparison, and the libc explains the difference even though neither
-        // group has two members. What must not happen is preferring such an axis
-        // when a genuinely grouping one exists — that is the one-report-per-distro
-        // trap. So grouping explanations win, and vacuous ones are the fallback,
-        // marked weaker.
+        // A vacuously consistent axis is the fallback, marked weaker, only where a grouping
+        // one is absent and it is the only thing that changed: some two configurations that
+        // read the flag differently compare that axis alone ([`controls`]).
+        let mut uncontrolled = Vec::new();
         let strength = if !explained_by.is_empty() {
             "grouped"
         } else if !vacuous.is_empty() {
-            explained_by.clone_from(&vacuous);
-            "controlled"
+            let carrying: Vec<(&CellKey, &String)> = cells
+                .iter()
+                .filter_map(|(key, got)| got.get(flag).map(|v| (*key, v)))
+                .collect();
+            for axis in vacuous {
+                let controlled = carrying.iter().enumerate().any(|(i, (a, va))| {
+                    carrying
+                        .iter()
+                        .skip(i.saturating_add(1))
+                        .any(|(b, vb)| va != vb && controls(&axis, a, b))
+                });
+                if controlled {
+                    explained_by.push(axis);
+                } else {
+                    uncontrolled.push(axis);
+                }
+            }
+            if explained_by.is_empty() {
+                "none"
+            } else {
+                "controlled"
+            }
         } else {
             "none"
         };
 
-        // For each explaining axis, which coarser axes it cannot be told apart from.
-        //
-        // `a` is nested in `b` when every value of `a` occurs under exactly one value
-        // of `b`. A nested axis induces a refinement of the coarser partition, so any
-        // pattern it appears to explain is equally consistent with the coarser axis
-        // explaining it, and the inputs contain no observation that could distinguish
-        // them. Identical partitions are mutually nested and reported both ways,
-        // which is correct: neither is preferable on this evidence.
+        // For each explaining axis, which coarser axes it cannot be told apart from: `a` is
+        // nested in `b` when every value of `a` occurs under exactly one value of `b`, and then
+        // any pattern `a` appears to explain is equally consistent with `b`.
         let mut confounded_with: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for axis in &explained_by {
+        for axis in explained_by.iter().chain(&uncontrolled) {
             let mut coarser = Vec::new();
             for other in &varying {
                 if other == axis || is_structural_refinement(axis, other) {
                     continue;
                 }
-                // Over the cells that carry this flag, and only those.
-                //
-                // This iterated every cell, while `explained_by` above counts only cells
-                // where `got.get(flag)` is `Some`. The two therefore ranged over
-                // different spans, and the wider one suppressed the warning: a report
-                // that does not carry the flag at all still contributed cross-links,
-                // pushing the count to the threshold and removing the coarser axis from
-                // `confounded_with`.
-                //
-                // Measured. Three reports carrying `-fPIE`, with distro nested inside
-                // compiler_version, report `confounded_with: {compiler_version:
-                // [distro, release], distro: [release, compiler_version]}`. Adding two
-                // reports that do not carry `-fPIE` leaves the verdicts byte-identical
-                // and `observed_in: 3` unchanged, and `confounded_with` disappears — the
-                // evidence about the flag did not move, only the span it was counted
-                // over. Evidence that cannot speak about a flag must not be allowed to
-                // vouch for what explains it.
+                // Over the cells that carry this flag, as `explained_by` is: a report that
+                // cannot speak about a flag adds no cross-link to vouch for what explains it
+                // (`cells_without_the_flag_do_not_dissolve_its_confound` holds it).
                 let mut companions: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
                 for (key, got) in &cells {
                     if !got.contains_key(flag) {
@@ -776,17 +756,8 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
                         .or_default()
                         .insert(key.axis(other));
                 }
-                // A cross-link is one value of `axis` observed under two values of
-                // `other` — the only kind of observation that can tell the two apart.
-                // Two are required, for the same reason `groups_something` requires a
-                // group of two: a single pair is an anecdote, not a pattern, and the
-                // module already refuses to treat one observation as evidence.
-                //
-                // This threshold is what catches the real case. Every gcc version in
-                // the sweep was unique to one distribution, and the sole cross-link
-                // was clang 21.1.8 on both Fedora 43 and Ubuntu 26.04 — one pair,
-                // sitting inside a single verdict group, so it says nothing about
-                // where the boundary comes from.
+                // A cross-link is one value of `axis` observed under two values of `other`,
+                // the only observation that tells the two apart.
                 let cross_links = companions.values().filter(|seen| seen.len() > 1).count();
                 if cross_links < 2 {
                     coarser.push(other.clone());
@@ -796,34 +767,25 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
                 confounded_with.insert(axis.clone(), coarser);
             }
         }
+        // A controlled axis was separated from every axis its witnessing pair held known and
+        // equal, which is each axis but those that move with it ([`controls`]): the nesting
+        // above is no confound there, and only a version beside its compiler, or a release
+        // beside its distribution, stays inseparable.
+        if strength == "controlled" {
+            for axis in &explained_by {
+                if let Some(coarser) = confounded_with.get_mut(axis) {
+                    coarser.retain(|other| moves_with(other, axis));
+                }
+            }
+            confounded_with.retain(|_, coarser| !coarser.is_empty());
+        }
 
-        // The coarsest explaining pair of axes, when it beats every single axis.
-        //
-        // Only pairs: a triple would almost always "explain" something by giving
-        // each observation its own group, which is the vacuity this whole section
-        // guards against, and the mechanisms chard actually models — a distribution
-        // patching one compiler — are two-factor.
-        // The measure of an explanation is the size of its largest agreeing group,
-        // not the number of groups it uses.
-        //
-        // Counting groups looked reasonable and was not: `compiler` × `libc`
-        // partitioned `-Werror=implicit-function-declaration` into fourteen groups
-        // where `compiler_version` needed fifteen, won by that one group, and thereby
-        // claimed the libc explains a GCC-14 language boundary. libc version is a
-        // proxy for the release, which is a proxy for the compiler version, so the
-        // margin was an artifact of the correlation rather than evidence.
-        //
-        // Largest-agreeing-group is the same standard `groups_something` already
-        // applies — a group of one is an identifier, a group of many is a pattern —
-        // extended to choosing between explanations. `distro` × `compiler` holds
-        // Ubuntu's four gcc releases in one agreeing group of four, where no single
-        // compiler version groups more than two observations, so it wins on evidence
-        // instead of on arithmetic.
+        // The explaining pair of axes, when it beats every single axis.
         let largest_group = |axes: &[&String]| -> usize {
             let mut sizes: BTreeMap<Vec<String>, usize> = BTreeMap::new();
-            for (key, got) in &cells {
+            for (index, (key, got)) in cells.iter().enumerate() {
                 if got.get(flag).is_some() {
-                    let k = axes.iter().map(|a| key.axis(a).to_owned()).collect();
+                    let k = axes.iter().map(|a| group_value(a, key, index)).collect();
                     let n = sizes.entry(k).or_default();
                     *n = n.saturating_add(1);
                 }
@@ -838,16 +800,13 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
         let mut explained_by_combination: Option<Vec<String>> = None;
         if varies {
             let mut best = best_single;
-            // An axis already known to be inseparable from the single explanation
-            // cannot contribute a genuinely different one. `-Werror=implicit-
-            // function-declaration` is the case: it flips at GCC 14, `libc` is
-            // confounded with `compiler_version` because each release ships its own
-            // glibc, and the pair `compiler` × `libc` therefore scored better than
-            // `compiler_version` while being a restatement of it wearing the libc's
-            // name. A reader would take it to mean the C library decides whether an
-            // undeclared call is an error.
+            // An axis inseparable from the single explanation cannot contribute a different
+            // one: for `-Werror=implicit-function-declaration`, which flips at GCC 14, `libc` is
+            // confounded with `compiler_version` because each release ships its own glibc, and
+            // `compiler` × `libc` would restate the version under the libc's name.
             let inseparable: BTreeSet<&String> = explained_by
                 .iter()
+                .chain(&uncontrolled)
                 .filter_map(|a| confounded_with.get(a))
                 .flatten()
                 .collect();
@@ -858,16 +817,20 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
                     }
                     let mut by_pair: BTreeMap<(String, String), (BTreeSet<&String>, usize)> =
                         BTreeMap::new();
-                    for (key, got) in &cells {
+                    for (index, (key, got)) in cells.iter().enumerate() {
                         if let Some(v) = got.get(flag) {
                             let slot = by_pair
-                                .entry((key.axis(a).to_owned(), key.axis(b).to_owned()))
+                                .entry((group_value(a, key, index), group_value(b, key, index)))
                                 .or_default();
                             slot.0.insert(v);
                             slot.1 = slot.1.saturating_add(1);
                         }
                     }
-                    let consistent = by_pair.values().all(|(verdicts, _)| verdicts.len() == 1);
+                    let unknown_member = cells.iter().any(|(key, got)| {
+                        got.contains_key(flag) && !(known(a, key.axis(a)) && known(b, key.axis(b)))
+                    });
+                    let consistent = !unknown_member
+                        && by_pair.values().all(|(verdicts, _)| verdicts.len() == 1);
                     let n = largest_group(&[a, b]);
                     if consistent && n >= 2 && n > best {
                         best = n;
@@ -877,38 +840,38 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
             }
         }
 
-        // How many cells actually carried this flag. A flag absent from a cell is dropped by
-        // `verdict_of`, so `verdicts` covers a subset of the input set — and the note said "the same
-        // everywhere in this input set" over that subset, including over a subset of one and over an
-        // empty one. Measured on a real mixed-corpus pair: 22 of 43 flags asserted agreement across
-        // "this input set" on a single observation, with `inputs: 2` at the top of the document, and
-        // a cell whose `verdict` key was missing produced `verdicts: {}` — zero observations — with
-        // the same affirmative note. The global guard (`cells.len() < 2`) cannot fire for a per-flag
-        // shortfall.
+        // Published for the explaining axes alone.
+        confounded_with.retain(|axis, _| explained_by.contains(axis));
+
+        // How many cells carried this flag: `verdicts` covers only those, so the note must not
+        // claim agreement over one observation or none, and the global guard
+        // (`cells.len() < 2`) cannot fire for a per-flag shortfall.
         let observed_in: usize = verdicts.values().map(Vec::len).sum();
         let note = if observed_in < 2 {
             format!(
-                "observed in {observed_in} of {} configurations, which is too few to say whether \
-                 it varies — a group of one is an identifier, not a pattern",
+                "observed in {observed_in} of {} configurations",
                 cells.len()
             )
         } else if !varies {
             format!("the same in all {observed_in} configurations that carried it")
         } else if let Some(ref pair) = explained_by_combination {
-            let single = explained_by
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "nothing".to_owned());
+            // With `explained_by` empty, no axis fits at all: an axis that fits only with a value
+            // per configuration (`uncontrolled`) is confounded with every other varying axis, so
+            // `inseparable` holds them all and no pair is offered beside it.
+            let single = explained_by.first().map_or_else(
+                || "No single axis partitions these observations consistently.".to_owned(),
+                |single| format!("`{single}` also partitions these observations consistently."),
+            );
             format!(
                 "best accounted for by {pair:?} together, which holds more agreeing \
-                 observations in a single group than any one axis manages. `{single}` also \
-                 partitions these observations consistently, but only across smaller groups, \
-                 so it fits more cheaply and is the weaker claim."
+                 observations in a single group than any one axis manages. {single}"
+            )
+        } else if explained_by.is_empty() && !uncontrolled.is_empty() {
+            format!(
+                "no axis accounts for the variation. Each of {uncontrolled:?} gives every configuration that carried the flag a value of its own."
             )
         } else if explained_by.is_empty() {
-            "no single axis accounts for the variation — it needs more than one, or the \
-             inputs are too few to separate them"
-                .to_owned()
+            "no single axis accounts for the variation".to_owned()
         } else if let [only] = explained_by.as_slice() {
             if let Some(coarser) = confounded_with.get(only) {
                 // The confound is the headline when there is one: the axis fits, but
@@ -921,23 +884,14 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
                      value across two values of {coarser:?}."
                 )
             } else if strength == "grouped" {
-                format!(
-                    "fully accounted for by `{only}`: every group of observations sharing a \
-                     value agrees, at least one such group has more than one member, and no \
-                     coarser axis shadows it"
-                )
+                format!("fully accounted for by `{only}`")
             } else {
                 format!(
-                    "consistent with `{only}` as the only axis that changed, but no group has \
-                     more than one member — a controlled comparison rather than a demonstrated \
-                     pattern. More configurations would strengthen it."
+                    "consistent with `{only}`: two configurations that read it differently differ in `{only}` and in no other axis of the key except those that change with it."
                 )
             }
         } else {
-            format!(
-                "consistent with any of {explained_by:?} — these inputs cannot tell them \
-                 apart, which is a limit of the data rather than an ambiguity to resolve"
-            )
+            format!("consistent with any of {explained_by:?} — these inputs cannot tell them apart")
         };
 
         variance.insert(
@@ -957,32 +911,21 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
     }
 
     if cells.len() < 2 {
-        warnings.push(
-            "only one configuration was supplied, so nothing can be attributed to any axis"
-                .to_owned(),
-        );
+        warnings.push("only one configuration was supplied".to_owned());
     }
 
     // A report that contradicts itself is not here: `build_from_reports` refuses the set
     // (`dataset::refuse_self_contradicted`).
 
-    // `polarities` gains a key exactly where `cells` does, so the two walk in step.
-    assert!(
-        cells.keys().eq(polarities.keys()),
-        "every cell's polarity map is made beside its verdicts"
-    );
-    let out_cells = cells
+    let out_cells = held
         .into_iter()
-        .zip(polarities.into_values())
-        .map(|((key, flags), polarity)| Cell {
+        .map(|(key, h)| Cell {
             label: key.label(&varying),
-            polarity,
-            kernel_ownership: ownership
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| UNPUBLISHED_OWNERSHIP.to_owned()),
+            polarity: h.polarity,
+            gating: h.gating,
+            kernel_ownership: h.ownership,
             key,
-            flags,
+            flags: h.verdicts,
         })
         .collect();
 
@@ -999,13 +942,6 @@ pub fn build_with(reports: &[(String, Value)], repeated: Repeated) -> Result<Mat
 }
 
 /// Read report files and cross-tabulate them.
-///
-/// Refuses reports that do not belong to one dataset unless `allow_mixed`. A matrix
-/// attributes outcomes to axes, so it is a stronger claim than a table: an axis is
-/// "explanatory" only if the observations grouped under it were produced by the same
-/// instrument. Two probe corpora in one input set can make a *change to chard* look
-/// like a property of a distribution, which is the failure mode this whole crate is
-/// organised against.
 ///
 /// # Errors
 ///
@@ -1037,7 +973,7 @@ pub fn build_from_reports(
     let identity = crate::dataset::Identity::of(reports);
     let conflicts = identity.conflicts();
     if !conflicts.is_empty() && !allow_mixed {
-        // See the note in `table::render_files`: a mismatched input set is the
+        // See the note in `table::render_reports`: a mismatched input set is the
         // operator's invocation, not a chard defect, and the error class decides which
         // of those a caller is told.
         return Err(crate::error::UserError::with_hint(
@@ -1046,17 +982,15 @@ pub fn build_from_reports(
                  a change in chard to a distribution:\n  {}",
                 conflicts.join("\n  ")
             ),
-            "pass --allow-mixed to build it anyway: the matrix will carry the conflict \
-             in its own warnings",
+            "pass --allow-mixed to build it anyway",
         )
         .into());
     }
 
     let mut matrix = build_with(reports, repeated)?;
-    // As in `table::render_files`: after the shape is read, refused rather than warned.
+    // As in `table::render_reports`: after the shape is read, refused rather than warned.
     crate::dataset::refuse_self_contradicted(reports)?;
-    // Into the document, not onto stderr. A matrix is consumed by machines and pasted
-    // by people, and neither reads the terminal it was produced in.
+    // Into the document, not onto stderr.
     matrix.warnings.splice(
         0..0,
         conflicts
@@ -1073,13 +1007,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Every axis in `AXES` reaches its own field, and no two reach the same one.
-    ///
-    /// `CellKey::axis` is a string-to-field lookup with a `_ => ""` fallthrough, so a
-    /// missing arm does not fail to compile: it makes that axis read as empty on every
-    /// specimen, which reads as "this axis does not vary" — the axis vanishes from
-    /// `varying`, joins `invariant`, and a difference the sweep actually measured stops
-    /// being attributable to it. Four arms could be deleted without any test noticing.
     #[test]
     fn every_axis_reads_its_own_field() {
         let key = CellKey {
@@ -1089,6 +1016,7 @@ mod tests {
             compiler_version: "compiler_version-v".to_owned(),
             libc: "libc-v".to_owned(),
             arch: "arch-v".to_owned(),
+            machine: "machine-v".to_owned(),
             profile: "profile-v".to_owned(),
             execution: "execution-v".to_owned(),
             execution_basis: "execution_basis-v".to_owned(),
@@ -1110,12 +1038,6 @@ mod tests {
         assert_eq!(key.axis("not-an-axis"), "");
     }
 
-    /// A level is appended only to a verdict that has one to report.
-    ///
-    /// `off:strong` and `probe-invalid:2` are the readings this guard exists to prevent:
-    /// an observation can carry a `level` beside a verdict that withheld, and pasting the
-    /// two together renders a strength for a protection that is not there. Three mutants
-    /// lived on this one guard — the negation, and forcing it to each constant.
     #[test]
     fn a_level_is_rendered_only_beside_a_verdict_that_earned_one() {
         let cell = |verdict: &str, level: Option<&str>| {
@@ -1148,16 +1070,6 @@ mod tests {
         assert!(verdict_of(&report, "-Dflag").is_none());
     }
 
-    /// A distribution that patches one of its compilers must be attributed to
-    /// `distro` × `compiler`, not to `compiler_version`.
-    ///
-    /// This is the LTS sweep's central result reduced to a fixture. Ubuntu's gcc
-    /// carries a canary across every release; its clang does not, and neither does
-    /// Fedora's gcc. `compiler_version` partitions that perfectly — no version string
-    /// appears on both sides — purely because each distribution ships its own patch
-    /// level, so reporting it would tell a reader that upstream GCC decides, which is
-    /// the opposite of the truth. The pair holds Ubuntu's three gcc observations in
-    /// one agreeing group, so it wins on evidence rather than on arithmetic.
     #[test]
     fn a_distro_patching_one_compiler_is_attributed_to_distro_and_compiler() {
         let on = &[("-fstack-protector-strong", "on")][..];
@@ -1190,8 +1102,7 @@ mod tests {
             // These three are what make `distro` separable from `compiler_version`
             // at all, and they are not invented: clang 21.1.8 really does appear on
             // both Fedora 43 and Ubuntu 26.04 in the sweep, and 22.1.8 on both
-            // Fedora 44 and openSUSE. Without such a pair the honest answer is
-            // "cannot separate", which the next test pins.
+            // Fedora 44 and openSUSE.
             (
                 "g".to_owned(),
                 report("ubuntu", "26.04", "clang", "21.1.8", "glibc", "bare", off),
@@ -1215,15 +1126,6 @@ mod tests {
         );
     }
 
-    /// Without an observation sharing a compiler version across distributions, the
-    /// pair must be withheld rather than asserted.
-    ///
-    /// Same shape as the test above, minus the cross-distro rows. Here every
-    /// compiler version belongs to exactly one distribution, so "the distribution
-    /// patches its compiler" and "these compiler versions simply differ" predict
-    /// the identical table and nothing in the data chooses between them. Reporting
-    /// `distro` x `compiler` anyway would be the vacuous-explanation bug in a new
-    /// costume: asserting a mechanism the inputs cannot witness.
     #[test]
     fn without_a_cross_distro_version_the_pair_is_withheld() {
         let on = &[("-fstack-protector-strong", "on")][..];
@@ -1253,19 +1155,18 @@ mod tests {
             "no cross-distro version exists, so the pair is not witnessed: {}",
             v.note
         );
+        // Nor is the version alone: it names each configuration, and every two that read the
+        // flag differently differ in the release or the compiler too, so no comparison here is
+        // controlled, and the note names the axes that only fit.
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
         assert!(
-            v.confounded_with
-                .get("compiler_version")
-                .is_some_and(|c| c.contains(&"distro".to_owned())),
-            "and the report must say distro cannot be separated"
+            v.note.contains(r#"["release", "compiler_version"]"#),
+            "{}",
+            v.note
         );
     }
 
-    /// A genuine compiler-version boundary must not be displaced by a pair.
-    ///
-    /// When the same compiler version appears under two distributions and agrees,
-    /// that is direct evidence the version is what matters, and no pair should hold a
-    /// larger agreeing group than the version itself.
     #[test]
     fn a_version_boundary_witnessed_across_distros_keeps_its_attribution() {
         let reports = vec![
@@ -1334,66 +1235,34 @@ mod tests {
         );
     }
 
-    /// An axis wholly nested inside the explaining one is reported as inseparable.
-    ///
-    /// Here every compiler version occurs under exactly one libc, so "the version
-    /// explains it" and "the libc explains it" are the same claim about this data.
-    /// Saying only the former would overstate what was measured.
     #[test]
     fn an_axis_nested_in_the_explainer_is_named_as_inseparable() {
+        // Two releases per compiler version, so the version groups two observations and is
+        // the explanation by itself, not a fit of one value per configuration.
+        let ubuntu = |release: &str, version: &str, libc: &str, verdict: &str| {
+            (
+                release.to_owned(),
+                report(
+                    "ubuntu",
+                    release,
+                    "gcc",
+                    version,
+                    libc,
+                    "bare",
+                    &[("-fx", verdict)],
+                ),
+            )
+        };
         let reports = vec![
-            (
-                "a".to_owned(),
-                report(
-                    "ubuntu",
-                    "20.04",
-                    "gcc",
-                    "9.4.0",
-                    "glibc2.31",
-                    "bare",
-                    &[("-fx", "off")],
-                ),
-            ),
-            (
-                "b".to_owned(),
-                report(
-                    "ubuntu",
-                    "22.04",
-                    "gcc",
-                    "11.4.0",
-                    "glibc2.35",
-                    "bare",
-                    &[("-fx", "off")],
-                ),
-            ),
-            (
-                "c".to_owned(),
-                report(
-                    "ubuntu",
-                    "24.04",
-                    "gcc",
-                    "13.3.0",
-                    "glibc2.39",
-                    "bare",
-                    &[("-fx", "on")],
-                ),
-            ),
-            (
-                "d".to_owned(),
-                report(
-                    "ubuntu",
-                    "26.04",
-                    "gcc",
-                    "15.2.0",
-                    "glibc2.43",
-                    "bare",
-                    &[("-fx", "on")],
-                ),
-            ),
+            ubuntu("20.04", "9.4.0", "glibc2.31", "off"),
+            ubuntu("20.10", "9.4.0", "glibc2.31", "off"),
+            ubuntu("24.04", "13.3.0", "glibc2.39", "on"),
+            ubuntu("24.10", "13.3.0", "glibc2.39", "on"),
         ];
         let m = build(&reports).expect("built");
         let v = &m.variance["-fx"];
         assert!(v.explained_by.contains(&"compiler_version".to_owned()));
+        assert_eq!(v.strength, "grouped");
         let confounds = v
             .confounded_with
             .get("compiler_version")
@@ -1409,6 +1278,8 @@ mod tests {
     fn on_execution(mode: &str, basis: Option<&str>, verdict: &str) -> Value {
         let mut execution = json!({"mode": mode});
         let mut kernel = json!({"arch": "x86_64"});
+        // A CPU, so the machine is known and a basis alone can be a controlled comparison.
+        let cpu = json!({"vendor": "GenuineIntel", "model_name": "Xeon", "relevant_features": []});
         if let Some(basis) = basis {
             execution["mode_evidence"] = json!({"basis": basis, "observation": "no marker"});
             // The word `measure` writes for this mode and basis, from the one derivation.
@@ -1429,9 +1300,10 @@ mod tests {
                 "distro": {"id": "fedora", "version_id": "44"},
                 "libc": {"impl": "glibc", "version": "2.43"},
                 "kernel": kernel,
+                "cpu": cpu,
                 "execution": execution,
             },
-            "toolchain": {"kind": "gcc", "version": "16.1.1"},
+            "toolchain": {"kind": "gcc", "version": "16.1.1", "target": {"arch": "x86_64"}},
             "profile": {"id": "bare"},
             "observations": [
                 {"flag": "noexecstack-enforced", "verdict": verdict},
@@ -1445,13 +1317,6 @@ mod tests {
         m.cells.iter().map(|c| c.label.as_str()).collect()
     }
 
-    /// A report on the default and an asserted `--execution host` report of one configuration
-    /// are two cells.
-    ///
-    /// Both read `environment.execution.mode` `host`, and only `mode_evidence.basis` tells them
-    /// apart (`assumed-host` against `asserted-but-unobservable`); the default withholds the two
-    /// `needs_vm` checks where the assertion measures them. Keyed on the mode alone the two
-    /// would be one cell, and the check would read `varies: false`.
     #[test]
     fn a_report_on_the_default_and_an_asserted_one_are_two_cells() {
         let reports = [
@@ -1496,12 +1361,6 @@ mod tests {
         }
     }
 
-    /// A report that publishes no basis is a cell of its own, named `unpublished`.
-    ///
-    /// Read as an empty string, the missing basis was skipped by `axes` and by the label, so
-    /// beside a report on `assumed-host` the axis read invariant, both cells were labelled
-    /// `(single configuration)` and the check that differed between them was explained by
-    /// nothing: two cells a reader could not tell apart.
     #[test]
     fn a_report_without_a_basis_is_a_cell_of_its_own() {
         let reports = [
@@ -1550,7 +1409,8 @@ mod tests {
                 check.verdicts["on"],
                 ["asserted-but-unobservable", UNPUBLISHED_BASIS]
             );
-            assert_eq!(check.explained_by, ["execution_basis"]);
+            // The unpublished basis may be either of the others, so the basis explains nothing.
+            assert!(check.explained_by.is_empty(), "{:?}", check.explained_by);
         }
 
         // A basis that is present but not a string, or empty, is no basis either.
@@ -1561,10 +1421,6 @@ mod tests {
         }
     }
 
-    /// The basis sits beside the mode it qualifies, in `AXES` and so in every label.
-    ///
-    /// `varying_axes` and the labels follow `AXES` order, and an axis that does not vary drops
-    /// out of both, so moving `execution_basis` past `image` passed every other test.
     #[test]
     fn the_basis_follows_the_mode_it_qualifies() {
         let at = |axis: &str| AXES.iter().position(|a| *a == axis);
@@ -1644,22 +1500,179 @@ mod tests {
             .iter()
             .map(|(f, v)| json!({"flag": f, "verdict": v}))
             .collect();
+        // A CPU and a basis, as a report chard writes today carries them: `controls` holds a
+        // comparison only over axes whose values are known.
         json!({
             "environment": {
                 "distro": {"id": distro, "version_id": release},
                 "libc": {"impl": libc},
                 "kernel": {"arch": "x86_64"},
-                "execution": {"mode": "vm"},
+                "cpu": {"vendor": "GenuineIntel", "model_name": "Xeon", "relevant_features": []},
+                "execution": {"mode": "vm", "mode_evidence": {"basis": "measured"}},
             },
-            "toolchain": {"kind": kind, "version": version},
+            "toolchain": {"kind": kind, "version": version, "target": {"arch": "x86_64"}},
             "profile": {"id": profile},
             "observations": Value::Array(observations),
         })
     }
 
-    /// Each cell carries every flag's polarity beside its verdict, from the observation the
-    /// verdict came from, and a later report that replaces a cell ([`Repeated::Replace`])
-    /// replaces the polarity with the verdict.
+    #[test]
+    fn one_image_on_two_machines_is_two_cells_and_each_names_its_gating() {
+        let on = |features: &[&str], verdict: &str, rule: Option<&str>| {
+            let mut r = report("ol", "10.2", "gcc", "14.3.1", "glibc", "bare", &[]);
+            r["toolchain"]["target"]["arch"] = "aarch64".into();
+            r["environment"]["execution"]["image"] = "oci-ol10".into();
+            r["environment"]["cpu"] = json!({"relevant_features": features});
+            let mut obs =
+                json!({"flag": "-mbranch-protection=bti (BTI enforced)", "verdict": verdict});
+            if let Some(rule) = rule {
+                obs["gating"] = json!({"rule": rule});
+            }
+            r["observations"] = json!([obs]);
+            r
+        };
+        let m = build(&[
+            (
+                "a1.json".to_owned(),
+                on(&[], "indeterminate", Some("machine-lacks-bti")),
+            ),
+            (
+                "a2.json".to_owned(),
+                on(&["bti", "paca", "pacg"], "on", None),
+            ),
+        ])
+        .expect("two machines are two cells, no repeat");
+        assert_eq!(m.cells.len(), 2);
+        assert!(
+            m.varying_axes.contains(&"machine".to_owned()),
+            "{:?}",
+            m.varying_axes
+        );
+        let flag = "-mbranch-protection=bti (BTI enforced)";
+        let cell = |machine: &str| {
+            m.cells
+                .iter()
+                .find(|c| c.key.machine == machine)
+                .unwrap_or_else(|| panic!("a cell on {machine}"))
+        };
+        // An A1 report written before `arm_parts` names no feature and no identity.
+        let a1 = cell("unread");
+        assert_eq!(a1.flags[flag], "indeterminate");
+        assert_eq!(a1.gating[flag], "machine-lacks-bti");
+        let a2 = cell("features:bti,paca,pacg");
+        assert_eq!(a2.flags[flag], "on");
+        assert!(a2.gating.is_empty(), "{:?}", a2.gating);
+        // The A1's machine is unread, so it may be the A2's: the flip is put down to no axis.
+        assert_eq!(m.variance[flag].explained_by, Vec::<String>::new());
+        assert_eq!(m.variance[flag].strength, "none");
+        // With the A1's machine read, the machine is the one axis that moved.
+        let mut a1 = on(&[], "indeterminate", Some("machine-lacks-bti"));
+        a1["environment"]["cpu"] = json!({"arm_parts": ["0x41:0xd0c"], "relevant_features": []});
+        let m = build(&[
+            ("a1.json".to_owned(), a1),
+            (
+                "a2.json".to_owned(),
+                on(&["bti", "paca", "pacg"], "on", None),
+            ),
+        ])
+        .expect("two machines");
+        assert_eq!(m.variance[flag].explained_by, ["machine"]);
+        assert_eq!(m.variance[flag].strength, "controlled");
+
+        // A later report of the configuration that replaces a cell names a moved gating rule.
+        let m = build_with(
+            &[
+                (
+                    "a1.json".to_owned(),
+                    on(&[], "indeterminate", Some("machine-lacks-bti")),
+                ),
+                (
+                    "a1-again.json".to_owned(),
+                    on(&[], "indeterminate", Some("needs-vm")),
+                ),
+            ],
+            Repeated::Replace,
+        )
+        .expect("replaced");
+        assert_eq!(m.cells[0].gating[flag], "needs-vm");
+        assert!(
+            m.warnings.iter().any(
+                |w| w.contains("under gating.rule machine-lacks-bti in a1.json")
+                    && w.contains("under gating.rule needs-vm in a1-again.json")
+            ),
+            "{:?}",
+            m.warnings
+        );
+    }
+
+    #[test]
+    fn two_targets_compare_the_architecture_only_on_one_machine() {
+        let on = |features: &[&str], verdict: &str, rule: Option<&str>| {
+            let mut r = report("ol", "10.2", "gcc", "14.3.1", "glibc", "bare", &[]);
+            r["toolchain"]["target"]["arch"] = "aarch64".into();
+            r["environment"]["execution"]["image"] = "oci-ol10".into();
+            r["environment"]["cpu"] = json!({"relevant_features": features});
+            let mut obs =
+                json!({"flag": "-mbranch-protection=bti (BTI enforced)", "verdict": verdict});
+            if let Some(rule) = rule {
+                obs["gating"] = json!({"rule": rule});
+            }
+            r["observations"] = json!([obs]);
+            r
+        };
+        let flag = "-mbranch-protection=bti (BTI enforced)";
+        // Two architectures on two machines: the architecture is the toolchain's target and
+        // the machine the CPU the run had, two changes, so neither is a controlled comparison.
+        let mut x86 = on(&[], "off", None);
+        x86["toolchain"]["target"]["arch"] = "x86_64".into();
+        x86["environment"]["cpu"] =
+            json!({"vendor": "GenuineIntel", "model_name": "Xeon", "relevant_features": []});
+        let m = build(&[
+            ("x86.json".to_owned(), x86.clone()),
+            (
+                "a2.json".to_owned(),
+                on(&["bti", "paca", "pacg"], "on", None),
+            ),
+        ])
+        .expect("two architectures");
+        assert_eq!(m.variance[flag].explained_by, Vec::<String>::new());
+        assert_eq!(m.variance[flag].strength, "none");
+        assert!(
+            m.variance[flag].note.contains(r#"["arch", "machine"]"#),
+            "{}",
+            m.variance[flag].note
+        );
+        // One machine, two targets under one profile (a driver for x86 beside the native one; a
+        // `-m32` profile would change the profile too): the architecture alone.
+        let m_arch_base = x86.clone();
+        let mut x86_32 = x86.clone();
+        x86_32["toolchain"]["target"]["arch"] = "x86".into();
+        x86_32["observations"] = json!([{"flag": flag, "verdict": "unsupported"}]);
+        let m = build(&[
+            ("x86.json".to_owned(), x86),
+            ("x86-m32.json".to_owned(), x86_32),
+        ])
+        .expect("two targets on one machine");
+        assert_eq!(m.variance[flag].explained_by, ["arch"]);
+        assert_eq!(m.variance[flag].strength, "controlled");
+        // A `-m32` profile beside a `-m64` one: the profile's flags chose the target, so the
+        // profile changed too (its id carries a hash of the flags), and neither is compared.
+        let mut m64 = m_arch_base.clone();
+        m64["profile"]["id"] = "explicit:c1e6c54d9448".into();
+        let mut m32 = m64.clone();
+        m32["profile"]["id"] = "explicit:a716de576aa4".into();
+        m32["toolchain"]["target"]["arch"] = "x86".into();
+        m32["observations"] = json!([{"flag": flag, "verdict": "build-failed"}]);
+        let m = build(&[("m64.json".to_owned(), m64), ("m32.json".to_owned(), m32)])
+            .expect("two profiles");
+        assert_eq!(m.variance[flag].explained_by, Vec::<String>::new());
+        assert!(
+            m.variance[flag].note.contains(r#"["arch", "profile"]"#),
+            "{}",
+            m.variance[flag].note
+        );
+    }
+
     #[test]
     fn a_cell_carries_each_flags_polarity_beside_its_verdict() {
         let with_polarity = |rpath: &str| {
@@ -1713,9 +1726,6 @@ mod tests {
         );
     }
 
-    /// The motivating case: an error under gcc 16 and a warning under gcc 13.3,
-    /// across two different distributions. The compiler version explains it; the
-    /// distribution does not.
     #[test]
     fn a_compiler_version_boundary_is_not_attributed_to_the_distro() {
         let reports = vec![
@@ -1770,8 +1780,6 @@ mod tests {
         );
     }
 
-    /// Two reports differing in several axes at once cannot separate them, and the
-    /// output says so rather than picking one.
     #[test]
     fn confounded_axes_are_reported_as_confounded() {
         let reports = vec![
@@ -1802,8 +1810,556 @@ mod tests {
         ];
         let m = build(&reports).expect("built");
         let v = &m.variance["-fx"];
-        assert!(v.explained_by.len() > 1, "several axes should fit");
-        assert!(v.note.contains("cannot tell them apart"));
+        // Each of the four fits, a value per report, and none is the one thing that changed:
+        // not `controlled`, and nothing in `explained_by`.
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+        assert!(
+            v.note
+                .contains(r#"["distro", "release", "compiler", "compiler_version"]"#),
+            "{}",
+            v.note
+        );
+    }
+
+    #[test]
+    fn the_arch_axis_reads_the_target_the_toolchain_built_for() {
+        let flag = "-fcf-protection=full";
+        let run = |target: &str, libc: &str, verdict: &str| {
+            let mut r = report(
+                "fedora",
+                "44",
+                "gcc",
+                "16.2.1",
+                libc,
+                "bare",
+                &[(flag, verdict)],
+            );
+            r["toolchain"]["target"]["arch"] = target.into();
+            r
+        };
+        let native = run("x86_64", "glibc2.43", "off");
+        let cross = run("aarch64", "unknown", "unsupported");
+        assert_eq!(
+            native["environment"]["kernel"]["arch"],
+            cross["environment"]["kernel"]["arch"]
+        );
+        let m = build(&[
+            ("native.json".to_owned(), native.clone()),
+            ("cross.json".to_owned(), cross),
+        ])
+        .expect("two targets are two cells");
+        assert_eq!(m.axes["arch"], ["aarch64", "x86_64"]);
+        assert_eq!(m.varying_axes, ["libc", "arch"]);
+        let v = &m.variance[flag];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+        // The cross run's libc reads `unknown`, so the libc fits nothing; the architecture
+        // identifies the two runs and compares nothing, since the libc may have changed too.
+        assert!(v.note.contains(r#"["arch"]"#), "{}", v.note);
+
+        // The kernel's architecture is no axis: a run whose chard was built for aarch64,
+        // measuring the same x86_64 target, is a repeat of the native run.
+        let mut elsewhere = native.clone();
+        elsewhere["environment"]["kernel"]["arch"] = "aarch64".into();
+        let err = build(&[
+            ("native.json".to_owned(), native),
+            ("elsewhere.json".to_owned(), elsewhere),
+        ])
+        .expect_err("one target is one configuration");
+        assert!(
+            err.to_string()
+                .contains("arch x86_64, machine GenuineIntel/Xeon features:none"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn controlled_is_one_change_seen_at_its_grains() {
+        let fedora = |kind: &str, version: &str, libc: &str, verdict: &str| {
+            (
+                format!("{kind}-{libc}.json"),
+                report(
+                    "fedora",
+                    "44",
+                    kind,
+                    version,
+                    libc,
+                    "bare",
+                    &[("-fx", verdict)],
+                ),
+            )
+        };
+        let m = build(&[
+            fedora("gcc", "16.1.1", "glibc", "on"),
+            fedora("clang", "21.1.8", "glibc", "off"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert_eq!(v.explained_by, ["compiler"]);
+        assert_eq!(v.strength, "controlled");
+        // The one pair cannot tell the compiler from its version, and the note says so.
+        assert_eq!(v.confounded_with["compiler"], ["compiler_version"]);
+
+        let m = build(&[
+            fedora("gcc", "16.1.1", "glibc", "on"),
+            fedora("clang", "21.1.8", "musl", "off"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+
+        // The compiler beside a change of where the run executed: two changes.
+        let mut elsewhere = fedora("clang", "21.1.8", "glibc", "off");
+        elsewhere.1["environment"]["execution"]["mode"] = "host".into();
+        let m = build(&[fedora("gcc", "16.1.1", "glibc", "on"), elsewhere]).expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        // And beside a change of profile.
+        let mut hardened = fedora("clang", "21.1.8", "glibc", "off");
+        hardened.1["profile"]["id"] = "hardened".into();
+        let m = build(&[fedora("gcc", "16.1.1", "glibc", "on"), hardened]).expect("built");
+        assert_eq!(m.variance["-fx"].explained_by, Vec::<String>::new());
+
+        // The libc beside any other axis of the key is two changes, each axis in turn: the
+        // basis, the image, and a version of the same compiler.
+        for (axis, value) in [
+            ("execution_basis", json!("asserted-and-corroborated")),
+            ("image", json!("fedora-44-image")),
+            ("compiler_version", json!("16.2.0")),
+        ] {
+            let mut other = fedora("gcc", "16.1.1", "musl", "off");
+            match axis {
+                "execution_basis" => {
+                    other.1["environment"]["execution"]["mode_evidence"]["basis"] = value;
+                }
+                "image" => other.1["environment"]["execution"]["image"] = value,
+                _ => other.1["toolchain"]["version"] = value,
+            }
+            let m = build(&[fedora("gcc", "16.1.1", "glibc", "on"), other]).expect("built");
+            let v = &m.variance["-fx"];
+            assert!(v.explained_by.is_empty(), "{axis}: {:?}", v.explained_by);
+        }
+
+        // A third configuration that changes the libc alone: the libc groups two agreeing
+        // reports, which outranks a comparison.
+        let m = build(&[
+            fedora("gcc", "16.1.1", "glibc", "on"),
+            fedora("clang", "21.1.8", "musl", "off"),
+            fedora("clang", "21.1.8", "glibc", "on"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert_eq!(v.explained_by, ["libc"], "{}", v.note);
+        assert_eq!(v.strength, "grouped", "glibc groups two agreeing reports");
+    }
+
+    #[test]
+    fn a_version_is_not_compared_across_compilers() {
+        let m = build(&[
+            (
+                "gcc13.json".to_owned(),
+                report(
+                    "fedora",
+                    "44",
+                    "gcc",
+                    "13",
+                    "glibc",
+                    "bare",
+                    &[("-fx", "on")],
+                ),
+            ),
+            (
+                "gcc14.json".to_owned(),
+                report(
+                    "fedora",
+                    "44",
+                    "gcc",
+                    "14",
+                    "musl",
+                    "bare",
+                    &[("-fx", "off")],
+                ),
+            ),
+            (
+                "clang18.json".to_owned(),
+                report(
+                    "fedora",
+                    "44",
+                    "clang",
+                    "18",
+                    "glibc",
+                    "bare",
+                    &[("-fx", "off")],
+                ),
+            ),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+        // The axes that only fit are named, and none is published as confounded.
+        assert!(v.note.contains(r#"["compiler_version"]"#), "{}", v.note);
+        assert!(v.confounded_with.is_empty(), "{:?}", v.confounded_with);
+    }
+
+    #[test]
+    fn a_pair_that_reads_alike_compares_nothing() {
+        let one = |release: &str, profile: &str, libc: &str, verdict: &str| {
+            (
+                format!("{release}-{profile}-{libc}.json"),
+                report(
+                    "alpine",
+                    release,
+                    "gcc",
+                    "14",
+                    libc,
+                    profile,
+                    &[("-fx", verdict)],
+                ),
+            )
+        };
+        let m = build(&[
+            one("3.20", "bare", "glibc", "on"),
+            one("3.20", "bare", "musl", "on"),
+            one("3.20", "hardened", "uclibc", "off"),
+            one("3.21", "hardened", "musl1.2", "on"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?} {}", v.explained_by, v.note);
+        assert_eq!(v.strength, "none");
+        assert!(v.note.contains(r#"["libc"]"#), "{}", v.note);
+    }
+
+    #[test]
+    fn a_distribution_is_compared_with_its_release_and_not_with_its_libc() {
+        let m = build(&[
+            (
+                "debian.json".to_owned(),
+                report(
+                    "debian",
+                    "13",
+                    "gcc",
+                    "14.2.0",
+                    "glibc2.41",
+                    "bare",
+                    &[("-fx", "on")],
+                ),
+            ),
+            (
+                "ubuntu.json".to_owned(),
+                report(
+                    "ubuntu",
+                    "25.04",
+                    "gcc",
+                    "14.2.0",
+                    "glibc2.41",
+                    "bare",
+                    &[("-fx", "off")],
+                ),
+            ),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert_eq!(v.explained_by, ["distro"], "{}", v.note);
+        assert_eq!(v.strength, "controlled");
+
+        let m = build(&[
+            (
+                "debian.json".to_owned(),
+                report(
+                    "debian",
+                    "13",
+                    "gcc",
+                    "14.2.0",
+                    "glibc2.41",
+                    "bare",
+                    &[("-fx", "on")],
+                ),
+            ),
+            (
+                "alpine.json".to_owned(),
+                report(
+                    "alpine",
+                    "3.21",
+                    "gcc",
+                    "14.2.0",
+                    "musl1.2.5",
+                    "bare",
+                    &[("-fx", "off")],
+                ),
+            ),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+    }
+
+    #[test]
+    fn a_contradicted_architecture_is_its_own_value_and_never_known() {
+        let flag = "-fcf-protection=full";
+        let native = report(
+            "fedora",
+            "44",
+            "gcc",
+            "16.2.1",
+            "glibc2.43",
+            "bare",
+            &[(flag, "off")],
+        );
+        let mut wrapped = report(
+            "fedora",
+            "44",
+            "gcc",
+            "16.2.1",
+            "glibc2.43",
+            "bare",
+            &[(flag, "indeterminate")],
+        );
+        wrapped["toolchain"]["target"]["macros"] = json!({"agreement": "disagrees"});
+        assert_eq!(arch_of(&wrapped), format!("x86_64{CONTRADICTED}"));
+        let m = build(&[
+            ("native.json".to_owned(), native.clone()),
+            ("wrapped.json".to_owned(), wrapped.clone()),
+        ])
+        .expect("two cells, not a repeat");
+        assert_eq!(m.axes["arch"], ["x86_64", "x86_64 (contradicted)"]);
+        assert_eq!(m.variance[flag].explained_by, Vec::<String>::new());
+        assert_eq!(m.variance[flag].strength, "none");
+
+        for path in ["agreement", "abi", "profile_macros"] {
+            let mut r = native.clone();
+            if path == "agreement" {
+                r["toolchain"]["target"]["agreement"] = "disagrees".into();
+            } else {
+                r["toolchain"]["target"][path] = json!({"agreement": "disagrees"});
+            }
+            assert_eq!(arch_of(&r), "x86_64 (contradicted)", "{path}");
+        }
+        // Any other word, `overruled` and `superseded` among them, leaves the architecture.
+        let mut r = native.clone();
+        r["toolchain"]["target"]["macros"] = json!({"agreement": "superseded"});
+        assert_eq!(arch_of(&r), "x86_64");
+        // A C++ dump's `disagrees` alone does not: it witnesses the C++ probes, and a C++ check
+        // it withheld marks the run by its gating rule.
+        let mut r = native.clone();
+        r["toolchain"]["target"]["profile_macros_cxx"] = json!({"agreement": "disagrees"});
+        assert_eq!(arch_of(&r), "x86_64");
+        for rule in CONTRADICTING_RULES {
+            r["observations"] = json!([
+                {"flag": flag, "verdict": "indeterminate", "gating": {"rule": rule}}
+            ]);
+            assert_eq!(arch_of(&r), "x86_64 (contradicted)", "{rule}");
+        }
+        // A target without an architecture reads empty, contradicted or not.
+        let mut r = wrapped.clone();
+        r["toolchain"]["target"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("arch");
+        assert_eq!(arch_of(&r), "");
+        // An absent target reads empty: never the kernel's architecture.
+        let mut r = wrapped;
+        r["toolchain"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("target");
+        assert_eq!(arch_of(&r), "");
+    }
+
+    #[test]
+    fn an_unknown_value_compares_nothing() {
+        let blank = |libc: &str, verdict: &str| {
+            let mut r = report(
+                "fedora",
+                "44",
+                "gcc",
+                "16.2.1",
+                libc,
+                "bare",
+                &[("-fx", verdict)],
+            );
+            r["toolchain"]
+                .as_object_mut()
+                .expect("an object")
+                .remove("target");
+            (format!("{libc}.json"), r)
+        };
+        let m = build(&[blank("glibc", "on"), blank("musl", "off")]).expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+        for (axis, value, is) in [
+            ("image", "", true),
+            ("arch", "", false),
+            ("machine", "unread", false),
+            ("libc", "unknown", false),
+            ("execution_basis", UNPUBLISHED_BASIS, false),
+            ("arch", "x86_64 (contradicted)", false),
+            ("arch", "x86_64", true),
+        ] {
+            assert_eq!(known(axis, value), is, "{axis} {value:?}");
+        }
+    }
+
+    #[test]
+    fn the_machine_and_the_architecture_are_confounded_where_they_move_together() {
+        let run = |arch: &str, vendor: &str, release: &str, verdict: &str| {
+            let mut r = report(
+                "fedora",
+                release,
+                "gcc",
+                "16.2.1",
+                "glibc",
+                "bare",
+                &[("-fx", verdict)],
+            );
+            r["toolchain"]["target"]["arch"] = arch.into();
+            r["environment"]["cpu"] =
+                json!({"vendor": vendor, "model_name": "m", "relevant_features": []});
+            (format!("{arch}-{release}.json"), r)
+        };
+        let m = build(&[
+            run("x86_64", "GenuineIntel", "43", "off"),
+            run("x86_64", "GenuineIntel", "44", "off"),
+            run("aarch64", "ARM", "43", "on"),
+            run("aarch64", "ARM", "44", "on"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert_eq!(v.explained_by, ["arch", "machine"]);
+        assert_eq!(v.strength, "grouped");
+        assert_eq!(v.confounded_with["arch"], ["machine"]);
+        assert_eq!(v.confounded_with["machine"], ["arch"]);
+        assert!(v.note.contains("cannot tell them apart"), "{}", v.note);
+    }
+
+    #[test]
+    fn a_controlled_axis_is_not_confounded_with_what_its_pair_held() {
+        let m = build(&[
+            (
+                "glibc.json".to_owned(),
+                report(
+                    "fedora",
+                    "44",
+                    "gcc",
+                    "16",
+                    "glibc",
+                    "bare",
+                    &[("-fx", "on")],
+                ),
+            ),
+            (
+                "musl.json".to_owned(),
+                report(
+                    "fedora",
+                    "44",
+                    "gcc",
+                    "16",
+                    "musl",
+                    "bare",
+                    &[("-fx", "off")],
+                ),
+            ),
+            (
+                "uclibc.json".to_owned(),
+                report(
+                    "ubuntu",
+                    "26.04",
+                    "clang",
+                    "21",
+                    "uclibc",
+                    "bare",
+                    &[("-fx", "on")],
+                ),
+            ),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert_eq!(v.explained_by, ["libc"], "{}", v.note);
+        assert_eq!(v.strength, "controlled");
+        assert!(v.confounded_with.is_empty(), "{:?}", v.confounded_with);
+        assert!(
+            v.note
+                .contains("differ in `libc` and in no other axis of the key"),
+            "{}",
+            v.note
+        );
+    }
+
+    #[test]
+    fn unknown_values_form_no_group() {
+        let run = |distro: &str, release: &str, contradicted: bool, verdict: &str| {
+            let mut r = report(
+                distro,
+                release,
+                "gcc",
+                "14",
+                "glibc",
+                "bare",
+                &[("-fx", verdict)],
+            );
+            if contradicted {
+                r["toolchain"]["target"]["macros"] = json!({"agreement": "disagrees"});
+            }
+            (format!("{distro}-{release}.json"), r)
+        };
+        let m = build(&[
+            run("fedora", "43", true, "off"),
+            run("fedora", "44", true, "off"),
+            run("debian", "12", false, "on"),
+            run("debian", "13", false, "on"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert_eq!(v.explained_by, ["distro"], "{}", v.note);
+        assert_eq!(v.strength, "grouped");
+        assert!(
+            !v.confounded_with.contains_key("arch"),
+            "{:?}",
+            v.confounded_with
+        );
+    }
+
+    #[test]
+    fn a_pair_explains_where_no_single_axis_fits() {
+        let one = |name: &str, distro: &str, kind: &str, profile: &str, verdict: &str| {
+            let version = if kind == "gcc" { "14" } else { "18" };
+            (
+                format!("{name}.json"),
+                report(
+                    distro,
+                    "1",
+                    kind,
+                    version,
+                    "glibc",
+                    profile,
+                    &[("-fx", verdict)],
+                ),
+            )
+        };
+        let m = build(&[
+            one("a", "ubuntu", "gcc", "p1", "on"),
+            one("b", "ubuntu", "gcc", "p2", "on"),
+            one("c", "ubuntu", "clang", "p1", "off"),
+            one("d", "fedora", "gcc", "p2", "off"),
+        ])
+        .expect("built");
+        let v = &m.variance["-fx"];
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(
+            v.explained_by_combination.as_deref(),
+            Some(&["distro".to_owned(), "compiler".to_owned()][..])
+        );
+        assert!(
+            v.note
+                .contains("No single axis partitions these observations consistently."),
+            "{}",
+            v.note
+        );
     }
 
     #[test]
@@ -1871,7 +2427,15 @@ mod tests {
             ),
         ];
         let m = build(&reports).expect("built");
-        assert_eq!(m.variance["-fortify"].explained_by, vec!["libc".to_owned()]);
+        let v = &m.variance["-fortify"];
+        assert_eq!(v.explained_by, vec!["libc".to_owned()]);
+        assert_eq!(v.strength, "controlled");
+        assert!(
+            v.note
+                .contains("differ in `libc` and in no other axis of the key"),
+            "{}",
+            v.note
+        );
     }
 
     #[test]
@@ -1902,22 +2466,10 @@ mod tests {
         assert!(build(&[("x".to_owned(), json!({"nope": 1}))]).is_err());
     }
 
-    /// A report that does not carry a flag must not vouch for what explains it.
-    ///
-    /// `explained_by` is computed over the cells carrying the flag; `confounded_with`
-    /// iterated *every* cell. The two ranged over different spans, and the wider one
-    /// suppressed the warning — a cell with no verdict for the flag still contributed
-    /// cross-links, pushing the count past the threshold and removing the coarser axis.
-    ///
-    /// The two arms below share the same three carrying reports and produce the same
-    /// verdicts and the same `observed_in`. Only `of_configurations` differs. If the
-    /// confound answer differs too, the extra reports changed a conclusion about a flag
-    /// they hold no evidence about — a correct count over the wrong span, which reads as
-    /// measured and is worse than an obvious zero.
     #[test]
     fn cells_without_the_flag_do_not_dissolve_its_confound() {
         // distro is nested inside compiler_version: alpha only ever appears with 10,
-        // beta only with 11. So the two cannot be told apart on this evidence.
+        // beta only with 11.
         let carrying = || {
             vec![
                 (
@@ -1944,7 +2496,7 @@ mod tests {
         );
 
         // The same three, plus two that cross-link the axes while saying nothing about
-        // `-fq`. They carry a different flag so the cells exist and are non-empty.
+        // `-fq`.
         let mut wide = carrying();
         wide.push((
             "c1".to_owned(),
@@ -2018,10 +2570,6 @@ mod tests {
         )
     }
 
-    /// A pair holding an axis inseparable from the single explanation explains nothing of
-    /// its own, however large a group it agrees over: here `compiler` x `libc` agrees over a
-    /// group of two where each `compiler_version` stands alone, and `libc` is nested in
-    /// `compiler_version`.
     #[test]
     fn a_pair_holding_an_axis_inseparable_from_the_explainer_is_not_named() {
         let reports = vec![
@@ -2033,15 +2581,15 @@ mod tests {
         ];
         let m = build(&reports).expect("built");
         let v = &m.variance["-f"];
-        assert_eq!(v.explained_by, ["compiler_version"]);
-        assert!(v.confounded_with["compiler_version"].contains(&"libc".to_owned()));
+        // `compiler_version` fits a value per configuration, and every pair that reads `-f`
+        // differently changed the libc or the compiler beside it: it explains nothing, and its
+        // confounds still keep the pair out.
+        assert!(v.explained_by.is_empty(), "{:?}", v.explained_by);
+        assert_eq!(v.strength, "none");
+        assert!(v.confounded_with.is_empty(), "{:?}", v.confounded_with);
         assert_eq!(v.explained_by_combination, None, "{}", v.note);
     }
 
-    /// A pair whose largest agreeing group is no larger than the single explanation's is
-    /// not named beside it, and with the single axis's groups of more than one member the
-    /// note says it is fully accounted for; a flag observed in one configuration is said to
-    /// be too few to read.
     #[test]
     fn a_pair_that_only_ties_the_single_explanation_is_not_named() {
         let reports = vec![
@@ -2089,7 +2637,6 @@ mod tests {
         );
     }
 
-    /// A set that is not one dataset is refused unless the caller allows a mixed set.
     #[test]
     fn a_mixed_set_is_refused_unless_allowed() {
         // Two profiles, so the allowed set is two configurations and no repeat.
@@ -2124,11 +2671,10 @@ mod tests {
         );
     }
 
-    /// The measured shape ([`Repeated`]): a full run, then a run of fewer checks of the same
+    /// The measured shape ([`Repeated`]): a full run, a run of fewer checks of the same
     /// configuration through a wrapper that moves two of them, and a report of another
-    /// configuration. Beside the measured shape: a flag the wrapper run carries with no
-    /// verdict, one whose polarity alone differs, one whose polarity only the full run
-    /// publishes, and one only the wrapper run carries.
+    /// configuration, with a flag read with no verdict, polarities that differ, and a flag
+    /// each of the pair carries alone.
     fn full_wrapped_and_other() -> [(String, Value); 3] {
         let bare = |flags: &[(&str, &str)], extra: &[Value]| {
             let mut r = report("fedora", "44", "gcc", "16.1.1", "glibc", "bare", flags);
@@ -2186,17 +2732,13 @@ mod tests {
     /// The configuration of [`full_wrapped_and_other`]'s repeated pair, as a refusal and a
     /// warning name it: every axis, the empty one too.
     const BARE: &str = "distro fedora, release 44, compiler gcc, compiler_version 16.1.1, libc \
-                        glibc, arch x86_64, profile bare, execution vm, execution_basis \
-                        unpublished, image (none)";
+                        glibc, arch x86_64, machine GenuineIntel/Xeon features:none, profile bare, \
+                        execution vm, execution_basis measured, image (none)";
 
-    /// Two reports of one configuration are refused, every repeat named, rather than merged flag
-    /// by flag; a report of another configuration beside them is no repeat.
     #[test]
     fn a_repeated_configuration_is_refused() {
         let [full, wrapped, other] = full_wrapped_and_other();
-        // Refused, whichever comes first, with every repeat named against the report it
-        // repeats and the configuration in full; a third report of another configuration is
-        // no repeat.
+        // Each repeat is named against the report it repeats, with the configuration in full.
         let refused = build(&[full.clone(), other.clone(), wrapped.clone()])
             .expect_err("a repeated configuration");
         let user = refused
@@ -2231,8 +2773,6 @@ mod tests {
         );
     }
 
-    /// Replaced ([`Repeated::Replace`]), a repeated configuration's cell is the later report's
-    /// whole and every flag the two read differently is named, never a merge of the two.
     #[test]
     fn a_repeated_configuration_is_replaced_whole_never_merged() {
         let [full, wrapped, other] = full_wrapped_and_other();
@@ -2263,9 +2803,8 @@ mod tests {
                 "-fcf-protection"
             }
         };
-        // In either order: the cell is the later report's alone, and the warning names the
-        // five flags read differently (two verdicts, a verdict against none, a polarity against
-        // another and against none), not the one read alike, and the flag only each carries.
+        // In either order: the cell is the later report's alone, and the warning names each
+        // flag read differently and each flag only one report carries, not the one read alike.
         for (earlier, later) in [(&full, &wrapped), (&wrapped, &full)] {
             let m = build_with(
                 &[earlier.clone(), later.clone(), other.clone()],

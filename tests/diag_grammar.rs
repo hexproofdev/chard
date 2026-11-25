@@ -2,25 +2,19 @@
 
 //! The compiler-diagnostic decoders against stderr drawn from a grammar of what gcc and
 //! clang print.
-//!
-//! Two decoders read a compiler's stderr as text. The compiler-diag detectors find the
-//! line carrying the diagnostic's wording and read its severity from that line
-//! (`probe::diag_severity_of`); the rejection rule finds a line saying a tool does not
-//! know a flag and naming one chard supplied (`measure::flag_rejection`). Each has unit
-//! tests on stderr someone captured or wrote. What neither had was a stream nobody wrote:
-//! the diagnostic between two unrelated errors, behind a gcc `In function` header, under
-//! a work directory named for the check, quoted with U+2018/U+2019 or with apostrophes,
-//! tagged `[-Wfoo]`, `[-Werror=foo]`, `[-Werror,-Wfoo]` or not at all. This file draws
-//! such streams from a seed (`tests/seeded`) and holds each decoder's verdict to the
-//! rule its doc comment states, computed here from the grammar's own record of what it
-//! wrote, never from the decoder.
-//!
-//! The diagnostic wordings are the ones the replay corpus (`tests/fixtures/detectors.json`)
-//! recorded from real builds, gcc 10 through 16 and clang 10 through 23, and the
-//! detectors' own doc comments for the three the corpus has no line of; the rejection
-//! wordings are the ones `measure::flag_rejection` lists, in the shapes gcc, clang, GNU
-//! ld, lld and Apple's ld print them. Streams are color-free: `compile` builds with the
-//! diagnostic language pinned and no terminal.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -368,14 +362,6 @@ fn check(id: &str) -> &'static Check {
         .unwrap_or_else(|| panic!("{id} is not in the corpus"))
 }
 
-/// Every compiler-diag detector reads a drawn stream as its doc comment says.
-///
-/// The rule, in the detectors' own terms: the diagnostic's line decides, and its severity
-/// is the one on that line, never one elsewhere in the stream; a presence check is
-/// present at that severity, a severity check only at `error`; with no diagnostic line,
-/// the canary missing or the build failed is `indeterminate`, and silence over a canary
-/// and a clean exit is `absent`. Each verdict is counted per check and per cell of that
-/// rule, and a default-sized run must reach every cell for every check.
 #[test]
 fn compiler_diag_detectors_read_drawn_streams_as_documented() {
     let (seed, from_env) = seeded::seed();
@@ -392,8 +378,7 @@ fn compiler_diag_detectors_read_drawn_streams_as_documented() {
         .collect();
     assert_eq!(
         listed, in_corpus,
-        "every compiler-diag check that reads a diagnostic has a grammar here, and no other \
-         (no-copy-dt-needed and pic-shared-link read a link, not a diagnostic)"
+        "the grammars here are not the compiler-diag checks that read a diagnostic"
     );
 
     let macros = BTreeMap::new();
@@ -416,8 +401,7 @@ fn compiler_diag_detectors_read_drawn_streams_as_documented() {
         let got = (detection.outcome, detection.level.as_deref());
         assert!(
             got == want,
-            "{}: expected {want:?}, the detector read {got:?} ({}).\nwritten: {written:#?}\n\
-             observed: {}",
+            "{}: expected {want:?}, read {got:?} ({})\nwritten: {written:#?}\nobserved: {}",
             diag.id,
             seeded::replay(seed, case),
             detection.observed
@@ -609,16 +593,6 @@ fn draw_rejection(rng: &mut seeded::Rng) -> Rejection {
     }
 }
 
-/// The rejection rule names the first line that rejects a supplied flag, and the flag,
-/// over drawn streams; and it names nothing when no line does.
-///
-/// Held here: a line that names a supplied flag without a rejection phrase is not one; a
-/// rejection of a flag the control did not supply is not one, even when the tool's
-/// suggestion is a flag it did supply; every quote a tool puts around the flag, and the
-/// sentence punctuation after it, is trimmed; a linker's spelling of a `-Wl,` flag is
-/// matched. The tool is held to the line's own prefix where the line has one, and to
-/// `the toolchain` where the line opens with its severity, as clang's frontend prints
-/// `warning: unknown warning option`.
 #[test]
 fn flag_rejection_names_the_first_line_rejecting_a_supplied_flag() {
     let (seed, from_env) = seeded::seed();
@@ -673,16 +647,6 @@ fn flag_rejection_names_the_first_line_rejecting_a_supplied_flag() {
     );
 }
 
-/// A profile flag's refusal names the first line the tool stopped on that rejects a
-/// supplied flag, and carries that line's tool and flag as its fields, over the same drawn
-/// streams with the flags as a profile's; and it names nothing when no such line is drawn.
-///
-/// The fields name the refusal a cell's `build_rejection` publishes, and the first entry of
-/// `measure::profile_flag_refusals`, which `report::profile_flag_rejections` groups a run's
-/// cells by, one `profile-flag-rejected` diagnostic per tool and flag; a tool or flag read
-/// wrong here is a refused flag counted under the wrong name. The
-/// expectation is the grammar's own record: the tool it wrote (`the toolchain` where the
-/// line opens with its severity), the one spelling it wrote, and the line.
 #[test]
 fn profile_flag_refusal_carries_the_tool_and_flag_of_the_first_refusal() {
     let (seed, from_env) = seeded::seed();
@@ -749,11 +713,6 @@ fn profile_flag_refusal_carries_the_tool_and_flag_of_the_first_refusal() {
     );
 }
 
-/// Every profile flag a build's tools refused is read, each tool and flag once, on the
-/// first line that refused it, in order, over the same drawn streams; the first entry is
-/// the refusal a cell's `build_rejection` names. `report::profile_flag_rejections` counts a
-/// run by this reader, so a refusal it skips is a rejected flag named nowhere, which is
-/// what reading only the first line did to a build refusing two flags.
 #[test]
 fn profile_flag_refusals_reads_every_refusal_line() {
     let (seed, from_env) = seeded::seed();

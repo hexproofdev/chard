@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier no_std: crates built without std.
+clippy.std_instead_of_core = "deny"
+clippy.std_instead_of_alloc = "deny"
+clippy.alloc_instead_of_core = "deny"
+clippy.host_endian_bytes = "deny"              # wire and on-disk formats name their byte order
+clippy.infinite_loop = "deny"                  # a loop that never ends returns `!`
+clippy.large_stack_frames = "deny"
+rust.elided_lifetimes_in_paths = "deny"        # zero-copy parsers show what they borrow

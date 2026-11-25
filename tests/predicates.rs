@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The macro and elf-static predicates, which are those checks' decoders.
-//!
-//! `src/predicate/macro_channel.rs` and `src/predicate/elf_static.rs` hold one
-//! `chard-predicate/1` value per check, and `probe::Check::decode` evaluates it.
-//! `tests/detector_replay.rs` replays the fixtures in `tests/fixtures/detectors.json`
-//! through `decode`.
-//!
-//! What this file holds: every macro and elf-static check has a predicate and every
-//! predicate a check; every word a predicate concludes is one its check's `Levels` admits;
-//! every clause is reached, over the fixtures and a generated space of macro values or a
-//! mutation space of `ElfFacts`; the published macro filter keeps every name a predicate
-//! reads, and the Published view over it concludes what the Live view concluded; every
-//! table a predicate's terms read is on its `tables`; every `ElfField` is a schema field;
-//! and the Published view of serialized facts concludes what the Live view concluded.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +21,7 @@ use chard::predicate::{self, Conclusion, LevelOf, Predicate};
 use chard::probe::{self, Channel, Check, Decoder};
 
 mod common;
+mod predicate_rules;
 
 /// Write a `chard:` line to the real stderr, which libtest does not capture, so a passing
 /// run's log carries the seed and the counts as plainly as a failing one; the same reason
@@ -30,8 +31,7 @@ macro_rules! announce {
         use std::io::Write as _;
         let line = format!("\n{}\n", format!($($arg)*));
         let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(line.as_bytes());
-        let _ = stderr.flush();
+        chard::error::best_effort(stderr.write_all(line.as_bytes()).and_then(|()| stderr.flush()));
     }};
 }
 
@@ -39,12 +39,6 @@ fn corpus_checks() -> impl Iterator<Item = &'static Check> {
     probe::CORPUS.iter().flat_map(|p| p.checks.iter())
 }
 
-/// Every macro and elf-static check decodes through a predicate its channel's table lists
-/// under its id, and every table entry is the predicate of a corpus check on that channel.
-///
-/// `probe::Decoder` makes a code decoder on either channel unrepresentable; this holds the
-/// two tables, which `predicate::for_check` and a report's published predicates are read
-/// from, to the decoders the corpus names, in both directions.
 #[test]
 fn every_macro_and_elf_static_check_has_a_predicate_and_no_predicate_is_orphaned() {
     let tables = [
@@ -141,17 +135,18 @@ fn predicate_of(check: &Check) -> &'static Predicate {
         .unwrap_or_else(|| panic!("{} has no predicate", check.id))
 }
 
-/// The macro channel: clause reach over fixtures and a generated space of macro values,
-/// and the published filter.
+/// The macro channel: clause reach over a generated space of macro values, and the
+/// published filter.
 mod macro_channel {
-    use std::path::Path;
-
-    use chard::fixture::Fixture;
-    use chard::measure::{MACRO_EVIDENCE_KEEP, relevant_macros};
-    use chard::predicate::{Cond, Evaluation, Fact, Live, Published, ReadKey, Term};
+    use chard::measure::MACRO_EVIDENCE_KEEP;
+    use chard::predicate::{Cond, ReadKey, Term};
     use chard::probe::Outcome;
 
     use super::*;
+    use crate::predicate_rules::{
+        PublishedReading, UnreadableReading, first, follows_names, integer_names, live, moved_by,
+        names_read, published_reading, unreadable_in, unreadable_reading,
+    };
 
     /// The flag spelling that forwards libc++'s mode to a named constant.
     const MODE_FLAG: &str = "-D_LIBCPP_HARDENING_MODE=";
@@ -168,7 +163,8 @@ mod macro_channel {
     /// sibling: the integer readings' edge cases, the spellings a build's `-D` arrives in
     /// that have no integer reading (`(3)`, `3L`, `2UL`, each measured as the text of
     /// `_FORTIFY_SOURCE`), the one decimal C types as unsigned, and the words the detectors
-    /// compare text to.
+    /// compare text to. A number with a leading zero is held by [`leading_zero_rows`]
+    /// instead: a value added here moves which seeded draws are taken.
     const VALUES: &[&str] = &[
         "",
         "0",
@@ -212,94 +208,15 @@ mod macro_channel {
             .collect()
     }
 
-    fn live(p: &Predicate, macros: &BTreeMap<String, String>) -> Evaluation {
-        predicate::evaluate(
-            p,
-            &Live {
-                macros: Some(macros),
-                elf: None,
-            },
-        )
-        .expect("a live view is complete")
-    }
-
-    /// Every term `p` reads, in its clauses and its conclusions.
-    fn terms(p: &Predicate) -> Vec<&Term> {
-        fn cond<'a>(c: &'a Cond, out: &mut Vec<&'a Term>) {
-            match c {
-                Cond::All(members) | Cond::Any(members) | Cond::NoneOf(members) => {
-                    for member in members {
-                        cond(member, out);
-                    }
-                }
-                Cond::Defined(t)
-                | Cond::Missing(t)
-                | Cond::Truth(t)
-                | Cond::Eq(t, _)
-                | Cond::Int(t, _, _)
-                | Cond::AnyStartsWith(t, _)
-                | Cond::AnyContains(t, _)
-                | Cond::NonEmpty(t) => out.push(t),
-            }
-        }
-        fn conclusion<'a>(c: &'a Conclusion, out: &mut Vec<&'a Term>) {
-            if let Conclusion::Present(LevelOf::Value(t)) = c {
-                out.push(t);
-            }
-        }
-        let mut out = Vec::new();
-        for clause in &p.clauses {
-            cond(&clause.when, &mut out);
-            conclusion(&clause.then, &mut out);
-        }
-        conclusion(&p.otherwise, &mut out);
-        out
-    }
-
-    /// Every macro name `p` names: its `macro` and `c-int` terms and the three the
-    /// `cxx-stdlib` ladder consults. The names a `c-int` goes on to follow are not here; they
-    /// come from the map, and [`mode_targets`] is the generated space's supply of them.
-    fn names_read(p: &Predicate) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        for t in terms(p) {
-            match t {
-                Term::Macro(name) | Term::CInt(name) => {
-                    out.insert(name.clone());
-                }
-                Term::CxxStdlib => {
-                    out.extend(
-                        ["_CXX_STDLIB", "_LIBCPP_VERSION", "__GLIBCXX__"].map(ToOwned::to_owned),
-                    );
-                }
-                Term::Elf(_) | Term::Symbol(_) | Term::SymbolNames => {
-                    panic!("a macro-channel predicate reads the artifact: {t:?}")
-                }
-            }
-        }
-        out
-    }
-
-    /// Whether `p` reads any `c-int` term, and so follows macro values as names.
-    fn follows_names(p: &Predicate) -> bool {
-        terms(p).iter().any(|t| matches!(t, Term::CInt(_)))
-    }
-
     /// The names libc++'s mode is forwarded to by something other than the filter under test:
-    /// every `-D_LIBCPP_HARDENING_MODE=NAME` in the corpus's control flags and in the recorded
-    /// fixtures' build argv. A control or a recorded build forwarding to a name the filter
-    /// does not keep fails `every_name_a_predicate_reads_is_kept`.
-    fn forwarded_mode_names(fixtures: &BTreeMap<String, Vec<Fixture>>) -> BTreeSet<String> {
-        let corpus = probe::CORPUS
+    /// every `-D_LIBCPP_HARDENING_MODE=NAME` in the corpus's control flags. A control
+    /// forwarding to a name the filter does not keep fails
+    /// `every_name_a_predicate_reads_is_kept`.
+    fn forwarded_mode_names() -> BTreeSet<String> {
+        probe::CORPUS
             .iter()
             .flat_map(|p| p.checks)
-            .flat_map(|c| c.positive.iter().chain(c.negative).map(|f| (*f).to_owned()));
-        let recorded = fixtures
-            .values()
-            .flatten()
-            .filter_map(|f| f.build.as_ref())
-            .flat_map(|b| b.argv.iter().cloned());
-        corpus
-            .chain(recorded)
+            .flat_map(|c| c.positive.iter().chain(c.negative))
             .flat_map(|flag| {
                 flag.split(',')
                     .filter_map(|piece| piece.trim().strip_prefix(MODE_FLAG).map(str::to_owned))
@@ -312,8 +229,8 @@ mod macro_channel {
     /// The names the generated space defines for a `c-int` to follow: the forwarded names,
     /// the filter's own libc++ constants (so each kept one is exercised), and
     /// [`UNKEPT_TARGET`].
-    fn mode_targets(fixtures: &BTreeMap<String, Vec<Fixture>>) -> BTreeSet<String> {
-        let mut targets = forwarded_mode_names(fixtures);
+    fn mode_targets() -> BTreeSet<String> {
+        let mut targets = forwarded_mode_names();
         targets.extend(
             MACRO_EVIDENCE_KEEP
                 .iter()
@@ -345,10 +262,10 @@ mod macro_channel {
     }
 
     impl Space {
-        fn of(p: &Predicate, fixtures: &BTreeMap<String, Vec<Fixture>>) -> Self {
+        fn of(p: &Predicate) -> Self {
             let mut read = names_read(p);
             if follows_names(p) {
-                read.extend(mode_targets(fixtures));
+                read.extend(mode_targets());
             }
             let names: Vec<String> = read.into_iter().collect();
             let mut domain: Vec<Option<String>> = vec![None];
@@ -434,55 +351,51 @@ mod macro_channel {
         }
     }
 
-    /// The recorded macro-channel fixtures, grouped by check.
-    fn fixtures() -> BTreeMap<String, Vec<Fixture>> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detectors.json");
-        let all: Vec<Fixture> =
-            serde_json::from_str(&std::fs::read_to_string(path).expect("readable")).expect("JSON");
-        let ids: BTreeSet<&str> = macro_checks().iter().map(|c| c.id).collect();
-        let mut grouped: BTreeMap<String, Vec<Fixture>> = BTreeMap::new();
-        for f in all {
-            if ids.contains(f.check.as_str()) {
-                grouped.entry(f.check.clone()).or_default().push(f);
-            }
-        }
-        grouped
-    }
+    /// Maps written out, each beside the generated space of its check, for a rung the draws
+    /// miss: fortify-headers at a request above 2, under either of its marks, where three
+    /// names must take one value each of the domain at once.
+    const WRITTEN_MAPS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "fortify-effective",
+            &[
+                ("_FORTIFY_IMPL", "fortify-headers"),
+                ("_FORTIFY_SOURCE", "3"),
+                ("__OPTIMIZE__", "1"),
+            ],
+        ),
+        (
+            "fortify-effective",
+            &[
+                ("_FORTIFY_HEADERS_H", ""),
+                ("_FORTIFY_SOURCE", "3"),
+                ("__OPTIMIZE__", "1"),
+            ],
+        ),
+    ];
 
-    /// Every macro map a check is exercised over: its fixtures, then its generated space.
-    fn every_map(
-        check: &Check,
-        fixtures: &BTreeMap<String, Vec<Fixture>>,
-    ) -> Vec<BTreeMap<String, String>> {
-        let space = Space::of(predicate_of(check), fixtures);
-        let mut maps: Vec<BTreeMap<String, String>> = fixtures
-            .get(check.id)
-            .map(|fs| fs.iter().map(|f| f.macros.clone()).collect())
-            .unwrap_or_default();
-        maps.extend(space.assignments().0.iter().map(|a| space.map(a)));
-        maps
-    }
-
-    /// The first few failures and how many there were, so one broken rule is not ten
-    /// thousand lines.
-    fn first(failures: &[String]) -> String {
-        let shown: Vec<&str> = failures.iter().take(8).map(String::as_str).collect();
-        format!(
-            "{} failures, the first {}:\n{}",
-            failures.len(),
-            shown.len(),
-            shown.join("\n")
-        )
+    /// Every macro map a check is exercised over: its [`WRITTEN_MAPS`], then its generated
+    /// space.
+    fn every_map(check: &Check) -> Vec<BTreeMap<String, String>> {
+        let space = Space::of(predicate_of(check));
+        WRITTEN_MAPS
+            .iter()
+            .filter(|(id, _)| *id == check.id)
+            .map(|(_, map)| {
+                map.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect()
+            })
+            .chain(space.assignments().0.iter().map(|a| space.map(a)))
+            .collect()
     }
 
     #[test]
     fn every_clause_is_reached() {
-        let grouped = fixtures();
         let mut dead = Vec::new();
         for check in macro_checks() {
             let p = predicate_of(check);
             let mut reached: BTreeMap<String, usize> = BTreeMap::new();
-            for m in every_map(check, &grouped) {
+            for m in every_map(check) {
                 *reached.entry(live(p, &m).clause).or_default() += 1;
             }
             announce!("chard: clauses reached: {}: {reached:?}", check.id);
@@ -495,24 +408,8 @@ mod macro_channel {
         assert!(dead.is_empty(), "clauses no map reaches: {dead:?}");
     }
 
-    /// The Published view over `relevant_macros(m)` and the published filter concludes what
-    /// the Live view concluded over `m`.
-    ///
-    /// One case reads as `Incomplete` and is counted rather than refused: a `c-int` follow to
-    /// a name the filter does not keep. `c-int` looks up whatever text a mode's value holds,
-    /// and the published map, trimmed to the filter, says nothing about a name outside it,
-    /// so the Published view stops at that key where the Live view read on. Both halves are
-    /// generated and both are counted: a value such as `x` naming a macro the map leaves
-    /// undefined, and [`UNKEPT_TARGET`] defined, which is `-D_LIBCPP_HARDENING_MODE=MYMODE
-    /// -DMYMODE=4` reading `fast` live and `Incomplete(macros.MYMODE)` published. That is the
-    /// view declining to conclude, never a different conclusion. The self-report prints the
-    /// mode's expansion, a number, and libc++'s own constants are kept, so only a
-    /// preprocessor-sourced map naming some other macro reaches it; the predicate in
-    /// `src/predicate/macro_channel.rs` records how a re-derivation reads it. Every other
-    /// read is of a kept name and never `Incomplete`.
     #[test]
     fn filtered_macros_suffice() {
-        let grouped = fixtures();
         let filter: Vec<String> = MACRO_EVIDENCE_KEEP
             .iter()
             .map(|n| (*n).to_owned())
@@ -522,47 +419,21 @@ mod macro_channel {
         let mut declined_undefined = 0usize;
         for check in macro_checks() {
             let p = predicate_of(check);
-            let named = names_read(p);
             let mut fed = 0usize;
             let mut declined = 0usize;
-            for m in every_map(check, &grouped) {
+            for m in every_map(check) {
                 fed += 1;
-                let whole = live(p, &m);
-                let published = serde_json::to_value(relevant_macros(&m)).expect("a string map");
-                let view =
-                    Published::new(Some(&published), Some(&filter), None, None).expect("an object");
-                match predicate::evaluate(p, &view) {
-                    Ok(eval) if eval == whole => {}
-                    Ok(eval) => failures.push(format!(
-                        "{}: over {m:?} the published view concluded {eval:?}, the live view \
-                     {whole:?}",
-                        check.id
-                    )),
-                    Err(incomplete) => {
-                        let key = incomplete.0.strip_prefix("macros.").unwrap_or_default();
-                        // Reached only by following: no term names it, the filter does not
-                        // keep it, and the live evaluation read it.
-                        let unkept_follow = follows_names(p)
-                            && !named.contains(key)
-                            && !MACRO_EVIDENCE_KEEP.contains(&key)
-                            && whole
-                                .reads
-                                .iter()
-                                .any(|r| r.key == ReadKey::Macro(key.to_owned()));
-                        if unkept_follow {
-                            declined += 1;
-                            if m.contains_key(key) {
-                                declined_defined += 1;
-                            } else {
-                                declined_undefined += 1;
-                            }
-                        } else {
-                            failures.push(format!(
-                                "{}: over {m:?} the published view is Incomplete({})",
-                                check.id, incomplete.0
-                            ));
-                        }
+                match published_reading(check.id, p, &m, &filter) {
+                    PublishedReading::Agrees => {}
+                    PublishedReading::DeclinedDefined => {
+                        declined += 1;
+                        declined_defined += 1;
                     }
+                    PublishedReading::DeclinedUndefined => {
+                        declined += 1;
+                        declined_undefined += 1;
+                    }
+                    PublishedReading::Fails(failure) => failures.push(failure),
                 }
             }
             announce!(
@@ -583,16 +454,9 @@ mod macro_channel {
         );
     }
 
-    /// Every name a predicate reads is one the published filter keeps: its terms, the
-    /// `cxx-stdlib` ladder's three, and every defined name a `c-int` followed anywhere in the
-    /// fixtures or the generated space, except [`UNKEPT_TARGET`], which the space plants
-    /// outside the filter so the follow is seen. The forwarded names come from the corpus's
-    /// controls and the recorded builds rather than from the filter, and each must be
-    /// followed somewhere.
     #[test]
     fn every_name_a_predicate_reads_is_kept() {
-        let grouped = fixtures();
-        let forwarded = forwarded_mode_names(&grouped);
+        let forwarded = forwarded_mode_names();
         assert!(
             !MACRO_EVIDENCE_KEEP.contains(&UNKEPT_TARGET),
             "{UNKEPT_TARGET} is kept, so it no longer stands for a name outside the filter"
@@ -607,13 +471,13 @@ mod macro_channel {
                     missing.insert(name.clone());
                 }
             }
-            for m in every_map(check, &grouped) {
+            for m in every_map(check) {
                 for read in live(p, &m).reads {
                     if let ReadKey::Macro(name) = read.key
-                        && m.contains_key(&name)
-                        && !named.contains(&name)
+                        && m.contains_key(name.as_str())
+                        && !named.contains(name.as_str())
                     {
-                        followed.insert(name);
+                        followed.insert(name.as_str().to_owned());
                     }
                 }
             }
@@ -624,8 +488,8 @@ mod macro_channel {
             }
         }
         announce!(
-            "chard: kept names: {} defined names followed by c-int, {} forwarded by the corpus \
-         and the recorded builds: {forwarded:?}",
+            "chard: kept names: {} defined names followed by c-int, {} forwarded by the corpus's \
+         controls: {forwarded:?}",
             followed.len(),
             forwarded.len()
         );
@@ -642,54 +506,112 @@ mod macro_channel {
         assert!(missing.is_empty(), "read and not kept: {missing:?}");
     }
 
-    /// The names `p` reads as integers through a `macro` term: in an `int` or `truth`
-    /// condition, or as a `value` level. A `c-int` term is not here: it reads by its own
-    /// rule, under which text that is no value is `Undefined`, and the predicates over it
-    /// withhold under a clause of their own (`libcxx-unrecognised`).
-    fn integer_names(p: &Predicate) -> BTreeSet<String> {
-        fn cond(c: &Cond, out: &mut BTreeSet<String>) {
-            match c {
-                Cond::All(members) | Cond::Any(members) | Cond::NoneOf(members) => {
-                    for member in members {
-                        cond(member, out);
-                    }
-                }
-                Cond::Int(Term::Macro(name), _, _) | Cond::Truth(Term::Macro(name)) => {
-                    out.insert(name.clone());
-                }
-                Cond::Int(_, _, _)
-                | Cond::Truth(_)
-                | Cond::Defined(_)
-                | Cond::Missing(_)
-                | Cond::Eq(_, _)
-                | Cond::AnyStartsWith(_, _)
-                | Cond::AnyContains(_, _)
-                | Cond::NonEmpty(_) => {}
-            }
+    #[test]
+    fn a_reading_some_integer_would_move_is_found() {
+        let x = || Term::Macro("X".to_owned());
+        let y = || Term::Macro("Y".to_owned());
+        let maps = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let one = Predicate {
+            tables: Vec::new(),
+            clauses: vec![predicate::Clause {
+                id: "seven".to_owned(),
+                when: Cond::Int(x(), predicate::Cmp::Eq, 7),
+                then: Conclusion::Absent,
+                because: "X is 7".to_owned(),
+            }],
+            otherwise: Conclusion::Present(LevelOf::None),
+        };
+        let m = maps(&[("X", "(7)")]);
+        let eval = live(&one, &m);
+        assert_eq!(eval.outcome, Outcome::Present);
+        let names = unreadable_in(&m, &BTreeSet::from(["X".to_owned()]));
+        assert_eq!(names, ["X"]);
+        let moved = moved_by(&one, &m, &eval, &names);
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(moved[0].starts_with("X=7 moves to Absent"), "{moved:?}");
+
+        let pair = Predicate {
+            tables: Vec::new(),
+            clauses: vec![predicate::Clause {
+                id: "both".to_owned(),
+                when: Cond::All(vec![
+                    Cond::Int(x(), predicate::Cmp::Gt, 0),
+                    Cond::Int(y(), predicate::Cmp::Gt, 0),
+                ]),
+                then: Conclusion::Present(LevelOf::None),
+                because: "X and Y are above zero".to_owned(),
+            }],
+            otherwise: Conclusion::Absent,
+        };
+        let m = maps(&[("X", "x"), ("Y", "y")]);
+        let eval = live(&pair, &m);
+        assert_eq!((eval.outcome, eval.reads.len()), (Outcome::Absent, 1));
+        let names = unreadable_in(&m, &BTreeSet::from(["X".to_owned(), "Y".to_owned()]));
+        let moved = moved_by(&pair, &m, &eval, &names);
+        assert!(
+            moved
+                .iter()
+                .any(|line| line.contains("X=1 Y=1 moves to Present")),
+            "{moved:?}"
+        );
+        // The values tried hold each bound's neighbour and the three around zero: a reading
+        // that moves only above a bound, or only where `truth` holds, is found.
+        let shaped = |when: Cond| Predicate {
+            clauses: vec![predicate::Clause {
+                id: "shaped".to_owned(),
+                when,
+                ..pair.clauses[0].clone()
+            }],
+            ..pair.clone()
+        };
+        let x_only = maps(&[("X", "x")]);
+        let x_name = ["X".to_owned()];
+        for (when, at) in [
+            (Cond::Int(x(), predicate::Cmp::Gt, 5), "X=6 "),
+            (Cond::Truth(x()), "X=-1 "),
+        ] {
+            let p = shaped(when);
+            let eval = live(&p, &x_only);
+            assert_eq!(eval.outcome, Outcome::Absent);
+            let moved = moved_by(&p, &x_only, &eval, &x_name);
+            assert!(
+                moved.iter().any(|line| line.starts_with(at)),
+                "{at}: {moved:?}"
+            );
         }
-        let mut out = BTreeSet::new();
-        for clause in &p.clauses {
-            cond(&clause.when, &mut out);
-            if let Conclusion::Present(LevelOf::Value(Term::Macro(name))) = &clause.then {
-                out.insert(name.clone());
-            }
+        // Every assignment is visited: under `any`, the five of nine where X or Y is 1 move.
+        let either = Predicate {
+            clauses: vec![predicate::Clause {
+                id: "either".to_owned(),
+                when: Cond::Any(vec![
+                    Cond::Int(x(), predicate::Cmp::Gt, 0),
+                    Cond::Int(y(), predicate::Cmp::Gt, 0),
+                ]),
+                ..pair.clauses[0].clone()
+            }],
+            ..pair.clone()
+        };
+        let eval = live(&either, &m);
+        assert_eq!(eval.outcome, Outcome::Absent);
+        assert_eq!(moved_by(&either, &m, &eval, &names).len(), 5);
+        // One name at a time finds nothing: the shape the joint substitution is for.
+        for name in &names {
+            assert!(
+                moved_by(&pair, &m, &eval, std::slice::from_ref(name))
+                    .iter()
+                    .all(|line| !line.contains("Present")),
+                "{name} alone moved the pair"
+            );
         }
-        if let Conclusion::Present(LevelOf::Value(Term::Macro(name))) = &p.otherwise {
-            out.insert(name.clone());
-        }
-        out
     }
 
-    /// A macro defined with text that has no integer reading decides no verdict: over
-    /// every fixture and generated map, a reading that is `present` or `absent` read no
-    /// such text from a name its predicate reads as an integer. `int` is false over text
-    /// it cannot read, so without the `unreadable` clauses `-D_FORTIFY_SOURCE=(3)` fell to
-    /// `@otherwise` and published `off` beside the library's level 3; this holds every
-    /// predicate to withholding there, whichever clause does it, and counts the maps that
-    /// exercised it so the rule is not held over nothing.
     #[test]
     fn a_macro_with_no_integer_reading_decides_no_verdict() {
-        let grouped = fixtures();
         let mut failures = Vec::new();
         let mut held = Vec::new();
         for check in macro_checks() {
@@ -701,47 +623,36 @@ mod macro_channel {
             held.push(check.id);
             let mut fed = 0usize;
             let mut withheld = 0usize;
-            for m in every_map(check, &grouped) {
+            let mut stood = 0usize;
+            for m in every_map(check) {
                 fed += 1;
-                let eval = live(p, &m);
-                // Defined text that is not readable, by the language's own reading and
-                // the one decimal `readable` leaves out (`macro_channel::readable`).
-                let unreadable: Vec<&str> = eval
-                    .reads
-                    .iter()
-                    .filter_map(|r| match (&r.key, &r.value) {
-                        (ReadKey::Macro(name), Fact::Text(_))
-                            if names.contains(name)
-                                && r.value.integer().is_none_or(|i| i == i64::MIN) =>
-                        {
-                            Some(name.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if unreadable.is_empty() {
-                    continue;
-                }
-                if eval.outcome == Outcome::Indeterminate {
-                    withheld += 1;
-                } else {
-                    failures.push(format!(
-                        "{}: over {m:?} read {unreadable:?} with no integer reading and \
-                         concluded {:?} under {}",
-                        check.id, eval.outcome, eval.clause
-                    ));
+                match unreadable_reading(check.id, p, &names, &m) {
+                    UnreadableReading::NotRead => {}
+                    UnreadableReading::Withheld => withheld += 1,
+                    UnreadableReading::Stood => stood += 1,
+                    UnreadableReading::Fails(failure) => failures.push(failure),
                 }
             }
             announce!(
-                "chard: unreadable macros: {}: {withheld} of {fed} maps read one of {names:?} \
-                 as text with no integer reading, every one withheld",
-                check.id
+                "chard: unreadable macros: {}: {} of {fed} maps read one of {names:?} as text \
+                 with no integer reading: {withheld} withheld, {stood} the reading every \
+                 integer there gives",
+                check.id,
+                withheld + stood
             );
             assert!(
                 withheld > 0,
                 "{}: no map reads a name among {names:?} as text with no integer reading",
                 check.id
             );
+            // The one predicate with a rung ahead of its unreadable one that holds at every
+            // value: the rule's second side is held over maps that reach it.
+            if check.id == "fortify-effective" {
+                assert!(
+                    stood > 0,
+                    "fortify-effective: no reading stood at every value"
+                );
+            }
         }
         // The checks the rule holds, pinned, so one that stops reading an integer through a
         // `macro` term leaves the rule loudly rather than by a `continue`.
@@ -960,7 +871,139 @@ mod macro_channel {
                 None,
             ),
         ]);
+        rows.extend(fortify_request_rows());
         rows
+    }
+
+    /// The request below the libraries' rungs, and the leading-zero spellings. At or below
+    /// zero a request is no request, as glibc reads it. Without optimization, or on a
+    /// FreeBSD with no `<ssp/ssp.h>`, no implementation instantiates at any request, so a
+    /// request the language cannot read (`(3)`, `010`, empty text) is `absent` there. An
+    /// optimized one beside no library is withheld. A leading zero, which C reads as octal,
+    /// is withheld by `fortify-requested` and by glibc's level rung too.
+    fn fortify_request_rows() -> Vec<Row> {
+        let fs = "_FORTIFY_SOURCE";
+        let opt = "__OPTIMIZE__";
+        let w = Outcome::Indeterminate;
+        let effective = "fortify-effective";
+        let absent = |macros: &[(&str, &str)], clause: &str| {
+            row(effective, macros, clause, Outcome::Absent, None)
+        };
+        vec![
+            absent(&[(fs, "-1"), (opt, "2")], "not-requested"),
+            absent(&[(fs, "0"), (opt, "2")], "not-requested"),
+            absent(&[(opt, "2")], "not-requested"),
+            absent(&[(fs, "(3)")], "requested-without-optimization"),
+            absent(&[(fs, "3L")], "requested-without-optimization"),
+            absent(&[(fs, "3")], "requested-without-optimization"),
+            absent(&[(fs, "010")], "requested-without-optimization"),
+            absent(&[(fs, "")], "requested-without-optimization"),
+            row(
+                effective,
+                &[(fs, ""), (opt, "2")],
+                "requested-unreadable",
+                w,
+                None,
+            ),
+            absent(
+                &[(fs, "(3)"), ("__FreeBSD__", "14"), (opt, "1")],
+                "freebsd-without-ssp",
+            ),
+            row(
+                effective,
+                &[(fs, "(3)"), (opt, "2")],
+                "requested-unreadable",
+                w,
+                None,
+            ),
+            row(
+                effective,
+                &[(fs, "010"), (opt, "2")],
+                "requested-unreadable",
+                w,
+                None,
+            ),
+            row(
+                effective,
+                &[(fs, "-01"), (opt, "2")],
+                "requested-unreadable",
+                w,
+                None,
+            ),
+            row(
+                "fortify-requested",
+                &[(fs, "08"), (opt, "2")],
+                "requested-unreadable",
+                w,
+                None,
+            ),
+            row(
+                "fortify-effective",
+                &[(fs, "2"), ("__USE_FORTIFY_LEVEL", "02"), (opt, "2")],
+                "glibc-unreadable",
+                w,
+                None,
+            ),
+        ]
+    }
+
+    /// A number with a leading zero, which C reads as octal, in every other predicate that
+    /// reads a macro as an integer, and in `c-int`: each withholds under its own clause.
+    fn leading_zero_rows() -> Vec<Row> {
+        let w = Outcome::Indeterminate;
+        let bti = "__ARM_FEATURE_BTI_DEFAULT";
+        let pac = "__ARM_FEATURE_PAC_DEFAULT";
+        let mode = "_LIBCPP_HARDENING_MODE";
+        let libcxx = ("_LIBCPP_VERSION", "220100");
+        let cxx = "cxx-hardening-requested";
+        vec![
+            row("pic-macro", &[("__PIC__", "02")], "unreadable", w, None),
+            row("cet-macro", &[("__CET__", "03")], "unrecognised", w, None),
+            row(
+                "gcs-macro",
+                &[("__ARM_FEATURE_GCS_DEFAULT", "01")],
+                "unreadable",
+                w,
+                None,
+            ),
+            row(
+                "branch-protection-macro",
+                &[(bti, "01"), (pac, "1")],
+                "unreadable",
+                w,
+                None,
+            ),
+            row(
+                "branch-protection-macro",
+                &[(bti, "1"), (pac, "02")],
+                "unreadable",
+                w,
+                None,
+            ),
+            row(
+                "exceptions-macro",
+                &[("__EXCEPTIONS", "01")],
+                "unreadable",
+                w,
+                None,
+            ),
+            row(
+                cxx,
+                &[libcxx, (mode, "016")],
+                "libcxx-unrecognised",
+                w,
+                None,
+            ),
+            row(
+                cxx,
+                &[libcxx, (mode, "(01 << 4)")],
+                "libcxx-unrecognised",
+                w,
+                None,
+            ),
+            row(cxx, &[libcxx, (mode, "-0")], "libcxx-unrecognised", w, None),
+            row(cxx, &[libcxx, (mode, "")], "libcxx-unrecognised", w, None),
+        ]
     }
 
     /// The other predicates that read a macro as an integer, over a spelling the integer
@@ -974,6 +1017,7 @@ mod macro_channel {
         let w = Outcome::Indeterminate;
         vec![
             row("pie-macro", &[("__PIE__", "(2)")], "unreadable", w, None),
+            row("pie-macro", &[("__PIE__", "02")], "unreadable", w, None),
             row("pic-macro", &[("__PIC__", "2L")], "unreadable", w, None),
             row("cet-macro", &[("__CET__", "(3)")], "unrecognised", w, None),
             row("cet-macro", &[("__CET__", "4")], "unrecognised", w, None),
@@ -1031,117 +1075,28 @@ mod macro_channel {
         ]
     }
 
-    /// The spellings measured or named in review, each under the clause that withholds
-    /// it, beside the readings that stay, and the rung order where it decides: a library
-    /// that identified itself is read ahead of an unreadable request, and glibc's
-    /// unreadable level ahead of Apple's readable one.
     #[test]
     fn the_unreadable_spellings_withhold_under_a_named_clause() {
-        let rows: Vec<Row> = fortify_rows().into_iter().chain(other_rows()).collect();
+        let rows: Vec<Row> = fortify_rows()
+            .into_iter()
+            .chain(other_rows())
+            .chain(leading_zero_rows())
+            .collect();
         let mut fed = 0usize;
+        let mut wrong = Vec::new();
         for (check, macros, clause, outcome, level) in &rows {
             fed += 1;
             let eval = live(predicate_of(check), macros);
-            assert_eq!(
-                (&eval.clause, eval.outcome, &eval.level),
-                (clause, *outcome, level),
-                "{}: over {macros:?}",
-                check.id
-            );
+            if (&eval.clause, eval.outcome, &eval.level) != (clause, *outcome, level) {
+                wrong.push(format!(
+                    "{}: over {macros:?} read {:?} at {:?} under {}, not {outcome:?} at \
+                     {level:?} under {clause}",
+                    check.id, eval.outcome, eval.level, eval.clause
+                ));
+            }
         }
-        assert_eq!(fed, 32);
-    }
-
-    /// The reason `fortify-effective` publishes under fortify-headers.
-    fn reason_of(clause: &str) -> &'static str {
-        let p = chard::predicate::macro_channel::fortify_effective();
-        let found = p.clauses.iter().find(|c| c.id == clause);
-        &found
-            .unwrap_or_else(|| panic!("{clause} is a clause"))
-            .because
-    }
-
-    /// Under fortify-headers the reason names the builtin the request selects, the level is 1
-    /// at every readable request, and a request with no integer reading, or none, is withheld.
-    /// fortify-headers 3.0.2's `__bos` is `__builtin_dynamic_object_size` above 2,
-    /// and Alpine 3.24 and edge and Chimera read `fortify-enforced-dynamic` `on` there, beside
-    /// a reason that said the checks use `__builtin_object_size` only. A request at 2 still
-    /// reads that reason word for word.
-    ///
-    /// Both requests are recorded rows of `detectors.json` (Alpine 3.24.1 at 2, Chimera at
-    /// 3), and the include guard alone is read the same way, so the clause depends on the
-    /// request and not on which of the two marks identified the library.
-    #[test]
-    fn fortify_headers_reasons_name_the_builtin_the_request_selects() {
-        use chard::predicate::macro_channel::{
-            FORTIFY_HEADERS_CLAUSE, FORTIFY_HEADERS_DYNAMIC_CLAUSE, FORTIFY_HEADERS_UNREAD_CLAUSE,
-        };
-        let check = macro_checks()
-            .into_iter()
-            .find(|c| c.id == "fortify-effective")
-            .expect("fortify-effective is a macro check");
-        // Each reason word for word, so a rewrite that brings back a whole-object-only claim,
-        // or drops the condition that keeps the sentence true on Alpine 3.21, fails here.
-        assert_eq!(
-            reason_of(FORTIFY_HEADERS_CLAUSE),
-            "fortify-headers: its checks use whole-object __builtin_object_size only and never \
-             subobject bounds, so the enforced level is 1 whatever level was requested"
-        );
-        assert_eq!(
-            reason_of(FORTIFY_HEADERS_DYNAMIC_CLAUSE),
-            "fortify-headers at a request above 2: its checks never ask a subobject's bounds, \
-             so the enforced level is 1, since level 2 is defined by subobject bounds; at this \
-             request they size objects with __builtin_dynamic_object_size where the installed \
-             headers and the compiler both provide it, which fortify-enforced-dynamic measures \
-             and this level does not say"
-        );
-        assert_eq!(
-            reason_of(FORTIFY_HEADERS_UNREAD_CLAUSE),
-            "fortify-headers identified itself, and _FORTIFY_SOURCE is undefined or defined with \
-             text chard's integer reading does not read, so which builtin its checks size \
-             objects with, which the request selects, cannot be read from it and the verdict is \
-             withheld"
-        );
-        let expected = fortify_headers_expected;
-        let recorded = fixtures();
-        let rows: Vec<&Fixture> = recorded
-            .get(check.id)
-            .into_iter()
-            .flatten()
-            .filter(|f| {
-                f.arm.is_none()
-                    && f.macros.get("_FORTIFY_IMPL").map(String::as_str) == Some("fortify-headers")
-            })
-            .collect();
-        let mut requests = BTreeSet::new();
-        for f in &rows {
-            let request = f.macros.get("_FORTIFY_SOURCE").expect("a request").as_str();
-            let eval = live(predicate_of(check), &f.macros);
-            // The request is read, so `evidence.observed` names it beside the mark.
-            assert!(
-                eval.reads
-                    .iter()
-                    .any(|r| r.key == ReadKey::Macro("_FORTIFY_SOURCE".to_owned())),
-                "{}: the request is read",
-                f.toolchain
-            );
-            assert_eq!(
-                (eval.clause.as_str(), eval.outcome, eval.level.as_deref()),
-                expected(Some(request)),
-                "{} at {request}",
-                f.toolchain
-            );
-            requests.insert(request.to_owned());
-        }
-        eprintln!(
-            "fortify-headers rows of detectors.json: {} fed, requests {requests:?}",
-            rows.len()
-        );
-        assert_eq!(rows.len(), 2, "the recorded rows: {requests:?}");
-        assert!(
-            requests.contains("2") && requests.contains("3"),
-            "the recorded rows hold a request at 2 and one above it: {requests:?}"
-        );
+        assert!(wrong.is_empty(), "{}", first(&wrong));
+        assert_eq!(fed, 58);
     }
 
     /// The clause each request decides under fortify-headers, written out per request rather
@@ -1164,8 +1119,6 @@ mod macro_channel {
         }
     }
 
-    /// Both marks at every request shape, and no mark at all, decide the clause the request
-    /// selects, and a clause that reads the level is exactly one the slot reads.
     #[test]
     fn fortify_headers_clause_follows_the_request_under_either_mark() {
         use chard::predicate::macro_channel::{
@@ -1207,6 +1160,15 @@ mod macro_channel {
                     expected(request),
                     "{mark:?} at {request:?}"
                 );
+                // A request is read, so `evidence.observed` names it beside the mark.
+                assert!(
+                    request.is_none()
+                        || eval.reads.iter().any(|r| matches!(
+                            &r.key,
+                            ReadKey::Macro(n) if n.as_str() == "_FORTIFY_SOURCE"
+                        )),
+                    "{mark:?} at {request:?}: the request is read"
+                );
                 assert_eq!(
                     FORTIFY_HEADERS_CLAUSES.contains(&eval.clause.as_str()),
                     eval.outcome == Outcome::Present,
@@ -1239,19 +1201,19 @@ mod macro_channel {
     }
 }
 
-/// The elf-static channel: clause reach over fixtures and a mutation space of `ElfFacts`,
-/// the tables, the schema fields and the Published view.
+/// The elf-static channel: clause reach over a mutation space of the synthetic objects'
+/// `ElfFacts`, the tables, the schema fields and the Published view.
 mod elf_static {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::LazyLock;
 
     use chard::elf::{self, ElfFacts, ElfTable, SymbolFact, Truncation, TruncationKind};
-    use chard::fixture::Fixture;
     use chard::predicate::{Cond, ElfField, FactView as _, Incomplete, Live, Published, Term};
     use chard::probe::Evidence;
     use serde_json::Value;
 
     use super::*;
+    use crate::predicate_rules::published_elf;
 
     /// The elf-static checks the corpus ships, in corpus order.
     fn elf_static_checks() -> Vec<&'static Check> {
@@ -1275,15 +1237,6 @@ mod elf_static {
             .unwrap_or_else(|Incomplete(key)| panic!("{}: a Live view lacked {key}", check.id))
     }
 
-    fn fixtures_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detectors.json")
-    }
-
-    fn load_fixtures() -> Vec<Fixture> {
-        let text = std::fs::read_to_string(fixtures_path()).expect("the replay corpus is readable");
-        serde_json::from_str(&text).expect("the replay corpus is valid JSON")
-    }
-
     /// The synthetic objects `tests/elf_builder` writes, read through the real reader, with
     /// their file names.
     fn synthetic_objects() -> Vec<(String, ElfFacts)> {
@@ -1305,7 +1258,7 @@ mod elf_static {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             out.len(),
-            super::common::ELF_FIXTURE_COUNT,
+            common::ELF_FIXTURE_COUNT,
             "tests/fixtures/elf holds the catalogue's objects"
         );
         out
@@ -1319,62 +1272,12 @@ mod elf_static {
         elf: Option<ElfFacts>,
     }
 
-    /// Every replayed case: each elf-static fixture under its own check, and each synthetic
-    /// object under every elf-static check. Every fixture row is either fed or passed over
-    /// because the corpus names its check on another channel, with none of the per-check
-    /// counts zero.
+    /// Every case: each synthetic object under every elf-static check, then each of
+    /// [`written_bases`] under its own check.
     static CASES: LazyLock<Vec<Case>> = LazyLock::new(|| {
         let checks = elf_static_checks();
-        let by_id: BTreeMap<&str, &'static Check> = checks.iter().map(|c| (c.id, *c)).collect();
-        let fixtures = load_fixtures();
-
-        let mut cases = Vec::new();
-        let mut fed: BTreeMap<&str, usize> = BTreeMap::new();
-        let mut other_channel = 0usize;
-        for f in &fixtures {
-            let Some(check) = by_id.get(f.check.as_str()) else {
-                let channel = probe::CORPUS
-                    .iter()
-                    .flat_map(|p| p.checks)
-                    .find(|c| c.id == f.check)
-                    .map(Check::channel);
-                assert!(
-                    channel.is_some_and(|c| c != Channel::ElfStatic),
-                    "fixture row for {} was passed over, and the corpus names it on {channel:?}",
-                    f.check
-                );
-                other_channel += 1;
-                continue;
-            };
-            *fed.entry(check.id).or_default() += 1;
-            cases.push(Case {
-                check,
-                label: format!(
-                    "detectors.json {} {} {}",
-                    f.check,
-                    f.toolchain,
-                    f.arch.as_deref().unwrap_or("-")
-                ),
-                macros: f.macros.clone(),
-                elf: f.elf.clone(),
-            });
-        }
-        let expected_rows = cases.len();
-        assert_eq!(
-            expected_rows + other_channel,
-            fixtures.len(),
-            "every fixture row was fed or passed over as another channel's"
-        );
-        for check in &checks {
-            assert!(
-                fed.get(check.id).copied().unwrap_or(0) > 0,
-                "{} has no fixture in the replay corpus, so no recorded artifact reaches its \
-             predicate's clauses",
-                check.id
-            );
-        }
-
         let synthetic = synthetic_objects();
+        let mut cases = Vec::new();
         for (name, facts) in &synthetic {
             for check in &checks {
                 cases.push(Case {
@@ -1385,13 +1288,108 @@ mod elf_static {
                 });
             }
         }
+        let written = written_bases(&object_in(&synthetic));
+        for (id, label, facts) in &written {
+            let check = checks
+                .iter()
+                .find(|c| c.id == *id)
+                .unwrap_or_else(|| panic!("{id} is an elf-static check"));
+            cases.push(Case {
+                check,
+                label: format!("written: {label} under {id}"),
+                macros: BTreeMap::new(),
+                elf: Some(facts.clone()),
+            });
+        }
         assert_eq!(
             cases.len(),
-            expected_rows + synthetic.len() * checks.len(),
+            synthetic.len() * checks.len() + written.len(),
             "every synthetic object was fed under every elf-static check"
         );
         cases
     });
+
+    /// The relocatable object with functions, which the written bases and the tests that
+    /// set `function_references` start from.
+    const OBJECT_WITH_FUNCTIONS: &str = "elf64-le-x86_64-rel-functions.elf";
+
+    fn object_in(objects: &[(String, ElfFacts)]) -> ElfFacts {
+        objects
+            .iter()
+            .find(|(name, _)| name == OBJECT_WITH_FUNCTIONS)
+            .map_or_else(
+                || panic!("tests/fixtures/elf holds {OBJECT_WITH_FUNCTIONS}"),
+                |(_, facts)| facts.clone(),
+            )
+    }
+
+    fn object_with_functions() -> ElfFacts {
+        object_in(&synthetic_objects())
+    }
+
+    /// `function_references` of `probes/optimization_applied.c`'s object at `-O0`: both calls.
+    const UNOPTIMISED_CALLS: &[&str] = &[
+        "chard_opt_probe:",
+        "chard_opt_probe:chard_opt_anchor",
+        "chard_opt_probe:chard_opt_dead",
+    ];
+    /// The same above `-O0`: the anchor alone.
+    const OPTIMISED_CALLS: &[&str] = &["chard_opt_probe:", "chard_opt_probe:chard_opt_anchor"];
+
+    /// Facts no synthetic object holds, each written on [`OBJECT_WITH_FUNCTIONS`] for the
+    /// one check whose clause it reaches: a landing-pad table, a RETGUARD cookie section,
+    /// printf's checking call with flag 1, and the optimization probe's calls at `-O0` and
+    /// above it. The walk edits one other dimension at a time and leaves a check's own
+    /// fields as the base has them, so each clause is reached from its base.
+    fn written_bases(object: &ElfFacts) -> Vec<(&'static str, &'static str, ElfFacts)> {
+        let with_section = |name: String| {
+            let mut facts = object.clone();
+            facts.sections.push(name);
+            facts
+        };
+        let mut printf = object.clone();
+        printf.code_scanned = vec!["chard_fortify_printf_probe:x86-mov-edi-1=1".to_owned()];
+        printf.code_matches = vec!["chard_fortify_printf_probe:x86-mov-edi-1@0x8".to_owned()];
+        printf.watched_symbols.insert(
+            "__printf_chk".to_owned(),
+            SymbolFact {
+                defined: false,
+                tables: vec![".symtab".to_owned()],
+                versioned: Vec::new(),
+            },
+        );
+        let with_calls = |calls: &[&str]| {
+            let mut facts = object.clone();
+            facts.function_references = Some(calls.iter().map(|s| (*s).to_owned()).collect());
+            facts
+        };
+        vec![
+            (
+                "except-table-emitted",
+                "a landing-pad table",
+                with_section(predicate::elf_static::EXCEPT_TABLE_SECTION_PREFIX.to_owned()),
+            ),
+            (
+                "ret-protector-emitted",
+                "a RETGUARD cookie section",
+                with_section(format!(
+                    "{}chard_ret_probe",
+                    predicate::elf_static::RETGUARD_SECTION_PREFIX
+                )),
+            ),
+            ("fortify-printf-flag", "flag 1 beside __printf_chk", printf),
+            (
+                "optimization-applied",
+                "both calls",
+                with_calls(UNOPTIMISED_CALLS),
+            ),
+            (
+                "optimization-applied",
+                "the anchor alone",
+                with_calls(OPTIMISED_CALLS),
+            ),
+        ]
+    }
 
     // --- the mutation space ------------------------------------------------------------
 
@@ -1413,9 +1411,8 @@ mod elf_static {
     /// and the empty string, which is a non-empty list's one item, and two section
     /// names: 32-bit ARM's `.rel.ARM.extab`, which `except-table-emitted` reads as a landing-pad
     /// table, and the `.ARM.extab` it relocates, which unwind tables write without one. The walk
-    /// reaches the clause with them; what holds `.ARM.extab` alone to `absent` is the replay
-    /// corpus's two gcc unwind-table rows from the armv6 board, which a prefix widened to
-    /// `.ARM.extab` fails.
+    /// reaches the clause with them; [`an_unwind_table_alone_is_no_landing_pad_table`] holds
+    /// `.ARM.extab` alone to `absent`, which a prefix widened to `.ARM.extab` fails.
     const LIST_ITEMS: &[&str] = &[
         "libm.so.6",
         "libc.so.6",
@@ -1444,29 +1441,6 @@ mod elf_static {
     /// `strong` row with the guard unattributed, which reaches it too, since the reference
     /// could be `ssp_any`'s; and the same row with only a call unattributed, which is no
     /// canary and reads `strong`.
-    ///
-    /// The next seven carry the fifth function, `ssp_safe_array`, and `SafeStack`'s marker
-    /// (`elf_static::SAFESTACK_MARKER`): the `unsafe-frame` row clang
-    /// 22.1.8 gives at -O1 and above (the three escaping functions canaried with the
-    /// unsafe stack pointer, `ssp_any` and the in-range array bare); the same at -O0, where
-    /// `SafeStack` moves the array too and it reads `CU`; the marker beside an ordinary canary
-    /// on the array with no unsafe frame, which fits no rule and withholds; `strong`'s
-    /// pattern with the array bare and no marker, which is not `strong` and withholds;
-    /// every function canaried, `all` over five; the marker beside a canary on every
-    /// function (`all` excludes the marker as the other rungs do), which no measured clang
-    /// built and which fits no rule and withholds; and
-    /// `-fno-stack-protector` with `SafeStack`, the unsafe stack in use and no canary, which
-    /// reads `none`.
-    ///
-    /// The last four hold `basic` to the marker and to the fifth
-    /// function ([`BASIC_ROWS`]): the marker beside `basic`'s own canary pattern (the unsafe
-    /// stack pointer in three functions, `ssp_addr_taken` with no canary, the in-range array
-    /// bare), which clang 22.1.8 produced from a copy of the probe with `no_stack_protector`
-    /// on `ssp_addr_taken` under `-O2 -fstack-protector-strong -fsanitize=safe-stack`, and
-    /// which would read `basic` without this row; `basic`'s pattern with no marker and the
-    /// in-range array bare while `ssp_char_array` is canaried, which no threshold produces;
-    /// plain `-fstack-protector` over five, both arrays canaried; and the raised threshold
-    /// over five, both arrays bare.
     const FUNCTION_ROWS: &[&[&str]] = &[
         &["ssp_any:", "ssp_addr_taken:", "ssp_char_array:"],
         &[
@@ -1788,6 +1762,125 @@ mod elf_static {
         ],
     ];
 
+    /// The `function_references` lists of `probes/optimization_applied.c`'s object beyond
+    /// [`UNOPTIMISED_CALLS`] and [`OPTIMISED_CALLS`]: the function present with neither call, which is what a
+    /// relocation section the reader skipped left behind and reaches `unread-call`; the
+    /// unconditional call read and the dead one outside every function's range, the shape
+    /// clang 22.1.8 left at `-O0 -fbasic-block-sections=all` (measured on Fedora 44 x86_64,
+    /// 2026-11-09), which reaches `unattributed-call` rather than `@otherwise`; and a
+    /// function whose name has the probe function's as a prefix holding both calls, which
+    /// the roll-call does not take for the probe's own; and the unconditional call in the
+    /// probe function with the dead one in a part split from it (gcc's `.cold` naming),
+    /// which reaches `call-elsewhere` rather than `@otherwise`; the dead call both in the
+    /// function and outside every range, which withholds under `unattributed-call` before
+    /// `dead-call-kept` reads it; and the dead call outside every range with no call read in
+    /// the function, which `unread-call` withholds first.
+    const OPTIMIZATION_ROWS: &[&[&str]] = &[
+        &["chard_opt_probe:"],
+        &[
+            "chard_opt_probe:",
+            "chard_opt_probe:chard_opt_anchor",
+            "?:chard_opt_dead",
+        ],
+        &[
+            "chard_opt_probe_x:",
+            "chard_opt_probe_x:chard_opt_anchor",
+            "chard_opt_probe_x:chard_opt_dead",
+        ],
+        &[
+            "chard_opt_probe:",
+            "chard_opt_probe:chard_opt_anchor",
+            "chard_opt_probe.cold:",
+            "chard_opt_probe.cold:chard_opt_dead",
+        ],
+        &[
+            "chard_opt_probe:",
+            "chard_opt_probe:chard_opt_anchor",
+            "chard_opt_probe:chard_opt_dead",
+            "?:chard_opt_dead",
+        ],
+        &["chard_opt_probe:", "?:chard_opt_dead"],
+    ];
+
+    #[test]
+    fn an_unwind_table_alone_is_no_landing_pad_table() {
+        let check = elf_static_checks()
+            .into_iter()
+            .find(|c| c.id == "except-table-emitted")
+            .expect("the corpus ships except-table-emitted");
+        let base = object_with_functions();
+        let rows: [(&[&str], &str, probe::Outcome); 3] = [
+            (
+                &[".text", ".ARM.extab"],
+                "@otherwise",
+                probe::Outcome::Absent,
+            ),
+            (
+                &[".text", ".ARM.extab", ".rel.ARM.extab"],
+                "ehabi-except-table",
+                probe::Outcome::Present,
+            ),
+            (
+                &[".text.f", ".ARM.extab.text.f", ".rel.ARM.extab.text.f"],
+                "ehabi-except-table",
+                probe::Outcome::Present,
+            ),
+        ];
+        for (sections, clause, outcome) in rows {
+            let mut facts = base.clone();
+            facts.sections = sections.iter().map(|s| (*s).to_owned()).collect();
+            let got = live_evaluation(check, &BTreeMap::new(), Some(&facts));
+            assert_eq!(
+                (got.clause.as_str(), got.outcome),
+                (clause, outcome),
+                "sections {sections:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimization_rows_read_their_clause_and_only_that() {
+        let check = elf_static_checks()
+            .into_iter()
+            .find(|c| c.id == "optimization-applied")
+            .expect("the corpus ships optimization-applied");
+        let base = object_with_functions();
+        let indeterminate = probe::Outcome::Indeterminate;
+        let expected = [
+            ("unread-call", indeterminate),
+            ("unattributed-call", indeterminate),
+            ("roll-call", indeterminate),
+            ("call-elsewhere", indeterminate),
+            ("unattributed-call", indeterminate),
+            ("unread-call", indeterminate),
+            ("dead-call-kept", probe::Outcome::Absent),
+            ("@otherwise", probe::Outcome::Present),
+        ];
+        let rows: Vec<&[&str]> = OPTIMIZATION_ROWS
+            .iter()
+            .copied()
+            .chain([UNOPTIMISED_CALLS, OPTIMISED_CALLS])
+            .collect();
+        assert_eq!(rows.len(), expected.len(), "one expectation per row");
+        for (row, (clause, outcome)) in rows.iter().zip(expected) {
+            let mut facts = base.clone();
+            facts.function_references = Some(row.iter().map(|s| (*s).to_owned()).collect());
+            let got = live_evaluation(check, &BTreeMap::new(), Some(&facts));
+            assert_eq!(
+                (got.clause.as_str(), got.outcome),
+                (clause, outcome),
+                "row {row:?}"
+            );
+        }
+        let mut facts = base;
+        facts.function_references = None;
+        let got = live_evaluation(check, &BTreeMap::new(), Some(&facts));
+        assert_eq!(
+            (got.clause.as_str(), got.outcome),
+            ("not-an-object", indeterminate)
+        );
+    }
+
     /// How many rows at the end of [`FUNCTION_ROWS`] hold `basic` to the marker and the
     /// fifth function, and before them how many are the `SafeStack`-era rows.
     const BASIC_ROWS: usize = 4;
@@ -1854,6 +1947,7 @@ mod elf_static {
             ElfField::BindNow => &mut facts.bind_now,
             ElfField::GnuStackPresent => &mut facts.gnu_stack_present,
             ElfField::GnuStackExecutable => &mut facts.gnu_stack_executable,
+            ElfField::RwxSegment => &mut facts.rwx_segment,
             other => panic!("{other:?} is not a nullable bool field"),
         }
     }
@@ -1963,7 +2057,7 @@ mod elf_static {
         values: Vec<Mutation>,
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one match over field shapes, each list field's vocabulary beside the others; \
                   split, a field's values would be read in two places"
@@ -1978,8 +2072,7 @@ mod elf_static {
                 Mutation::NullableBool(field, Some(false)),
                 Mutation::NullableBool(field, Some(true)),
             ],
-            // `relro`, whose domain is the reader's three words and `None`. The empty string
-            // is outside it: `Elf::facts` writes one of `elf::RELRO_*` or nothing.
+            // `relro`, whose domain is the reader's three words and `None`.
             predicate::FieldShape::NullableText => [
                 None,
                 Some(elf::RELRO_NONE),
@@ -2065,8 +2158,8 @@ mod elf_static {
                             .map(|(f, b)| &*format!("{f}={b}").leak())
                             .collect()
                     };
-                    let endbr64 = chard::predicate::elf_static::ENDBR64;
-                    let endbr32 = chard::predicate::elf_static::ENDBR32;
+                    let endbr64 = predicate::elf_static::ENDBR64;
+                    let endbr32 = predicate::elf_static::ENDBR32;
                     let mut two = entries([endbr64, endbr64, endbr64]);
                     two.pop();
                     vec![
@@ -2089,11 +2182,6 @@ mod elf_static {
             // its values are the probe callee's two forms, both together, a type the reader
             // leaves unnamed, a named type on neither list, and a GOT type against another
             // symbol.
-            // The relocation entries `pic-object-relocs` concludes on, one of each kind and
-            // both kinds at once, beside two it must not conclude on: a type that is a
-            // prefix of a listed one (`R_X86_64_32` of `R_X86_64_32S`), and a listed type
-            // against another symbol; and a direct type against a hidden anchor, which
-            // withholds rather than reading absent.
             predicate::FieldShape::NullableList if field == ElfField::CodeRelocations => [
                 None,
                 Some(Vec::new()),
@@ -2121,6 +2209,7 @@ mod elf_static {
                 .chain(match field {
                     ElfField::FunctionReferences => FUNCTION_ROWS
                         .iter()
+                        .chain(OPTIMIZATION_ROWS)
                         .map(|row| Some(row.to_vec()))
                         .collect::<Vec<_>>(),
                     _ => LIST_ITEMS.iter().map(|item| Some(vec![*item])).collect(),
@@ -2480,15 +2569,15 @@ mod elf_static {
     // --- tables, fields and the Published view -------------------------------------------
 
     /// The tables a field's value is read from, as `Elf::facts` derives it.
-    ///
-    /// `ElfTable::Header` and `ElfTable::ProgramHeaders` are the tables whose cut is an error
-    /// from `Elf::parse` (`ElfTable::HARD_FAILURES`), so no facts exist to read after one; a
-    /// field derived partly from them names them only where it is read from them directly.
-    /// Written out per field with no wildcard, so a new `ElfField` states its tables here.
     fn field_tables(field: ElfField) -> &'static [ElfTable] {
         match field {
             ElfField::ElfClass | ElfField::ElfType | ElfField::Machine => &[ElfTable::Header],
-            ElfField::HasInterp | ElfField::GnuRelro => &[ElfTable::ProgramHeaders],
+            // `HasInterp` and `GnuRelro` are a program header apiece; a load or TLS
+            // segment's flags (`RwxSegment`) are, among the program headers, the same
+            // single table.
+            ElfField::HasInterp | ElfField::GnuRelro | ElfField::RwxSegment => {
+                &[ElfTable::ProgramHeaders]
+            }
             // The stack header, among the program headers; a disagreeing pair is recorded
             // against `gnu-stack` (`elf::Elf::gnu_stack`).
             ElfField::GnuStackPresent | ElfField::GnuStackExecutable => {
@@ -2571,9 +2660,6 @@ mod elf_static {
         }
     }
 
-    /// Every table a predicate's terms read is on its `tables`, which `Check::reads` returns,
-    /// so the truncation gate and the `@truncated` preamble withhold on every table a clause
-    /// can move on.
     #[test]
     fn every_predicate_names_the_tables_its_terms_read() {
         let mut fed = 0usize;
@@ -2600,9 +2686,6 @@ mod elf_static {
         assert!(fed > 0 && fed == predicate::elf_static::table().len());
     }
 
-    /// The checks that read one observable share one predicate, and no other elf-static
-    /// checks do. The pairs are named, so a shared predicate split in two, or a new sharing,
-    /// fails here and is stated rather than passing unseen.
     #[test]
     fn checks_that_read_one_observable_share_a_predicate() {
         const SHARED: [(&str, &str); 3] = [
@@ -2649,33 +2732,6 @@ mod elf_static {
         assert_eq!(starts, [prefix.as_str()]);
     }
 
-    /// `as-needed` withholds where no `DT_NEEDED` entry names the C library, ahead of the
-    /// list it reads, and reads the list whatever the link classification.
-    ///
-    /// The observable is an absence, so the predicate's `present` is its `@otherwise`, and
-    /// an empty `DT_NEEDED` list read as the flag acting over a `-static` link with no
-    /// `.dynamic` (a reproduction on gcc 13.3 on Ubuntu 24.04 x86_64), over a static PIE, which
-    /// has one and records no library, and over a `-static-pie -Wl,--dynamic-linker=<path>`
-    /// link, which carries an interpreter and records none (gcc 13.3 with GNU ld 2.42 on
-    /// Ubuntu 24.04 x86_64); a list naming only `libz.so.1`, as a `-static-pie` link given
-    /// that one shared library writes, read the same way. Over the synthetic objects: the
-    /// static executable concludes `indeterminate` under `no-dynamic` and the relocatable under
-    /// `unclassified`, as does a core file forged onto the kept list; the unmarked static PIE,
-    /// which classifies as a shared object, under `shared-output`, the one clause that reads
-    /// the classification, and the static PIE given an interpreter, which classifies as a
-    /// dynamic PIE, under `no-c-library`, each with its list empty and naming `libz.so.1`
-    /// alone, as does a non-PIE executable whose list is emptied; a dynamic executable reads
-    /// its list, `present` with no `libm.` entry and
-    /// `absent` with one; and so does the `-pie -Wl,--no-dynamic-linker` link, which
-    /// classifies as a static PIE and keeps its entries, `absent` from its `libm.so.6`. The
-    /// two older static-PIE fixtures carry the builder's default `libc.so.6` entry and no
-    /// `libm.` entry, the shape `-static-pie -Wl,--no-as-needed -Wl,-Bdynamic libc.so.6
-    /// -Wl,-Bstatic` writes, and are withheld under `no-loader-output`: the archive may have
-    /// supplied the unused library, as it may on an `ET_EXEC` with no interpreter, the
-    /// `-no-pie -Wl,--no-dynamic-linker` twin, which the static executable forged onto a list
-    /// naming the C library alone shows. The withholding clauses come first: a `libm.` entry on an
-    /// object with no dynamic section, which no linker writes, still withholds under
-    /// `no-dynamic`, and so does an interpreter kept beside no dynamic section.
     #[test]
     fn as_needed_withholds_where_the_list_has_no_entry_and_reads_it_otherwise() {
         let objects: BTreeMap<String, ElfFacts> = synthetic_objects().into_iter().collect();
@@ -2774,11 +2830,6 @@ mod elf_static {
         (proof.clause, decoded.detection.outcome)
     }
 
-    /// `as-needed` reads the list of every link that records a library, whatever the link
-    /// classification: a dynamic executable, `present` with no `libm.` entry and `absent`
-    /// with one, and the `-pie -Wl,--no-dynamic-linker` link, which classifies as a static
-    /// PIE and keeps its entries, `absent` from its `libm.so.6` and `present` once that entry
-    /// is dropped, as a driver passing `--as-needed` drops it.
     #[test]
     fn as_needed_reads_the_list_of_every_link_that_records_a_library() {
         let objects: BTreeMap<String, ElfFacts> = synthetic_objects().into_iter().collect();
@@ -2843,7 +2894,7 @@ mod elf_static {
             .collect()
     }
 
-    /// Every fixture's facts and every synthetic object's, deduplicated by serialization.
+    /// Every synthetic object's facts, deduplicated by serialization.
     fn every_facts() -> Vec<(String, ElfFacts)> {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
@@ -2869,7 +2920,10 @@ mod elf_static {
             );
         }
         let facts = every_facts();
-        assert!(!facts.is_empty());
+        assert!(
+            !facts.is_empty(),
+            "the facts are not empty, so the loop below checks something"
+        );
         for (label, facts) in &facts {
             let value = published_elf(facts);
             let live = Live {
@@ -2889,51 +2943,13 @@ mod elf_static {
         }
     }
 
-    /// The published form of a case's facts, with `truncations` stated.
-    ///
-    /// `ElfFacts` omits `truncations` when it is empty, and the Published view reads that
-    /// absence as `Incomplete` (the module documentation's Views section says why), so a
-    /// publication re-evaluated with these predicates carries the list explicitly. The test
-    /// below states that the omitted form answers `Incomplete`, never a reading.
-    /// `data_in_code_pages` and `code_relocations` are stated as `null` where `ElfFacts`
-    /// omits them, as `report::serialize_stored_elf` states them, and the code reader's two
-    /// lists and `function_entries` as `[]`, from the list a report's store states
-    /// (`report::STATED_WHEN_EMPTY`).
-    fn published_elf(facts: &ElfFacts) -> Value {
-        let mut value = serde_json::to_value(facts).expect("facts serialize");
-        if let Some(map) = value.as_object_mut() {
-            for stated in chard::report::STATED_WHEN_EMPTY {
-                map.entry(stated)
-                    .or_insert_with(|| Value::Array(Vec::new()));
-            }
-            map.entry("data_in_code_pages").or_insert(Value::Null);
-            map.entry("code_relocations").or_insert(Value::Null);
-            map.entry("function_references").or_insert(Value::Null);
-        }
-        value
-    }
-
-    /// `ssp-level-emitted` over the seven `SafeStack`-era rows of [`FUNCTION_ROWS`], each to
-    /// the clause and word it earns: `SafeStack`'s selection reads `unsafe-frame` at -O1 and
-    /// above (the in-range array bare) and at -O0 (the array moved too), a marker beside an
-    /// ordinary canary on the array fits no rule, `strong`'s pattern with the array bare
-    /// and no marker is not `strong`, five canaries read `all`, five canaries beside the
-    /// marker fit no rule (with the marker the selection rule is `SafeStack`'s and no rung
-    /// describes it, and no measured clang builds it: `predicate::elf_static`'s
-    /// `SSP_LEVEL_EMITTED` says why), and no canary with the unsafe stack in use reads
-    /// `none`. The rows mirror the readelf attribution of 2026-10-08 (clang 22.1.8, Fedora 44
-    /// x86_64), which `probes/ssp_function_map.c` tabulates.
     #[test]
     fn safestack_rows_read_unsafe_frame_and_only_that() {
         let check = elf_static_checks()
             .into_iter()
             .find(|c| c.id == "ssp-level-emitted")
             .expect("the corpus ships ssp-level-emitted");
-        let base = load_fixtures()
-            .into_iter()
-            .find(|f| f.check == "ssp-level-emitted" && f.elf.is_some())
-            .and_then(|f| f.elf)
-            .expect("an ssp-level-emitted fixture carries an elf block");
+        let base = object_with_functions();
         let safestack_end = FUNCTION_ROWS.len() - BASIC_ROWS;
         let rows = &FUNCTION_ROWS[safestack_end - SAFESTACK_ROWS..safestack_end];
         let expected = [
@@ -2985,26 +3001,13 @@ mod elf_static {
         );
     }
 
-    /// `ssp-level-emitted` over the four `basic` rows of [`FUNCTION_ROWS`]: the marker beside
-    /// `basic`'s canary pattern fits no rule and withholds (it read `basic` until later on
-    /// 2026-10-08, the one rung an object with `SafeStack`'s marker and a broken
-    /// canary-iff-unsafe-frame pattern could still reach); `basic`'s pattern with the
-    /// in-range array bare beside a canaried `ssp_char_array` withholds too, since to plain
-    /// `-fstack-protector` the two are the same array; and plain `-fstack-protector` over
-    /// five reads `basic` with both arrays canaried and with both bare under a raised
-    /// threshold (measured 2026-10-08, clang 22.1.8 and gcc 16.1.1, Fedora 44 x86_64, -O0 to
-    /// -O3 and -Os).
     #[test]
     fn basic_excludes_the_marker_and_pairs_the_arrays() {
         let check = elf_static_checks()
             .into_iter()
             .find(|c| c.id == "ssp-level-emitted")
             .expect("the corpus ships ssp-level-emitted");
-        let base = load_fixtures()
-            .into_iter()
-            .find(|f| f.check == "ssp-level-emitted" && f.elf.is_some())
-            .and_then(|f| f.elf)
-            .expect("an ssp-level-emitted fixture carries an elf block");
+        let base = object_with_functions();
         let rows = &FUNCTION_ROWS[FUNCTION_ROWS.len() - BASIC_ROWS..];
         let expected = [
             ("@otherwise", probe::Outcome::Indeterminate, None),
@@ -3047,7 +3050,7 @@ mod elf_static {
         facts.function_references = Some(
             paired
                 .into_iter()
-                .filter(|s| !s.ends_with(chard::predicate::elf_static::SAFESTACK_MARKER))
+                .filter(|s| !s.ends_with(predicate::elf_static::SAFESTACK_MARKER))
                 .collect(),
         );
         let got = live_evaluation(check, &BTreeMap::new(), Some(&facts));

@@ -2,16 +2,6 @@
 
 //! Relocation type names, as `readelf -r` spells them, for the machines whose relocations
 //! a check reads: `EM_X86_64`, `EM_386`, `EM_AARCH64` and `EM_RISCV`.
-//!
-//! Copied from the `R_X86_64_*`, `R_386_*` and `R_AARCH64_*` definitions in glibc's
-//! `elf.h` (Fedora 44, glibc 2.43, read 2026-10-02), the `R_AARCH64_P32_*` ILP32 types
-//! left out: they reuse numbers below 256 that an LP64 object does not carry, and the
-//! reader names a type by machine alone. A type no row names is rendered by number
-//! (`ElfFacts::code_relocations` says how), so a type missing here reads as unnamed and
-//! never as another type.
-//!
-//! The `R_RISCV_*` rows were copied from the same `elf.h` on 2026-10-05. RISC-V shares its
-//! numbers between ELF32 and ELF64, so one table serves both classes.
 
 /// `EM_X86_64`, which an x32 object shares.
 pub(super) const X86_64: &[(u32, &str)] = &[
@@ -232,13 +222,6 @@ pub(super) const AARCH64: &[(u32, &str)] = &[
 ];
 
 /// `EM_RISCV`, both classes.
-///
-/// Fifty-five of these names were held against GNU readelf 2.46 and llvm-readelf 22.1.8
-/// on 2026-10-05 (Fedora 44 x86_64), over an object the riscv64 cross assembler wrote
-/// with one `.reloc` of each, and the three agreed. The other two, `R_RISCV_GOT32_PCREL`
-/// (41) and `R_RISCV_PLT32` (59), the assembler does not accept by name; patched into
-/// such an object, llvm-readelf 22.1.8 printed the names below and GNU readelf 2.46
-/// printed `unrecognized: 29` and `unrecognized: 3b`. Neither is a type the checks read.
 pub(super) const RISCV: &[(u32, &str)] = &[
     (0, "R_RISCV_NONE"),
     (1, "R_RISCV_32"),

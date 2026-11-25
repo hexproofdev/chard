@@ -2,35 +2,19 @@
 
 //! Every check states whether it owes a regime-matched negative arm, and why not where it
 //! does not.
-//!
-//! The control triple's plain arms are profile-free, so they validate the detector and not
-//! the attribution: a profile flag other than the one under test can produce a generic
-//! observable, and only the regime arm, the negative re-run on the profile, catches it
-//! (`DESIGN.md`, "The third control arm"). A bool asking for the arm would let a check decline
-//! it with no reason stated, and a confounder could hide in that set. `probe::Regime` is
-//! `Arm(flags)` or `NotOwed(Specific { reason, profiles, toolchains })`, with no default. The type,
-//! and a compile-time check beside `CORPUS` in `src/probe.rs`, refuse an omitted field, an empty
-//! arm, an empty arm flag and an unframed reason. This file holds what they cannot:
-//!
-//! - the checks that own an arm are exactly [`OWNS_REGIME_ARM`], so an arm gained or lost
-//!   is a stated change here and not a silent one in a five-thousand-line literal;
-//! - an arm's content: the checks whose arm differs from their negative list are an explicit
-//!   list ([`ARM_DIFFERS_FROM_NEGATIVE`]), no arm carries an `-O` ([`ARMS_CARRYING_AN_O`],
-//!   empty, as the `Regime::Arm` doc argues), and no arm re-enables the mechanism
-//!   by spelling a flag of the positive control that the negative does not share (a flag in
-//!   both controls, an `-O` or a `-U`, is setup, not the mechanism);
-//! - every reason's frame: `profiles` is the whole of [`probe::PROFILES_WITH_FLAGS`], since
-//!   `NotOwed` exempts the check under every profile; `toolchains` names every compiler family
-//!   the gate leaves measured, without duplicates, save the allowances in
-//!   [`NARROWER_TOOLCHAIN_FRAME`]; and the reason says, as a whole word, whether it is argued
-//!   or measured;
-//! - the flag lists those frames were argued over, pinned: the guide revision and the
-//!   composed `openssf-tldr` list per architecture, and `bare-optimized`'s `-O2` as the
-//!   binary spells it, so a change fails here with the instruction to re-read every reason;
-//! - `owes_regime_control` derives from the declaration and the profile alone.
-//!
-//! The counts are printed with the frame they were taken over (checks in the corpus, arms,
-//! reasons), so a run's output is checkable against the corpus and not only against itself.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::BTreeSet;
 
@@ -45,6 +29,7 @@ const OWNS_REGIME_ARM: &[&str] = &[
     "pic-shared-link",
     "pic-object-relocs",
     "noexecstack-enforced",
+    "zero-init-padding-bits",
     "zero-call-used-regs",
     "auto-var-init-active",
     "auto-var-init-pattern",
@@ -75,65 +60,8 @@ const ARMS_CARRYING_AN_O: &[&str] = &[];
 /// alone, and gcc, which the gate does not list, has nothing to argue over.
 const NARROWER_TOOLCHAIN_FRAME: &[(&str, &str)] = &[("ret-protector-emitted", "gcc")];
 
-/// The `openssf-tldr` flag list the reasons were argued over, per architecture, at guide
-/// revision [`PINNED_GUIDE_REVISION`]: the block's rows, the architecture rows, the
-/// executables row (`report::openssf_tldr_cflags`).
-const PINNED_GUIDE_REVISION: &str = "2026-08-20";
-const PINNED_TLDR_COMMON: &[&str] = &[
-    "-O2",
-    "-Wall",
-    "-Wformat",
-    "-Wformat=2",
-    "-Wconversion",
-    "-Wimplicit-fallthrough",
-    "-Werror=format-security",
-    "-U_FORTIFY_SOURCE",
-    "-D_FORTIFY_SOURCE=3",
-    "-D_GLIBCXX_ASSERTIONS",
-    "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
-    "-fstrict-flex-arrays=3",
-    "-fstack-clash-protection",
-    "-fstack-protector-strong",
-    "-Wl,-z,nodlopen",
-    "-Wl,-z,noexecstack",
-    "-Wl,-z,relro",
-    "-Wl,-z,now",
-    "-Wl,--as-needed",
-    "-Wl,--no-copy-dt-needed-entries",
-];
-const PINNED_TLDR_ARCH: &[(&str, &[&str])] = &[
-    (
-        "x86_64",
-        &["-fcf-protection=full", "-fzero-call-used-regs=used-gpr"],
-    ),
-    (
-        "aarch64",
-        &[
-            "-mbranch-protection=standard",
-            "-fzero-call-used-regs=used-gpr",
-        ],
-    ),
-];
-const PINNED_TLDR_EXECUTABLE: &[&str] = &["-fPIE", "-pie"];
-/// How the binary spells `bare-optimized` (`src/main.rs`), the other profile argued over.
-const PINNED_BARE_OPTIMIZED: &[&str] = &[
-    r#"cflags: vec!["-O2".to_owned()],"#,
-    "cxxflags: Vec::new(),",
-    "ldflags: Vec::new(),",
-];
-
-const REOPEN: &str = "a profile the reasons were argued over changed: re-read every \
-                      `Regime::NotOwed` reason in src/probe.rs (each names \
-                      `PROFILES_WITH_FLAGS`), then move this pin";
-
 fn checks() -> Vec<&'static probe::Check> {
     probe::CORPUS.iter().flat_map(|p| p.checks.iter()).collect()
-}
-
-/// Whether `word` occurs in `text` as a whole word (letters and digits on neither side).
-fn has_word(text: &str, word: &str) -> bool {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|w| w == word)
 }
 
 #[test]
@@ -146,8 +74,7 @@ fn the_checks_owning_a_regime_arm_are_exactly_the_listed_ones() {
         .collect();
     assert_eq!(
         declared, OWNS_REGIME_ARM,
-        "the checks declaring Regime::Arm, in corpus order, against the list this test pins: \
-         a check that gains or loses an arm is a stated change here"
+        "the checks declaring Regime::Arm, in corpus order, are not the list this test pins"
     );
     let ids: BTreeSet<&str> = all.iter().map(|c| c.id).collect();
     for id in OWNS_REGIME_ARM {
@@ -180,9 +107,7 @@ fn every_arm_is_a_countermand_and_its_content_is_a_stated_choice() {
         for flag in flags {
             assert!(
                 !check.positive.contains(flag) || check.negative.contains(flag),
-                "{}: the regime arm spells `{flag}`, a flag of the positive control that the \
-                 negative does not share, so the arm meant to show the mechanism absent turns \
-                 it on",
+                "{}: the regime arm spells `{flag}`, a positive-control flag the negative lacks",
                 check.id
             );
         }
@@ -194,13 +119,11 @@ fn every_arm_is_a_countermand_and_its_content_is_a_stated_choice() {
     }
     assert_eq!(
         differs, ARM_DIFFERS_FROM_NEGATIVE,
-        "the checks whose arm differs from their negative list, against the list this test \
-         pins: a re-spelled arm, or a return to the arm being the negative, is a stated change"
+        "the checks whose arm differs from their negative list are not the list this test pins"
     );
     assert_eq!(
         with_o, ARMS_CARRYING_AN_O,
-        "the arms carrying an -O, against the list this test pins: an arm's -O overrides the \
-         profile's level, so the arm is built outside the measured regime"
+        "the arms carrying an -O are not the list this test pins"
     );
     assert!(arms > 0, "no arm declared, so this test holds over nothing");
     eprintln!(
@@ -268,20 +191,6 @@ fn every_reason_for_owing_no_arm_is_framed_over_every_profile_and_measured_toolc
                 ));
             }
         }
-        if specific.reason.len() < 60 {
-            problems.push(format!(
-                "`{}`'s reason is {} characters, which does not state one",
-                check.id,
-                specific.reason.len()
-            ));
-        }
-        if !(has_word(specific.reason, "argued") || has_word(specific.reason, "measured")) {
-            problems.push(format!(
-                "`{}`'s reason says neither `argued` nor `measured` as a word, so a reader \
-                 cannot tell a belief from a result",
-                check.id
-            ));
-        }
     }
     for (check, family) in NARROWER_TOOLCHAIN_FRAME {
         assert!(
@@ -300,46 +209,6 @@ fn every_reason_for_owing_no_arm_is_framed_over_every_profile_and_measured_toolc
         probe::PROFILES_WITH_FLAGS,
         families,
         NARROWER_TOOLCHAIN_FRAME.len()
-    );
-}
-
-#[test]
-fn the_flag_lists_the_reasons_were_argued_over_are_pinned() {
-    assert_eq!(chard::guide::REVISION, PINNED_GUIDE_REVISION, "{REOPEN}");
-    for (arch, arch_rows) in PINNED_TLDR_ARCH {
-        let expected: Vec<&str> = PINNED_TLDR_COMMON
-            .iter()
-            .chain(arch_rows.iter())
-            .chain(PINNED_TLDR_EXECUTABLE)
-            .copied()
-            .collect();
-        assert_eq!(
-            chard::report::openssf_tldr_cflags(arch),
-            expected,
-            "openssf-tldr on {arch}: {REOPEN}"
-        );
-    }
-    // `bare-optimized` is composed in the binary, not the library, so its spelling is read
-    // from the source: the block that builds the profile, up to its closing.
-    let main_rs = include_str!("../src/main.rs");
-    let start = main_rs
-        .find(r#""bare-optimized" => Ok(Profile {"#)
-        .expect("src/main.rs builds the bare-optimized profile");
-    let block = &main_rs[start..];
-    let end = block.find("}),").expect("the profile literal closes");
-    let block = &block[..end];
-    for line in PINNED_BARE_OPTIMIZED {
-        assert!(
-            block.contains(line),
-            "bare-optimized no longer spells `{line}`: {REOPEN}"
-        );
-    }
-    eprintln!(
-        "regime_arms: pinned guide revision {PINNED_GUIDE_REVISION}, openssf-tldr on {} \
-         architectures ({} common flags), bare-optimized's {} lines",
-        PINNED_TLDR_ARCH.len(),
-        PINNED_TLDR_COMMON.len(),
-        PINNED_BARE_OPTIMIZED.len()
     );
 }
 

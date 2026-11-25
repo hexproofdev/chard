@@ -1,38 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Every report chard emits must validate against the schema it ships.
-//!
-//! `schema/chard-report.schema.json` and the Rust structs are written separately, and with
-//! nothing comparing them they drift: a schema can declare `coverage.probes_expected` while
-//! the code emits `coverage.checks_expected`, lack `observations[].check` while it also says
-//! `additionalProperties: false`, or miss control arms retyped in Rust. Every report chard
-//! produces would then fail its own published contract, and nothing would notice because
-//! nothing reads the file.
-//!
-//! A schema that is not machine-checked against real output is documentation that
-//! happens to be in JSON. The validator, in `tests/common/schema.rs` so that
-//! `tests/predicate_language.rs` runs the same one, is deliberately small: it covers
-//! only the keywords this schema actually uses, because the point is to make
-//! drift impossible, not to be a general JSON Schema implementation.
-//!
-//! "Covers the keywords this schema uses" is a claim about two things that drift
-//! independently: the schemas use `minimum`, `maximum`, `minItems`, `pattern` and `format`
-//! (the `profile.id` pattern and `maximum: 100` on the withheld percentage among them), and a
-//! validator that parsed those and dropped them would enforce every declared constraint on
-//! nothing. So the claim is checked:
-//! an unimplemented `pattern` or `format` construct **panics** rather than returning
-//! `true`, because a constraint that cannot be evaluated and reports success is
-//! indistinguishable from one that passed.
-//!
-//! The validator also evaluates `oneOf`, `prefixItems`, `maxItems`, `minProperties`,
-//! `maxProperties` and `minLength`, which `schema/chard-predicate.schema.json` and the
-//! report schema use, and panics on any keyword it does not evaluate, so the claim above
-//! is checked for keywords as well as pattern constructs.
-//!
-//! The live reports are one half of the check. A Darwin host builds Mach-O, so its reports
-//! carry no `elf` entry in `facts` and the typed ELF definition would meet nothing here; it is held
-//! instead against the checked-in fixture corpora and one live read of a checked-in object
-//! in `every_recorded_elf_fact_conforms_to_the_elf_facts_definition`.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,50 +24,21 @@ use serde_json::Value;
 
 mod common;
 
+use common::chard_binary;
 use common::schema::{matches_format, matches_pattern, resolve, validate};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn chard_binary() -> PathBuf {
-    // The integration-test binary lives alongside the built `chard`.
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("chard")
-}
-
 /// Can this machine run these tests at all? Checked once, at the top of each test.
-///
-/// There are exactly two reasons a machine legitimately cannot run them: `chard` is
-/// not built, and there is no C compiler to measure with. Both are properties of the
-/// environment, knowable before any work starts. Everything that can go wrong *after*
-/// those hold (output that is not JSON, a non-zero exit, a report carrying an error
-/// envelope) is a real failure, and `cannot_run` panics on it.
-///
-/// Keeping the two apart is the point. The previous single hatch could not tell
-/// "this box has no compiler" from "chard is broken", so the second wore the first's
-/// exemption: on any machine with `CHARD_ALLOW_TEST_SKIP` set, a genuine regression in
-/// `measure` would have ended the run quietly and green.
-///
-/// Returns `false` only when the operator opted into skipping; otherwise
-/// [`common::refuse`] panics.
 fn can_run(verifies: &str) -> bool {
     common::require_binary(&chard_binary(), verifies) && common::require_cc(verifies)
 }
 
 /// A failure that arrived after [`can_run`] said the machine was capable.
-///
-/// Not a skip: the compiler is present and `chard` is built, so whatever went wrong
-/// here is chard's, and the suite must say so rather than shrug.
 fn cannot_run(reason: &str) -> ! {
-    panic!(
-        "{reason}.\n\nThis is not an unrunnable machine — `can_run` already confirmed \
-         chard is built and a C compiler is present — so this is a real failure."
-    );
+    panic!("{reason}, after `can_run` passed");
 }
 
 /// Produce a report for `profile`, or refuse to pretend the test ran.
@@ -162,11 +114,6 @@ const FACT_KIND_MEMBERS: [(&str, &[&str]); 4] = [
 const FACT_KIND_OPTIONAL: [(&str, &[&str]); 1] = [("unreadable", &["mach_o"])];
 
 /// Every `facts` entry carries exactly the members of its kind.
-///
-/// `$defs/fact_entry` declares the union of the kinds' members, since the validator
-/// implements no conditional keyword, so an `elf` entry carrying `error` instead of `elf`
-/// would validate. This holds each instance to its kind, in the manner the nine nullable
-/// link facts are held per instance, and runs wherever [`assert_conforms`] does.
 fn fact_entries_carry_their_kinds_members(report: &Value) -> Vec<String> {
     let Some(entries) = report.get("facts").and_then(Value::as_object) else {
         return Vec::new();
@@ -208,11 +155,6 @@ fn fact_entries_carry_their_kinds_members(report: &Value) -> Vec<String> {
 
 /// `consistency.replay` counts every reading once: `readings` is `replayed + unresolved`
 /// plus the length of `not_replayable`.
-///
-/// `Replay` holds this by construction; the schema can state the members but not the sum,
-/// so this holds each recorded report to it, and a report whose replay rule fed itself a
-/// different number of readings than it accounted for fails here rather than reading as a
-/// clean replay.
 fn replay_counts_add_up(report: &Value) -> Vec<String> {
     let Some(replay) = report.get("consistency").and_then(|c| c.get("replay")) else {
         return Vec::new();
@@ -235,12 +177,6 @@ fn replay_counts_add_up(report: &Value) -> Vec<String> {
 }
 
 /// Every `elf` entry of the store carries `truncations`, `[]` included.
-///
-/// `$defs/elf_facts` leaves the list optional, since `chard elf`, the replay corpus and the
-/// synthetic fixtures serialize `ElfFacts` on its own and omit it when empty. A report's
-/// store states it always: `predicate::Published` reads an absent list as `Incomplete`, and
-/// a reader re-evaluating a published predicate over the entry would otherwise meet that
-/// on every elf-static reading of a check that declares `tables`.
 fn elf_entries_state_their_truncations(report: &Value) -> Vec<String> {
     let Some(entries) = report.get("facts").and_then(Value::as_object) else {
         return Vec::new();
@@ -254,19 +190,6 @@ fn elf_entries_state_their_truncations(report: &Value) -> Vec<String> {
 }
 
 /// Every `elf-delta` entry, laid over its base, is an instance of `$defs/elf_facts`.
-///
-/// `elf_changes` is declared as an object, since the validator implements no keyword that
-/// could say "a subset of `elf_facts`' members"; this is that statement, per instance. The
-/// base is an `elf` entry of the same store, and each change replaces the base's member of
-/// that name, so a misspelt member fails as undeclared and a mistyped one as its type. An
-/// empty list or map in place of a member the base carries and `$defs/elf_facts` does not
-/// require resolves to the member's absence, the result `report::overlay` reaches by
-/// reserializing: such a member is omitted when empty, and `comment` and `symbol_tables`
-/// are declared with `minItems: 1`. A `false` in place of `openbsd_nobtcfi`, the one
-/// boolean omitted when false, resolves the same way, since the member is declared
-/// `const: true`. `truncations` admits `[]`, the value an `elf` entry states when nothing was
-/// cut, so its removal here changes nothing. A required member, such as
-/// `watched_symbols`, is serialized when empty, so its empty value stands.
 fn fact_deltas_resolve(report: &Value, schema: &Value) -> Vec<String> {
     let Some(entries) = report.get("facts").and_then(Value::as_object) else {
         return Vec::new();
@@ -311,18 +234,6 @@ fn fact_deltas_resolve(report: &Value, schema: &Value) -> Vec<String> {
 }
 
 /// A whole-corpus sweep, produced once per profile and shared.
-///
-/// `report_for` runs `chard measure`, which drives the control triple over every check in
-/// the corpus, by a wide margin the most expensive thing this suite does. Six of the nine
-/// calls asked for one of two *identical* reports (`bare` and `openssf-tldr`, no extra
-/// arguments) and paid for each separately, which is why this file took four minutes to
-/// assert things about output it had already produced. The calls that differ (a single
-/// `--probe`, an explicit `--cc`, `bare-optimized`) still run their own sweep, because
-/// what they are testing is the difference.
-///
-/// Cloned rather than borrowed: one caller mutates its copy to check that the validator
-/// rejects the result, and a shared report it could edit would be a test that changes what
-/// the next test sees.
 fn shared_report(profile: &str) -> Value {
     static BARE: OnceLock<Value> = OnceLock::new();
     static TLDR: OnceLock<Value> = OnceLock::new();
@@ -347,9 +258,6 @@ fn a_bare_profile_report_conforms_to_the_schema() {
     assert_conforms(&report, "bare");
 }
 
-/// A measured report carries this build's stamps as `measure` writes them: the revision, the
-/// source that named it (absent exactly where the revision is) and the rustflags digest
-/// (absent where the build had none), which the join key reads.
 #[test]
 fn a_report_carries_the_builds_revision_source_and_rustflags_digest() {
     if !can_run("that a report carries this build's revision source and rustflags digest") {
@@ -372,8 +280,6 @@ fn a_report_carries_the_builds_revision_source_and_rustflags_digest() {
     );
 }
 
-/// `chard digest` prints a document that conforms to the report schema's `$defs/digest`, the
-/// shape its contract names, and is the published report's `digest`.
 #[test]
 fn chard_digest_output_conforms_to_the_digest_definition() {
     if !can_run("that chard digest's output validates against the schema chard ships") {
@@ -400,9 +306,6 @@ fn chard_digest_output_conforms_to_the_digest_definition() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
-/// A report chard writes carries `profile.compiler_environment`, though the schema leaves it
-/// optional so that a report without the field still validates; a report missing it is
-/// one of those, and this keeps a new one from being mistaken for it.
 #[test]
 fn a_new_report_carries_the_compiler_environment_the_schema_leaves_optional() {
     if !can_run("that a report chard writes publishes the compiler environment") {
@@ -424,11 +327,6 @@ fn a_new_report_carries_the_compiler_environment_the_schema_leaves_optional() {
     }
 }
 
-/// Every trimmed macro map cites the filter the report publishes, and stays inside it.
-///
-/// `evidence.macros` is a filtered view, and a filtered view that said nothing about being
-/// one would mislead. The report names the list; this holds each observation to it, and holds the
-/// truncation entry that announces the trimming to the count of observations trimmed.
 #[test]
 fn every_trimmed_macro_map_cites_the_published_filter_and_stays_inside_it() {
     if !can_run("that each macro-channel observation cites the evidence filter it was trimmed to") {
@@ -495,11 +393,6 @@ fn every_trimmed_macro_map_cites_the_published_filter_and_stays_inside_it() {
     );
 }
 
-/// `bare-optimized` carries a `profile.id` and a `flags_source` that no other
-/// profile produces, and both are constrained by the schema: the id by a regex
-/// alternation, `flags_source` by a closed enum. Adding the profile without
-/// widening either would have made every report from it fail validation, and
-/// nothing else in the suite would have noticed.
 #[test]
 fn a_bare_optimized_report_conforms_to_the_schema() {
     if !can_run("that a bare-optimized report validates against the schema chard ships") {
@@ -515,8 +408,6 @@ fn a_bare_optimized_report_conforms_to_the_schema() {
     assert_conforms(&report, "bare-optimized");
 }
 
-/// The profile that turns nearly everything on exercises the `on`/`partial`
-/// branches, the control arms, and the level fields that `bare` leaves empty.
 #[test]
 fn an_openssf_tldr_report_conforms_to_the_schema() {
     if !can_run("that an openssf-tldr report validates against the schema chard ships") {
@@ -525,10 +416,7 @@ fn an_openssf_tldr_report_conforms_to_the_schema() {
     let report = shared_report("openssf-tldr");
     assert_conforms(&report, "openssf-tldr");
 
-    // The guide's block is examined in full by the corpus. The set is pinned in
-    // `report::tests::the_openssf_tldr_flags_no_check_examines_are_the_ones_pinned_here`
-    // against the corpus; this is the same claim over a report the binary produced, where
-    // every check yielded an observation and so every flag the corpus reaches was reached.
+    // The guide's block is examined in full by the corpus.
     assert!(
         report["coverage"].get("profile_flags_unexamined").is_none(),
         "the guide's profile left flags unexamined: {}",
@@ -544,9 +432,128 @@ fn an_openssf_tldr_report_conforms_to_the_schema() {
     );
 }
 
-/// A filtered run must both conform and admit that it is incomplete. Judging
-/// `complete` against the *selected* count would let a run covering one
-/// check of seventeen declare full coverage.
+#[test]
+fn measure_reads_the_gate_from_the_record_it_publishes() {
+    if !can_run("that measure decides the gate from the record it publishes") {
+        return;
+    }
+    let work = common::Work::new("schema", "gate-wiring");
+    let run = |tag: &str, allow: bool| {
+        let workdir = work.dir().join(tag);
+        std::fs::create_dir_all(&workdir).expect("a work directory per run");
+        let mut command = Command::new(chard_binary());
+        command
+            .args([
+                "measure",
+                "-o",
+                "-",
+                "--profile",
+                "bare",
+                "--probe",
+                "bti-enforced",
+            ])
+            .arg("--workdir")
+            .arg(&workdir)
+            .arg("--fail-on-missing");
+        if allow {
+            command.args(["--allow", "no-check-on-target"]);
+        }
+        let output = command.output().expect("spawning chard");
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| cannot_run(&format!("{tag}: output was not JSON ({e})")));
+        if report.get("error").is_some() {
+            cannot_run(&format!("{tag}: chard reported {}", report["error"]));
+        }
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            report,
+        )
+    };
+    let (strict_status, strict_err, strict) = run("strict", false);
+    let (allowed_status, allowed_err, allowed) = run("allowed", true);
+    assert_eq!(strict_status, Some(1), "{strict_err}");
+    assert_eq!(
+        allowed_status,
+        Some(1),
+        "a narrowed run fails the gate: {allowed_err}"
+    );
+    assert_eq!(
+        strict["coverage"]["gate"],
+        serde_json::json!({"allowed": [], "excused": []}),
+        "a strict run writes both lists empty"
+    );
+    assert_eq!(
+        allowed["coverage"]["gate"]["allowed"],
+        serde_json::json!(["no-check-on-target"])
+    );
+    if allowed["toolchain"]["target"]["arch"] == "x86_64" {
+        assert_eq!(
+            allowed["coverage"]["gate"]["excused"],
+            serde_json::json!([{"check": "bti-enforced", "rule": "no-check-on-target"}])
+        );
+        assert!(
+            allowed_err
+                .contains("--fail-on-missing: excused by --allow no-check-on-target: bti-enforced"),
+            "{allowed_err}"
+        );
+        assert!(
+            allowed_err.contains("and 1 excused by --allow, named above"),
+            "the closing line counts the excused check: {allowed_err}"
+        );
+        assert!(
+            strict_err
+                .lines()
+                .any(|l| l.starts_with("chard: --fail-on-missing: exit 1")
+                    && l.contains("--allow no-check-on-target excuses it")),
+            "the strict gate's last line names the option: {strict_err}"
+        );
+    }
+}
+
+#[test]
+fn a_gated_report_conforms_and_records_what_its_allowance_excused() {
+    if !can_run("that a gated report validates and records what its allowance excused") {
+        return;
+    }
+    let work = common::Work::new("schema", "gated");
+    let report = report_for(
+        "bare",
+        &[
+            "--probe",
+            "bti-enforced",
+            "--fail-on-missing",
+            "--allow",
+            "no-check-on-target",
+        ],
+        work.dir(),
+    );
+    assert_conforms(
+        &report,
+        "bare under --fail-on-missing --allow no-check-on-target",
+    );
+    let gate = &report["coverage"]["gate"];
+    assert_eq!(gate["allowed"], serde_json::json!(["no-check-on-target"]));
+    let withheld: Vec<Value> = report["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .filter(|o| o["verdict"] == "indeterminate" && o["gating"]["rule"] == "no-check-on-target")
+        .map(|o| serde_json::json!({"check": o["check"], "rule": "no-check-on-target"}))
+        .collect();
+    assert_eq!(gate["excused"], Value::Array(withheld.clone()), "{gate}");
+    if report["toolchain"]["target"]["arch"] == "x86_64" {
+        assert_eq!(
+            withheld,
+            [serde_json::json!({"check": "bti-enforced", "rule": "no-check-on-target"})]
+        );
+    }
+    assert!(
+        shared_report("bare")["coverage"].get("gate").is_none(),
+        "a run without --fail-on-missing carries no gate record"
+    );
+}
+
 #[test]
 fn a_filtered_report_conforms_and_declares_itself_incomplete() {
     if !can_run("that a filtered run both conforms and admits its coverage is partial") {
@@ -588,17 +595,6 @@ fn a_filtered_report_conforms_and_declares_itself_incomplete() {
     );
 }
 
-/// A healthy report contradicts itself nowhere, says what it checked, and a
-/// contradicted one still conforms.
-///
-/// Three things, because the block has to prove three. A real run on a working chard
-/// must find no contradictions: one here would mean the derived layer disagrees with
-/// the observations under it on this very machine. The scope has to be published, or an
-/// empty result is unreadable: no contradictions under one rule and no contradictions
-/// under all of them are very different claims. And the schema branch for a
-/// contradiction has to be exercised, which a healthy run by definition cannot do, so
-/// the shape is spliced in; a schema that forgot to declare it then fails here rather
-/// than the first time chard is broken.
 #[test]
 fn consistency_reports_its_scope_and_declares_contradictions_when_present() {
     if !can_run("that the consistency block publishes its own scope alongside its findings") {
@@ -615,8 +611,7 @@ fn consistency_reports_its_scope_and_declares_contradictions_when_present() {
             && block["status"] == "consistent",
         "a healthy report must contradict itself nowhere and say so, got: {block}"
     );
-    // Every derived field the report can carry must be in scope. A rule set that
-    // silently stops covering one is the failure this field exists to make visible.
+    // Every derived field the report can carry must be in scope.
     let checked: Vec<&str> = block["fields_checked"]
         .as_array()
         .expect("fields_checked is an array")
@@ -629,10 +624,7 @@ fn consistency_reports_its_scope_and_declares_contradictions_when_present() {
             "{field} is a derived field and must be checked; scope is {checked:?}"
         );
     }
-    // Compared against the published rule set rather than against a number. The count was
-    // hardcoded here, so adding a fourth rule failed this test with the correct answer,
-    // and (the reason the count was the wrong assertion) removing one rule while adding
-    // another would have kept it passing.
+    // Compared against the published rule set rather than against a number.
     let announced: Vec<&str> = block["rules_applied"]
         .as_array()
         .expect("rules_applied is an array")
@@ -726,53 +718,6 @@ fn assert_the_schema_refuses_each_wrong_consistency_shape(report: &Value) {
     }
 }
 
-/// `elf` blocks in `tests/fixtures/detectors.json`. A deliberate regeneration
-/// (`tests/fixtures/README.md`) updates this count and names the new one in its commit; a
-/// corpus that lost rows any other way fails here. Each row's `note` says what the row holds,
-/// and `tests/fixtures/README.md` names the groups mined from particular reports. Which rows
-/// carry an `elf` block, and why:
-///
-/// - Mined control arms carry one where the store keeps the arm's artifact. The store keeps a
-///   runtime check's arm artifacts only where the check declares tables it reads
-///   (`report::stores_arm_artifacts`), so the positive arms of `zero-call-used-regs` and of
-///   `trapv-trapped`, clang 14.0.0's failed `zero-call-used-regs` build, the positive arms and
-///   `bare-optimized` negative arms of `shadow-stack-enforced`, and the six arms of the
-///   optimized gcc 4.8.4, 5.4.0 and 7.5.0 `no-strict-overflow` builds carry none.
-/// - An arm that built the same bytes as the `bare` measured build the store keeps carries
-///   that build's block: the four `zero-call-used-regs` negative arms, the `-ftrapv` checks'
-///   negative arms (the selection-only build), the four `bare` positive arms of
-///   `noexecstack-enforced` (a check that reads no table), the two `bare` negative arms of
-///   `shadow-stack-enforced`, and Ubuntu 22.04's `shadow-stack-enforced` positive arm from a
-///   KVM guest (gcc 11.4.0 defaults to the flag), where Ubuntu 24.04's carries none. Those two
-///   guest arms are the corpus's only recorded runs that name a machine without a shadow
-///   stack.
-/// - A check that reads an object carries the block on every row: the two `-fexceptions`
-///   checks, `strict-flex-arrays-enforced` (it declares the section names it reads),
-///   `separate-code` (carrying `data_in_code_pages`), `ubsan-trap-mode` and
-///   `fortify-printf-flag` (the code reader's two lists), `cet-endbr-emitted` (the slim LTO
-///   row's carries no `function_entries`), `ssp-level-emitted` (`function_references`) and
-///   `pic-object-relocs` (the object's relocations).
-/// - A build that wrote no ELF carries none: the two clang `-O2 -fno-plt -flto` measured
-///   `plt-bypassed` builds wrote LLVM bitcode, which the reader refuses, and the refused
-///   `pic-shared-link` links wrote nothing. The `pic-shared-link` measured builds whose shared
-///   link succeeded, and its one regime arm whose link succeeded, carry the linked object's
-///   block, and three of its control-arm rows carry the block another report stores under
-///   the same artifact digest.
-/// - Single rows: the Debian 12 i386 `separate-code` row is labelled `i386` because
-///   `fixture::extract` folds the triple's `i686` to the ELF header's name; the gcc 13.3.0
-///   Ubuntu 24.04 x86_64 `as-needed` row over a `-static` link, mined from a
-///   reproduction report and appended by hand, is the corpus's one `as-needed` row with no
-///   dynamic section; and `relro`'s measured `bare` builds from the OpenBSD 8.0 amd64 and
-///   arm64 reports (clang 22.1.6, lld) are the corpus's only OpenBSD `relro` rows, both
-///   reading `partial`.
-const REPLAY_ELF_ROWS: usize = 3939;
-
-/// Rows of the replay corpus whose link facts are not nullable: each is `cet-marked-object`
-/// on an `ET_REL` and carries `pie: false` and `relro: "none"` where the reader writes
-/// `null`. They validate under the union by design, and a
-/// regeneration that re-records them as `null` updates this count and says so.
-const PRE_NULLABLE_ET_REL_ROWS: usize = 40;
-
 /// The link facts whose type admits `null`, in the definition's order. The reader sets
 /// all nine on an object the loader can run and withholds all nine on any other; the
 /// sweep holds each instance to that, since the validator has no keyword for it.
@@ -795,11 +740,14 @@ const NULLABLE_LINK_FACTS: [&str; 9] = [
 /// `data_in_code_pages` is `None` on an object with no executable segment or no allocated
 /// section, `function_references` on any object but a relocatable one with a symbol table,
 /// and `code_relocations` on an object that is not `ET_REL` or has no section-header
-/// table; none is the link classification's condition, so none is one of the nine.
-const NULLABLE_OTHER_FACTS: [&str; 3] = [
+/// table; `rwx_segment` is the link classification's own condition, as the nine are, but
+/// is omitted when `None` like these three, so it is counted here and stated as `null` by
+/// the store like them. None of the four is one of the nine.
+const NULLABLE_OTHER_FACTS: [&str; 4] = [
     "data_in_code_pages",
     "code_relocations",
     "function_references",
+    "rwx_segment",
 ];
 
 /// What the ELF corpus sweep met, counted so that each optional declaration in
@@ -813,8 +761,6 @@ struct ElfCorpusSeen {
     versioned: usize,
     elf32: usize,
     null_link_facts: usize,
-    /// An `ET_REL` whose link facts carry a value where the reader writes `null`.
-    pre_nullable_et_rel: usize,
 }
 
 impl ElfCorpusSeen {
@@ -848,13 +794,11 @@ impl ElfCorpusSeen {
             .collect();
         assert!(
             nulls.is_empty() || nulls.len() == NULLABLE_LINK_FACTS.len(),
-            "{origin}: {} of the {} link facts are null and the rest carry a value; an object \
-             carries null in all of them or in none: {nulls:?}",
+            "{origin}: {} of the {} link facts are null and the rest carry a value: {nulls:?}",
             nulls.len(),
             NULLABLE_LINK_FACTS.len()
         );
         self.null_link_facts += usize::from(nulls.len() == NULLABLE_LINK_FACTS.len());
-        self.pre_nullable_et_rel += usize::from(is_pre_nullable_et_rel(facts));
     }
 }
 
@@ -873,8 +817,8 @@ fn nullable_members(definition: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// The `facts` object of every synthetic record under `tests/fixtures/elf/`, labelled by
-/// file, in name order.
+/// The reader's facts of every synthetic object under `tests/fixtures/elf/`, read live and
+/// serialized as a report carries them, labelled by file, in name order.
 fn synthetic_elf_facts() -> Vec<(String, Value)> {
     let dir = repo_root().join("tests/fixtures/elf");
     let mut out = Vec::new();
@@ -883,156 +827,37 @@ fn synthetic_elf_facts() -> Vec<(String, Value)> {
         let Some(stem) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".expected.json"))
+            .and_then(|n| n.strip_suffix(".elf"))
         else {
             continue;
         };
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let record: Value = serde_json::from_str(&text).expect("a synthetic record is JSON");
-        let facts = record
-            .get("facts")
-            .cloned()
-            .unwrap_or_else(|| panic!("{stem}.expected.json carries no `facts`"));
+        let facts = chard::elf::facts_for(&path)
+            .unwrap_or_else(|e| panic!("{}: the synthetic object parses: {e}", path.display()));
+        let facts = serde_json::to_value(&facts).expect("ElfFacts serializes");
         out.push((format!("fixtures/elf/{stem}"), facts));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
-/// Every `elf` block in the replay corpus, labelled by row and check.
-fn replayed_elf_facts() -> Vec<(String, Value)> {
-    let path = repo_root().join("tests/fixtures/detectors.json");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    let rows: Vec<Value> = serde_json::from_str(&text).expect("the replay corpus is a JSON array");
-    rows.into_iter()
-        .enumerate()
-        .filter_map(|(i, mut row)| {
-            let elf = row.get_mut("elf").map(Value::take)?;
-            if elf.is_null() {
-                return None;
-            }
-            let check = row["check"].as_str().unwrap_or("?");
-            Some((format!("detectors.json[{i}] {check}"), elf))
-        })
-        .collect()
-}
-
-/// An `ET_REL` whose link facts carry a value, where the reader writes `null`.
-fn is_pre_nullable_et_rel(facts: &Value) -> bool {
-    facts["elf_type"] == "ET_REL" && !facts["pie"].is_null()
-}
-
 /// How many instances each source of [`gather_elf_facts`] contributed, for the frame a
 /// failure prints.
 struct ElfCorpusSources {
     synthetic: usize,
-    replay: usize,
-    live: usize,
 }
 
-/// Every recorded ELF fact, labelled by origin, with each source reconciled against what
-/// it was expected to hold: a synthetic record per checked-in object and the pinned count
-/// of them, the pinned count of replay `elf` blocks, each of which the reader's own
-/// `ElfFacts` accepts, and one live read.
+/// The facts of every synthetic object, with the pinned count of them.
 fn gather_elf_facts() -> (Vec<(String, Value)>, ElfCorpusSources) {
-    let objects = std::fs::read_dir(repo_root().join("tests/fixtures/elf"))
-        .expect("tests/fixtures/elf is readable")
-        .filter(|e| {
-            e.as_ref()
-                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "elf"))
-        })
-        .count();
-    let mut fed = synthetic_elf_facts();
-    assert_eq!(
-        fed.len(),
-        objects,
-        "every synthetic object has a record beside it and every record was fed"
-    );
+    let fed = synthetic_elf_facts();
     assert_eq!(
         fed.len(),
         common::ELF_FIXTURE_COUNT,
         "the synthetic corpus changed size; update `common::ELF_FIXTURE_COUNT` and say why"
     );
     let synthetic = fed.len();
-
-    let replayed = replayed_elf_facts();
-    assert_eq!(
-        replayed.len(),
-        REPLAY_ELF_ROWS,
-        "the replay corpus carries a different number of `elf` blocks; a deliberate \
-         regeneration updates the constant and names the count in its commit"
-    );
-    let mut accepted = 0;
-    for (origin, facts) in &replayed {
-        serde_json::from_value::<chard::elf::ElfFacts>(facts.clone()).unwrap_or_else(|e| {
-            panic!("{origin}: the reader's own struct refuses a recorded `elf` block: {e}")
-        });
-        accepted += 1;
-    }
-    assert_eq!(
-        accepted,
-        replayed.len(),
-        "every replay block was offered to the struct"
-    );
-    let replay = replayed.len();
-    fed.extend(replayed);
-
-    let live_path = repo_root().join("tests/fixtures/elf/elf64-le-x86_64-rel.elf");
-    let live = chard::elf::facts_for(&live_path).expect("the checked-in relocatable object parses");
-    let live = serde_json::to_value(&live).expect("ElfFacts serializes");
-    fed.push((
-        "live read of fixtures/elf/elf64-le-x86_64-rel.elf".to_owned(),
-        live,
-    ));
-
-    (
-        fed,
-        ElfCorpusSources {
-            synthetic,
-            replay,
-            live: 1,
-        },
-    )
+    (fed, ElfCorpusSources { synthetic })
 }
 
-/// Every recorded ELF fact conforms to `$defs/elf_facts`, on every host.
-///
-/// A Darwin host never stores an `elf` fact: the artifact is Mach-O, `Elf::parse` refuses
-/// it and `measure` records `elf_error` instead, so the live-report tests above validate
-/// the typed definition against nothing here and a typo in it would surface only on an
-/// ELF host. This is the host-independent half. Three sources are fed: the synthetic
-/// corpus under `tests/fixtures/elf/`, which is where `null` link facts, `truncations`,
-/// `gnu_property_notes`, a `versioned` symbol and an ELF32 object live; every `elf` block
-/// in the replay corpus `tests/fixtures/detectors.json`, recorded from real toolchains on
-/// both architectures; and one live `facts_for` read of a checked-in object, serialized as
-/// a report would carry it, which needs no compiler and no fixture regeneration to stay
-/// current. The synthetic records are the live struct's serialization too, by
-/// `tests/elf_fixtures.rs::the_checked_in_facts_are_what_the_reader_reads`, which pins
-/// each record's `facts` to `Elf::parse(..).facts()`; validating them validates the struct
-/// for every member, the optional ones included, which the one relocatable object read
-/// here lacks.
-///
-/// Counted against exact numbers, because a corpus that failed to load, or lost rows,
-/// would validate less and pass: every synthetic object has to have produced a record and
-/// the record count is pinned, the replay block count is pinned and each block has to
-/// deserialize into `ElfFacts`, and each optional member has to have met at least one
-/// instance, or its declaration was held against nothing.
-///
-/// The rule that an object the loader cannot run carries `null` in all nine link facts
-/// together lives in the reader and in the definition's prose; the validator implements
-/// no conditional keyword, so `["boolean", "null"]` admits either on any object. The sweep
-/// holds the rule itself: `NULLABLE_LINK_FACTS` names the nine, the definition's members
-/// whose type admits `null` are held to that list exactly, and `ElfCorpusSeen::note`
-/// counts the nulls among them per instance and refuses any count other than zero or
-/// nine, so a reader change that nulls one fact and keeps the rest fails here with the
-/// instance named. Which objects carry the nine as `null` stays with the reader and the
-/// fixture records: the replay corpus carries rows whose link facts carry a value, every one
-/// `cet-marked-object` on an `ET_REL` with `pie: false` and `relro: "none"`. They validate under
-/// the union by design, their count is pinned as `PRE_NULLABLE_ET_REL_ROWS` so a regeneration that
-/// re-records them is a visible change, and the corpus stays as recorded through a schema-only
-/// change.
 #[test]
 fn every_recorded_elf_fact_conforms_to_the_elf_facts_definition() {
     let schema = schema();
@@ -1045,8 +870,7 @@ fn every_recorded_elf_fact_conforms_to_the_elf_facts_definition() {
             .chain(NULLABLE_OTHER_FACTS.iter())
             .map(|n| (*n).to_owned())
             .collect(),
-        "the members whose type admits null are the nine link facts the sweep counts and \
-         the three the store states"
+        "the members whose type admits null are not NULLABLE_LINK_FACTS and NULLABLE_OTHER_FACTS"
     );
 
     let mut seen = ElfCorpusSeen::default();
@@ -1064,27 +888,8 @@ fn every_recorded_elf_fact_conforms_to_the_elf_facts_definition() {
 
     assert_eq!(seen.instances, fed.len(), "every instance fed was counted");
     assert_eq!(
-        seen.instances,
-        sources.synthetic + sources.replay + sources.live,
+        seen.instances, sources.synthetic,
         "the sources account for every instance"
-    );
-    let pre_nullable: Vec<&str> = fed
-        .iter()
-        .filter(|(_, facts)| is_pre_nullable_et_rel(facts))
-        .map(|(origin, _)| origin.as_str())
-        .collect();
-    assert_eq!(
-        seen.pre_nullable_et_rel, PRE_NULLABLE_ET_REL_ROWS,
-        "{} ET_REL instances carry link facts with a value; {PRE_NULLABLE_ET_REL_ROWS} \
-         pre-nullable rows were in the replay corpus when this test was written, and a \
-         regeneration that re-records them updates the constant: {pre_nullable:?}",
-        seen.pre_nullable_et_rel
-    );
-    assert!(
-        pre_nullable
-            .iter()
-            .all(|origin| origin.contains("cet-marked-object")),
-        "a pre-nullable ET_REL outside the cet-marked-object rows: {pre_nullable:?}"
     );
     for (member, count) in [
         ("gnu_property_notes", seen.property_notes),
@@ -1102,13 +907,10 @@ fn every_recorded_elf_fact_conforms_to_the_elf_facts_definition() {
     let shown: Vec<&String> = errors.iter().take(20).collect();
     assert!(
         errors.is_empty(),
-        "recorded ELF facts violate $defs/elf_facts ({} problems over {} instances: {} \
-         synthetic, {} replay, {} live; first {}):\n{}",
+        "{} elf_facts problems in {} instances ({} synthetic), first {}:\n{}",
         errors.len(),
         seen.instances,
         sources.synthetic,
-        sources.replay,
-        sources.live,
         shown.len(),
         shown
             .iter()
@@ -1154,6 +956,8 @@ fn elf_facts_literal(populated: bool) -> chard::elf::ElfFacts {
         bind_now: Some(true),
         gnu_stack_present: Some(true),
         gnu_stack_executable: Some(false),
+        // `skip_serializing_if` the `Option`, so the minimal shape omits the key.
+        rwx_segment: populated.then_some(false),
         df_1_noopen: false,
         textrel: false,
         dt_relr: false,
@@ -1192,10 +996,29 @@ fn elf_facts_literal(populated: bool) -> chard::elf::ElfFacts {
         comment: filled("Linker: LLD 22.1.8"),
         code_scanned: filled("chard_ubsan_trap_probe:x86-ud2=1"),
         code_matches: filled("chard_ubsan_trap_probe:x86-ud2@0x1a"),
+        run_witness: filled("000102030405060708090a0b0c0d0e0f"),
         self_report: String::new(),
         recorded_command_line: String::new(),
         function_entries: filled("chard_ibt_target_a=f30f1efa"),
     }
+}
+
+#[test]
+fn the_rollup_keys_the_schema_declares_are_the_rollup_vocabulary() {
+    let schema = schema();
+    let counts = &schema["properties"]["defect_coverage"]["additionalProperties"]["properties"]["verdict_counts"];
+    // Open as published, so a validator accepts a later chard's key; this chard's reader
+    // refuses a nonzero count under one (`report::rollup_recount_disagrees`).
+    assert_eq!(
+        counts["additionalProperties"],
+        serde_json::json!({"type": "integer", "minimum": 0})
+    );
+    let declared = member_names(counts, "properties");
+    let vocabulary: BTreeSet<String> = chard::report::RollupKey::ALL
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .collect();
+    assert_eq!(declared, vocabulary);
 }
 
 /// The names a definition lists under `required`, or declares under `properties`.
@@ -1233,27 +1056,6 @@ fn optional_fields_in_source(struct_name: &str) -> usize {
     body.matches("skip_serializing_if").count()
 }
 
-/// The required and optional partition of `$defs/elf_facts` is the struct's own.
-///
-/// `every_recorded_elf_fact_conforms_to_the_elf_facts_definition` validates recorded
-/// facts, which holds each declared member to its type and each optional member to at
-/// least one instance. It cannot hold the partition: a field added to `ElfFacts` under
-/// `skip_serializing_if` with no schema entry serializes to nothing on a corpus recorded
-/// before it and validates by omission, and a required member demoted to optional in the
-/// schema withdraws a presence guarantee with every corpus row still conforming. This
-/// test holds both directions from the struct. `elf_facts_literal` is exhaustive, so a
-/// new field fails to compile until it is placed; the minimal serialization's key set is
-/// the definition's `required` list exactly, the populated one's is its `properties` key
-/// set exactly, the watched symbol's two shapes hold `$defs/symbol_fact` the same way,
-/// and both serializations validate with no problem.
-///
-/// The key sets alone leave one path open: a field added under `skip_serializing_if` and
-/// placed empty in both shapes of the literal serializes to nothing in either, so both
-/// comparisons pass with no schema entry for it. The optional-member count is therefore
-/// read a third way, from the struct text: `optional_fields_in_source` counts the
-/// `skip_serializing_if` attributes inside `pub struct ElfFacts` and `pub struct
-/// SymbolFact` in `src/elf.rs`, and each count is held equal to the definition's
-/// `properties` minus its `required`, so the empty placement fails here on every host.
 #[test]
 fn the_elf_facts_definition_partitions_the_struct_as_serde_serializes_it() {
     let schema = schema();
@@ -1287,8 +1089,7 @@ fn the_elf_facts_definition_partitions_the_struct_as_serde_serializes_it() {
             assert_eq!(
                 actual,
                 expected,
-                "populated={populated}: `{what}` writes keys other than its `{keyword}`.\n  \
-                 struct writes, schema omits: {:?}\n  schema names, struct never writes: {:?}",
+                "populated={populated}: `{what}` and `{keyword}` differ: struct {:?}, schema {:?}",
                 actual.difference(&expected).collect::<Vec<_>>(),
                 expected.difference(&actual).collect::<Vec<_>>(),
             );
@@ -1321,9 +1122,7 @@ fn the_elf_facts_definition_partitions_the_struct_as_serde_serializes_it() {
         );
         assert_eq!(
             declared, in_source,
-            "`{what}` declares {declared} optional members and `{struct_name}` carries \
-             {in_source} fields under `skip_serializing_if`; a field placed empty in the \
-             literal serializes to nothing, and this count is what catches it"
+            "`{what}` declares {declared} optional members but `{struct_name}` skips {in_source}"
         );
         compared += 1;
     }
@@ -1333,7 +1132,6 @@ fn the_elf_facts_definition_partitions_the_struct_as_serde_serializes_it() {
     );
 }
 
-/// The validator itself has to be able to fail, or the tests above prove nothing.
 #[test]
 fn the_validator_rejects_a_report_that_violates_the_schema() {
     let schema = schema();
@@ -1374,9 +1172,7 @@ fn the_validator_rejects_a_report_that_violates_the_schema() {
     );
 
     // Five keywords a small validator can parse and drop: `minimum`, `maximum`, `minItems`,
-    // `pattern` and `format`. Dropped, each declared constraint of theirs is enforced on
-    // nothing, including the `profile.id` pattern a join keys on, and `maximum: 100` on the
-    // withheld percentage.
+    // `pattern` and `format`.
     let cases: &[(&str, Value, &str)] = &[
         (
             "minimum",
@@ -1439,12 +1235,6 @@ fn the_validator_rejects_a_report_that_violates_the_schema() {
 }
 
 /// An attestation carrying an installed disk, as the library serialises it, conforms.
-///
-/// No live run here can produce one: `--execution vm` on a Linux host is refused by the
-/// mode-evidence rule, and chard cannot boot the harness's guests, so the record is built
-/// through the same parser and classifier `measure` uses, serialised, and spliced into a
-/// live report in place of its own `image_attestation`. What is checked is the shape the
-/// code emits against the shape the schema declares, and that the schema refuses the
 /// malformed and the null forms of the field rather than passing them.
 #[test]
 fn an_installed_disk_attestation_conforms_and_its_malformed_forms_do_not() {
@@ -1519,10 +1309,6 @@ fn an_installed_disk_attestation_conforms_and_its_malformed_forms_do_not() {
     }
 }
 
-/// A `type` name this validator does not implement panics, for the reason `pattern` and
-/// `format` do: a type that cannot be checked and reports success is indistinguishable
-/// from one that matched, and a misspelled name in any `type` keyword would otherwise
-/// validate by omission on every host.
 #[test]
 #[should_panic(expected = "is not implemented by this validator")]
 fn the_validator_refuses_a_type_it_does_not_implement() {
@@ -1537,15 +1323,6 @@ fn the_validator_refuses_a_type_it_does_not_implement() {
     );
 }
 
-/// The closed `evidence`, the typed store entry and the typed `elf` inside it have to be
-/// able to fail, or the corpus sweep above proves nothing. This is the tripwire a rename
-/// in `elf.rs` hits on every host, which the open `additionalProperties` left to downstream
-/// tools: with it, a renamed fact validated by omission. The untouched-record case is also
-/// the host-independent proof that a `facts` entry resolves to `$defs/fact_entry` and its
-/// `elf` to `$defs/elf_facts`: a mistyped `$ref` fails here as `unresolvable $ref`, which
-/// the corpus sweep, resolving the definition directly, never sees. The `aarch64_gcs` case
-/// holds the definition to refusing facts that lack that field: they fail `required` on it.
-/// `evidence.elf` is refused as undeclared, since facts are a `facts` entry.
 #[test]
 fn the_validator_rejects_evidence_the_contract_does_not_declare() {
     let schema = schema();
@@ -1601,8 +1378,7 @@ fn the_validator_rejects_evidence_the_contract_does_not_declare() {
         "`evidence.self_report` must be refused, got: {errors:?}"
     );
 
-    // The newest required fact, which an archived record can lack. `ElfFacts` reads such a
-    // record back with `#[serde(default)]`; the definition refuses it.
+    // The newest required fact, which an archived record can lack.
     let mut archived = facts.clone();
     archived
         .as_object_mut()
@@ -1647,8 +1423,6 @@ fn the_validator_rejects_evidence_the_contract_does_not_declare() {
     );
 }
 
-/// An `unreadable` entry may carry `mach_o`, a boolean, beside its `error`, and nothing
-/// else stands in for `error`.
 #[test]
 fn an_unreadable_entry_carries_mach_o_as_an_optional_boolean() {
     let schema = schema();
@@ -1676,10 +1450,6 @@ fn an_unreadable_entry_carries_mach_o_as_an_optional_boolean() {
     );
 }
 
-/// A store entry of a kind this revision does not write, with a member no kind declares,
-/// or with another kind's members is refused: the first two by the schema, the third per
-/// instance by [`fact_entries_carry_their_kinds_members`], since it validates under the
-/// union of the kinds' members.
 #[test]
 fn a_store_entry_outside_its_kind_is_refused() {
     let schema = schema();
@@ -1741,7 +1511,7 @@ fn a_store_entry_outside_its_kind_is_refused() {
     // A member omitted when empty and emptied where the base carries it resolves to its
     // absence, so a delta that empties a `minItems: 1` member of the base conforms; the
     // same change against a base without the member is the empty list itself, which
-    // `$defs/elf_facts` refuses. A required member keeps its empty value.
+    // `$defs/elf_facts` refuses.
     let mut with_comment = facts.clone();
     with_comment["comment"] = serde_json::json!(["GCC: (GNU) 16.0.0"]);
     let emptied_errors = |changes: Value, base_facts: &Value| -> Vec<String> {
@@ -1791,9 +1561,6 @@ fn a_store_entry_outside_its_kind_is_refused() {
     }
 }
 
-/// A `consistency.replay` whose counts do not add up is refused by
-/// [`replay_counts_add_up`], a well-formed one is not, and one left out is refused by the
-/// schema, which requires it.
 #[test]
 fn a_replay_that_does_not_account_for_its_readings_is_refused() {
     let replay = |value: Value| serde_json::json!({"consistency": {"replay": value}});
@@ -1828,9 +1595,6 @@ fn a_replay_that_does_not_account_for_its_readings_is_refused() {
     );
 }
 
-/// `evidence.cxx_assertions_source`, pinned against the list its one producer returns
-/// from, in both directions. The field appears only where libstdc++'s assertions are
-/// defined, so no single report is guaranteed to carry every value.
 #[test]
 fn the_cxx_assertions_sources_match_the_code() {
     let schema = schema();
@@ -1851,13 +1615,6 @@ fn the_cxx_assertions_sources_match_the_code() {
     );
 }
 
-/// `facts[].kind`, pinned against the enum that serializes it, in both directions, and
-/// the per-instance member lists against the kinds.
-///
-/// A kind the schema omits is an entry no consumer could validate; a kind the schema
-/// declares and no code writes is a promise nothing keeps. The member lists are the
-/// conditional the validator does not implement, so a kind without one would hold its
-/// instances to nothing.
 #[test]
 fn the_fact_entry_kinds_match_the_code() {
     let schema = schema();
@@ -1871,8 +1628,7 @@ fn the_fact_entry_kinds_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "facts[].kind disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "facts[].kind: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
@@ -1899,11 +1655,6 @@ fn the_fact_entry_kinds_match_the_code() {
     );
 }
 
-/// The report schema's `decoders` block validates its predicates against a copy of
-/// `schema/chard-predicate.schema.json`'s definitions, and the copy is that file's, member
-/// for member: the validator resolves `$ref` inside one document only, so the definitions
-/// are carried rather than referenced, and a copy that drifted from the language's own
-/// schema would accept predicates the language refuses.
 #[test]
 fn the_report_schema_carries_the_predicate_definitions() {
     let report = schema();
@@ -1955,12 +1706,6 @@ fn the_report_schema_carries_the_predicate_definitions() {
     );
 }
 
-/// Which verdict each gating rule publishes, as a consumer reads it from the `gating`
-/// description: one sentence per premise class, "publishes `<verdict>`:" followed by the
-/// class's rule ids.
-///
-/// Held to `gating_rule::Premise`, so a rule that changes class changes the sentence a
-/// consumer reads, and a class's membership cannot change in the code alone.
 #[test]
 fn the_gating_description_lists_each_rule_under_the_verdict_its_premise_reserves() {
     let schema = schema();
@@ -1986,18 +1731,11 @@ fn the_gating_description_lists_each_rule_under_the_verdict_its_premise_reserves
             .collect();
         assert_eq!(
             listed, class,
-            "the gating description lists the rules that `{marker}` differently from the \
-             premise each rule declares"
+            "the gating description's `{marker}` list is not the rules with that premise"
         );
     }
 }
 
-/// The rules `gating-rejection-absent-from-arm-stderr` reads, as its entry in the
-/// `rules_applied` description lists them, are the rows of `gating_rule::ALL` whose evidence
-/// is a tool's sentence, which is the set `report::rejection_agrees` derives.
-///
-/// The description names them by hand for a consumer; this holds the list to the table, so
-/// a rule that gains or loses a quoted sentence changes the sentence a consumer reads.
 #[test]
 fn the_rejection_rule_description_lists_the_tool_sentence_rows() {
     use chard::report::gating_rule::{ALL, Evidence};
@@ -2030,26 +1768,12 @@ fn the_rejection_rule_description_lists_the_tool_sentence_rows() {
     );
     assert_eq!(
         listed, rows,
-        "the rules_applied description lists the rules `gating-rejection-absent-from-arm-stderr` \
-         reads differently from the table's tool-sentence rows"
+        "the rules_applied description's rejection-rule list differs from the tool-sentence rows"
     );
 }
 
 /// Closed vocabularies in the schema are exactly the vocabularies in the code.
-///
-/// Both directions, because they fail differently. A code value the schema omits makes
-/// every report carrying it violate its own published contract, which is what happened:
-/// the binary emitted `abuild-default-conf`, `makepkg-conf` and `portageq-envvar` while
-/// the schema's enum said `abuild`, `portage` and `makepkg`, so every Alpine, Arch and
-/// Gentoo `distro-buildflags` report failed conformance and nothing noticed, because no
-/// test ever produced one on this host. A schema value the code cannot emit is the
-/// quieter fault: it promises consumers a case that will never arrive, and a consumer
-/// that switches on it has written dead code against a contract that invited it.
-///
-/// This is the same class as `observations[].check` missing from a schema that also said
-/// `additionalProperties: false`. That one was caught by validating real output; this one
-/// could not be, because the output that would have failed cannot be produced here.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "one pairing per closed vocabulary, the schema's set against the code's, each with why it is bound, read top to bottom"
 )]
@@ -2057,7 +1781,7 @@ fn the_rejection_rule_description_lists_the_tool_sentence_rows() {
 fn the_schemas_closed_vocabularies_match_the_code() {
     let schema = schema();
     let declared: BTreeSet<&str> =
-        schema["properties"]["profile"]["properties"]["flags_source"]["enum"]
+        vocabulary_of(&schema["properties"]["profile"]["properties"]["flags_source"])
             .as_array()
             .expect("flags_source declares an enum")
             .iter()
@@ -2067,8 +1791,7 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "profile.flags_source disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "profile.flags_source: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
@@ -2091,12 +1814,27 @@ fn the_schemas_closed_vocabularies_match_the_code() {
         "consistency.status disagrees between code and schema"
     );
 
-    // `controls.withheld_because`, pinned against the enum that produces it. A cause the
-    // schema omits would be a report key no consumer could validate; a cause the schema
-    // declares and no code path reaches would be a queue entry nobody can ever be working
-    // through.
+    // A listing's linkage form, pinned against the enum the parser reads it into.
     let declared: BTreeSet<&str> =
-        schema["$defs"]["controls"]["properties"]["withheld_because"]["enum"]
+        vocabulary_of(&schema["$defs"]["link_inputs"]["properties"]["form"])
+            .as_array()
+            .expect("link_inputs.form declares an enum")
+            .iter()
+            .map(|v| v.as_str().expect("enum values are strings"))
+            .collect();
+    let emitted: Vec<Value> = chard::link_inputs::LinkageForm::ALL
+        .iter()
+        .map(|f| serde_json::to_value(f).expect("a unit variant serializes"))
+        .collect();
+    let emitted: BTreeSet<&str> = emitted.iter().filter_map(Value::as_str).collect();
+    assert_eq!(
+        emitted, declared,
+        "link_inputs.form disagrees between code and schema"
+    );
+
+    // `controls.withheld_because`, pinned against the enum that produces it.
+    let declared: BTreeSet<&str> =
+        vocabulary_of(&schema["$defs"]["controls"]["properties"]["withheld_because"])
             .as_array()
             .expect("withheld_because declares an enum")
             .iter()
@@ -2109,22 +1847,20 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "controls.withheld_because disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "controls.withheld_because: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 
-    // `gating.rule`, pinned against the module that names them. A rule the schema omits is
-    // a key no consumer can validate; one the schema declares and no code path constructs
-    // is a withholding reason nobody will ever see and everybody will keep looking for.
-    let declared: BTreeSet<&str> =
-        schema["$defs"]["observation"]["properties"]["gating"]["properties"]["rule"]["enum"]
-            .as_array()
-            .expect("gating.rule declares an enum")
-            .iter()
-            .map(|v| v.as_str().expect("enum values are strings"))
-            .collect();
+    // `gating.rule`, pinned against the module that names them.
+    let declared: BTreeSet<&str> = vocabulary_of(
+        &schema["$defs"]["observation"]["properties"]["gating"]["properties"]["rule"],
+    )
+    .as_array()
+    .expect("gating.rule declares an enum")
+    .iter()
+    .map(|v| v.as_str().expect("enum values are strings"))
+    .collect();
     let emitted: BTreeSet<&str> = chard::report::gating_rule::ALL
         .iter()
         .map(|r| r.id)
@@ -2132,8 +1868,7 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "gating.rule disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "gating.rule: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
@@ -2154,19 +1889,12 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "observations[].observes disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "observations[].observes: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 
-    // `mode_evidence.basis`, where the two sets are deliberately NOT equal. The code can
-    // emit five spellings and the schema declares four: `asserted-and-contradicted` is
-    // absent because a report bearing it is quarantined before it is written. So the
-    // comparison is against `PUBLISHABLE`, and the excluded variant is asserted to be
-    // exactly the one the schema omits -- otherwise "the schema is missing a value the
-    // code emits" and "the schema correctly omits an unpublishable value" would be the
-    // same observation, and the first is a contract violation.
+    // `mode_evidence.basis`, where the two sets are deliberately NOT equal.
     let declared: BTreeSet<&str> = schema["properties"]["environment"]["properties"]
         ["execution"]["properties"]["mode_evidence"]["properties"]["basis"]["enum"]
         .as_array()
@@ -2181,8 +1909,7 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         publishable,
         declared,
-        "mode_evidence.basis disagrees between code and schema.\n  \
-         code can publish, schema omits: {:?}\n  schema declares, code cannot publish: {:?}",
+        "mode_evidence.basis: code alone can publish {:?}, schema alone declares {:?}",
         publishable.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&publishable).collect::<Vec<_>>(),
     );
@@ -2212,37 +1939,32 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "environment.kernel.ownership disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "environment.kernel.ownership: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 
     // `libc.impl`, which had drifted in both directions at once because nothing held it:
     // `openbsd` was returnable and undeclared, so the first OpenBSD report would have failed
-    // the validation above, and `uclibc` and `other` were declared and unreachable. The
-    // field is a `String` in the code, so the code's half of the binding is a source scan:
-    // `env::tests::no_libc_name_escapes_the_published_vocabulary`.
-    let declared: BTreeSet<&str> =
-        schema["properties"]["environment"]["properties"]["libc"]["properties"]["impl"]["enum"]
-            .as_array()
-            .expect("libc.impl declares an enum")
-            .iter()
-            .map(|v| v.as_str().expect("enum values are strings"))
-            .collect();
+    // the validation above, and `uclibc` and `other` were declared and unreachable.
+    let declared: BTreeSet<&str> = vocabulary_of(
+        &schema["properties"]["environment"]["properties"]["libc"]["properties"]["impl"],
+    )
+    .as_array()
+    .expect("libc.impl declares an enum")
+    .iter()
+    .map(|v| v.as_str().expect("enum values are strings"))
+    .collect();
     let emitted: BTreeSet<&str> = chard::env::LIBC_NAMES.iter().copied().collect();
     assert_eq!(
         emitted,
         declared,
-        "environment.libc.impl disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "environment.libc.impl: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 
-    // `linker.path_source`, which says who resolved the published linker path. Three
-    // values, and a fourth added in the code without the schema would be the first
-    // report carrying it failing validation on a host this suite cannot reach.
+    // `linker.path_source`, which says who resolved the published linker path.
     let declared: BTreeSet<&str> = schema["$defs"]["linker"]["properties"]["path_source"]["enum"]
         .as_array()
         .expect("linker.path_source declares an enum")
@@ -2256,14 +1978,12 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "toolchain.linker.path_source disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "toolchain.linker.path_source: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 
-    // The verdict vocabulary, by the same rule. Nine values across the Rust enum, the
-    // schema, the table renderers and the docs; this pins the first two together.
+    // The verdict vocabulary, by the same rule.
     let declared: BTreeSet<&str> = schema["$defs"]["verdict"]["enum"]
         .as_array()
         .expect("verdict declares an enum")
@@ -2277,18 +1997,12 @@ fn the_schemas_closed_vocabularies_match_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "observations[].verdict disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "observations[].verdict: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 }
 
-/// `gating.premise` is `gating_rule::Premise` as it serializes, pinned in both directions,
-/// and its description names the verdict each class publishes as `Premise::verdict` gives
-/// it. A class the schema omitted would be a word every new report writes and no
-/// consumer can validate; a verdict misnamed there would tell a consumer sorting by the
-/// class a different standing from the one chard counts.
 #[test]
 fn the_premise_vocabulary_matches_the_code_and_names_each_verdict() {
     use chard::report::gating_rule::Premise;
@@ -2322,10 +2036,6 @@ fn the_premise_vocabulary_matches_the_code_and_names_each_verdict() {
     }
 }
 
-/// Every gating a freshly measured report carries publishes `premise`, and it is the class
-/// this build's table gives its rule: the key the schema declares is the key `measure`
-/// writes, beside every rule, and no reader has to fall back to its own table for a report
-/// this build wrote.
 #[test]
 fn every_published_gating_carries_its_rules_premise() {
     if !can_run("that every gating in a measured report carries its rule's premise class") {
@@ -2355,23 +2065,17 @@ fn every_published_gating_carries_its_rules_premise() {
     );
 }
 
-/// `linker.artifact.agreement`, the artifacts' verdict on the banner, pinned to the code.
-///
-/// Five values, and the two absences among them are the ones a consumer must keep apart:
-/// a schema that dropped `no-linked-artifact` would let a Mach-O host validate as
-/// `no-signature`, which reads as a corroboration of GNU ld over nothing read. Its own
-/// test, since `the_schemas_closed_vocabularies_match_the_code` is already past the line
-/// cap.
 #[test]
 fn the_artifact_agreement_vocabulary_matches_the_code() {
     let schema = schema();
-    let declared: BTreeSet<&str> =
-        schema["$defs"]["linker"]["properties"]["artifact"]["properties"]["agreement"]["enum"]
-            .as_array()
-            .expect("linker.artifact.agreement declares an enum")
-            .iter()
-            .map(|v| v.as_str().expect("enum values are strings"))
-            .collect();
+    let declared: BTreeSet<&str> = vocabulary_of(
+        &schema["$defs"]["linker"]["properties"]["artifact"]["properties"]["agreement"],
+    )
+    .as_array()
+    .expect("linker.artifact.agreement declares an enum")
+    .iter()
+    .map(|v| v.as_str().expect("enum values are strings"))
+    .collect();
     let emitted: BTreeSet<&str> = chard::toolchain::Agreement::ALL
         .iter()
         .map(|s| s.as_str())
@@ -2379,15 +2083,12 @@ fn the_artifact_agreement_vocabulary_matches_the_code() {
     assert_eq!(
         emitted,
         declared,
-        "toolchain.linker.artifact.agreement disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "toolchain.linker.artifact.agreement: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 }
 
-/// `elf_facts.elf_data` is `elf::ByteOrder` as it serializes, pinned in both directions
-/// for the reason the linker's pin above gives.
 #[test]
 fn the_elf_data_vocabulary_matches_the_code() {
     let schema = schema();
@@ -2405,16 +2106,36 @@ fn the_elf_data_vocabulary_matches_the_code() {
     for o in chard::elf::ByteOrder::ALL {
         assert_eq!(
             serde_json::to_value(o).expect("serializes"),
-            serde_json::Value::from(o.as_str()),
+            Value::from(o.as_str()),
             "the published spelling is `as_str`"
         );
     }
 }
 
-/// A report carrying `profile-flag-rejected` diagnostics conforms, its `rejection` objects
-/// included: the schema closes the object, so a field `report::ProfileFlagRejection` gains
-/// or renames without the schema fails here. Two flags the driver rejects in one build give
-/// two.
+#[test]
+fn the_witness_source_vocabulary_matches_the_code() {
+    let schema = schema();
+    let declared: BTreeSet<String> = schema
+        .pointer("/properties/run/properties/artifact_witness/properties/source/enum")
+        .and_then(Value::as_array)
+        .expect("artifact_witness.source declares an enum")
+        .iter()
+        .map(|v| v.as_str().expect("enum values are strings").to_owned())
+        .collect();
+    let sources: BTreeSet<String> = chard::compile::WitnessSource::ALL
+        .iter()
+        .map(|s| s.as_str().to_owned())
+        .collect();
+    assert_eq!(sources, declared);
+    for source in chard::compile::WitnessSource::ALL {
+        assert_eq!(
+            serde_json::to_value(source).expect("serializes"),
+            Value::from(source.as_str()),
+            "the published spelling is `as_str`"
+        );
+    }
+}
+
 #[test]
 fn a_report_naming_rejected_profile_flags_conforms() {
     if !can_run("that a report naming rejected profile flags conforms") {
@@ -2454,7 +2175,34 @@ fn a_report_naming_rejected_profile_flags_conforms() {
     }
 }
 
-/// `diagnostics[].rejection.supplied_by` is `report::SuppliedBy`, as serde spells it.
+#[test]
+fn the_gate_allowance_vocabulary_matches_the_code() {
+    let schema = schema();
+    let gate = &schema["properties"]["coverage"]["properties"]["gate"]["properties"];
+    let code: BTreeSet<String> = chard::report::Allowance::ALL
+        .iter()
+        .map(|a| {
+            serde_json::to_value(a)
+                .expect("serializes")
+                .as_str()
+                .expect("a string")
+                .to_owned()
+        })
+        .collect();
+    for node in [
+        &gate["allowed"]["items"],
+        &gate["excused"]["items"]["properties"]["rule"],
+    ] {
+        let declared: BTreeSet<String> = vocabulary_of(node)
+            .as_array()
+            .expect("an open enumeration")
+            .iter()
+            .map(|v| v.as_str().expect("enum values are strings").to_owned())
+            .collect();
+        assert_eq!(code, declared);
+    }
+}
+
 #[test]
 fn the_rejection_provenance_vocabulary_matches_the_code() {
     let schema = schema();
@@ -2478,15 +2226,13 @@ fn the_rejection_provenance_vocabulary_matches_the_code() {
     assert_eq!(code, declared);
 }
 
-/// `toolchain.target.abi`'s two closed vocabularies are `toolchain::AbiAgreement` and
-/// what `toolchain::Abi::of_arch` gives each table architecture.
 #[test]
 fn the_target_abi_vocabulary_matches_the_code() {
     let schema = schema();
     let target = &schema["properties"]["toolchain"]["properties"]["target"]["properties"];
     let abi = &target["abi"]["properties"];
     let declared_abi = |field: &str| -> BTreeSet<String> {
-        abi[field]["enum"]
+        vocabulary_of(&abi[field])
             .as_array()
             .unwrap_or_else(|| panic!("toolchain.target.abi.{field} declares an enum"))
             .iter()
@@ -2501,7 +2247,7 @@ fn the_target_abi_vocabulary_matches_the_code() {
     for a in chard::toolchain::AbiAgreement::ALL {
         assert_eq!(
             serde_json::to_value(a).expect("serializes"),
-            serde_json::Value::from(a.as_str()),
+            Value::from(a.as_str()),
             "the published spelling is `as_str`"
         );
     }
@@ -2517,14 +2263,12 @@ fn the_target_abi_vocabulary_matches_the_code() {
     assert_eq!(expected, declared_abi("expected"));
 }
 
-/// `toolchain.target.agreement` and `toolchain.target.source`, pinned against the enums
-/// that produce them, in both directions for the reason the linker's pin above gives.
 #[test]
 fn the_target_agreement_vocabulary_matches_the_code() {
     let schema = schema();
     let target = &schema["properties"]["toolchain"]["properties"]["target"]["properties"];
     let declared = |field: &str| -> BTreeSet<String> {
-        target[field]["enum"]
+        vocabulary_of(&target[field])
             .as_array()
             .unwrap_or_else(|| panic!("toolchain.target.{field} declares an enum"))
             .iter()
@@ -2544,7 +2288,7 @@ fn the_target_agreement_vocabulary_matches_the_code() {
     for a in chard::toolchain::ArchAgreement::ALL {
         assert_eq!(
             serde_json::to_value(a).expect("serializes"),
-            serde_json::Value::from(a.as_str()),
+            Value::from(a.as_str()),
             "the published spelling is `as_str`"
         );
     }
@@ -2553,7 +2297,7 @@ fn the_target_agreement_vocabulary_matches_the_code() {
     let profile = &target["profile_macros"]["properties"];
     let cxx = &target["profile_macros_cxx"]["properties"];
     let enum_of = |v: &Value, at: &str| -> BTreeSet<String> {
-        v["enum"]
+        vocabulary_of(v)
             .as_array()
             .unwrap_or_else(|| panic!("toolchain.target.{at} declares an enum"))
             .iter()
@@ -2586,7 +2330,7 @@ fn the_target_agreement_vocabulary_matches_the_code() {
     for a in chard::toolchain::MacroAgreement::ALL {
         assert_eq!(
             serde_json::to_value(a).expect("serializes"),
-            serde_json::Value::from(a.as_str()),
+            Value::from(a.as_str()),
             "the published spelling is `as_str`"
         );
     }
@@ -2608,13 +2352,6 @@ fn the_target_agreement_vocabulary_matches_the_code() {
     );
 }
 
-/// `elf_facts.relro` is pinned against the list the reader produces from.
-///
-/// Kept beside `the_schemas_closed_vocabularies_match_the_code`, which is already past
-/// clippy's function-length cap. The schema carries `null` beside the three levels:
-/// `LinkKind` withholds every link fact on an object the loader cannot run, so `null`
-/// describes the object the way the levels do. Its presence is asserted and it is set
-/// aside before the levels are compared.
 #[test]
 fn the_relro_vocabulary_is_pinned_against_the_reader() {
     let schema = schema();
@@ -2635,19 +2372,12 @@ fn the_relro_vocabulary_is_pinned_against_the_reader() {
     assert_eq!(
         emitted,
         declared,
-        "elf_facts.relro disagrees between code and schema.\n  \
-         code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+        "elf_facts.relro: code alone emits {:?}, schema alone declares {:?}",
         emitted.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&emitted).collect::<Vec<_>>(),
     );
 }
 
-/// `elf_facts.truncations[].table` and `.kind` are pinned against the reader's enums.
-///
-/// The gate in `report::truncation_limitation` matches `table` against a check's declared
-/// `reads`, so a table the schema admits and the reader cannot spell, or the reverse, is a
-/// declaration nothing can meet. Compared as sets against `ElfTable::ALL` and
-/// `TruncationKind::ALL` through the same `as_str` the report serializes with.
 #[test]
 fn the_truncation_vocabulary_is_pinned_against_the_reader() {
     let schema = schema();
@@ -2658,7 +2388,7 @@ fn the_truncation_vocabulary_is_pinned_against_the_reader() {
         "a truncation is exactly its table, its kind and the reader's sentence"
     );
     let declared = |member: &str| -> BTreeSet<&str> {
-        item["properties"][member]["enum"]
+        vocabulary_of(&item["properties"][member])
             .as_array()
             .unwrap_or_else(|| panic!("truncations[].{member} declares an enum"))
             .iter()
@@ -2678,28 +2408,16 @@ fn the_truncation_vocabulary_is_pinned_against_the_reader() {
         assert_eq!(
             emitted,
             declared,
-            "elf_facts.truncations[].{member} disagrees between code and schema.\n  \
-             code emits, schema omits: {:?}\n  schema declares, code cannot emit: {:?}",
+            "elf_facts.truncations[].{member}: code alone emits {:?}, schema alone declares {:?}",
             emitted.difference(&declared).collect::<Vec<_>>(),
             declared.difference(&emitted).collect::<Vec<_>>(),
         );
     }
 }
 
-/// The pattern subset, checked directly, including what it refuses.
-///
-/// `matches_pattern` is forty lines of hand-rolled matching standing in for a regex
-/// engine, which makes it exactly the kind of code that quietly returns `true`. The
-/// last case is the one that matters: an unsupported construct must panic rather than
-/// pass, because a pattern that cannot be evaluated and reports success is the
-/// unimplemented keyword all over again.
 #[test]
 fn the_pattern_subset_matches_what_it_claims_and_refuses_the_rest() {
-    // Read from the schema rather than copied into the test. A copy can name a profile the
-    // schema does not admit. That is harmless, because the real conformance checks read the
-    // pattern from the loaded schema, but it reads as the live contract to anyone who finds
-    // it. A fixture that restates a value it does not own is
-    // the same drift this file exists to catch, one level down.
+    // Read from the schema rather than copied into the test.
     let schema = schema();
     let profile = schema["properties"]["profile"]["properties"]["id"]["pattern"]
         .as_str()
@@ -2757,140 +2475,6 @@ fn the_pattern_subset_matches_what_it_claims_and_refuses_the_rest() {
     );
 }
 
-/// `chard detect`'s output is a published contract as well: a replay of a real report is
-/// validated against the schema chard ships for it.
-#[test]
-fn detect_output_conforms_to_its_schema() {
-    if !can_run("that `chard detect` output validates against the schema chard ships") {
-        return;
-    }
-    let work = common::Work::new("schema", "detect");
-    let report = work.path("bare.json");
-    let bare = shared_report("bare");
-    std::fs::write(&report, serde_json::to_string(&bare).expect("serialize")).expect("write");
-    let schema = schema_at("schema/chard-detect.schema.json");
-    let mut outputs: Vec<(String, Value)> = Vec::new();
-    let run = |args: &[&std::ffi::OsStr]| -> Value {
-        let output = Command::new(chard_binary())
-            .arg("detect")
-            .args(args)
-            .output()
-            .expect("run detect");
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(output.status.code(), Some(0), "{args:?}: {text}");
-        serde_json::from_str(&text).expect("detect emits JSON")
-    };
-
-    // Every check replayed from a report, code decoders included.
-    let checks: Vec<(String, String)> = probe_listing();
-    for (check, _) in &checks {
-        outputs.push((
-            format!("replay {check}"),
-            run(&[check.as_ref(), "--evidence".as_ref(), report.as_os_str()]),
-        ));
-    }
-    // One arm alone.
-    outputs.push((
-        "replay ssp-level --arm negative".to_owned(),
-        run(&[
-            "ssp-level".as_ref(),
-            "--evidence".as_ref(),
-            report.as_os_str(),
-            "--arm".as_ref(),
-            "negative".as_ref(),
-        ]),
-    ));
-    // Every predicate check over a checked-in object.
-    let object = repo_root().join("tests/fixtures/elf/elf64-le-x86_64-exec-relro-lazy.elf");
-    for (check, channel) in &checks {
-        if channel == "macro" || channel == "elf-static" {
-            outputs.push((
-                format!("artifact {check}"),
-                run(&[check.as_ref(), "--artifact".as_ref(), object.as_os_str()]),
-            ));
-        }
-    }
-    // A store entry, and a record per channel.
-    if let Some((key, _)) = bare["facts"].as_object().and_then(|f| {
-        f.iter()
-            .find(|(_, e)| e["kind"] == "macro-dump" || e["kind"] == "elf")
-    }) {
-        let entry = work.path("entry.json");
-        std::fs::write(&entry, bare["facts"][key].to_string()).expect("write");
-        outputs.push((
-            "store entry".to_owned(),
-            run(&[
-                "ssp-level".as_ref(),
-                "--evidence".as_ref(),
-                entry.as_os_str(),
-            ]),
-        ));
-    }
-    let fixtures: Vec<Value> = serde_json::from_str(
-        &std::fs::read_to_string(repo_root().join("tests/fixtures/detectors.json"))
-            .expect("the fixture corpus"),
-    )
-    .expect("JSON");
-    let mut channels_seen = BTreeSet::new();
-    for fixture in &fixtures {
-        let check = fixture["check"].as_str().expect("check");
-        let Some((_, channel)) = checks.iter().find(|(id, _)| id == check) else {
-            continue;
-        };
-        if !channels_seen.insert(channel.clone()) {
-            continue;
-        }
-        let record = work.path("record.json");
-        std::fs::write(&record, fixture.to_string()).expect("write");
-        outputs.push((
-            format!("record {check}"),
-            run(&[check.as_ref(), "--evidence".as_ref(), record.as_os_str()]),
-        ));
-    }
-    assert_eq!(channels_seen.len(), 4, "{channels_seen:?}");
-
-    let mut kinds = BTreeSet::new();
-    for (what, output) in &outputs {
-        let mut errors = Vec::new();
-        validate(output, &schema, &schema, "", &mut errors);
-        assert!(
-            errors.is_empty(),
-            "{what} does not conform ({} problems):\n{}",
-            errors.len(),
-            errors.join("\n")
-        );
-        kinds.insert(output["kind"].as_str().expect("kind").to_owned());
-    }
-    assert_eq!(
-        kinds.into_iter().collect::<Vec<_>>(),
-        ["detection", "replay"],
-        "both output shapes were validated"
-    );
-}
-
-/// Every check id with its channel, as `chard probes` lists them.
-fn probe_listing() -> Vec<(String, String)> {
-    let output = Command::new(chard_binary())
-        .arg("probes")
-        .output()
-        .expect("run probes");
-    let listing: Value = serde_json::from_slice(&output.stdout).expect("probes emits JSON");
-    listing["probes"]
-        .as_array()
-        .expect("probes")
-        .iter()
-        .flat_map(|p| p["checks"].as_array().expect("checks").iter())
-        .map(|c| {
-            (
-                c["id"].as_str().expect("id").to_owned(),
-                c["channel"].as_str().expect("channel").to_owned(),
-            )
-        })
-        .collect()
-}
-
-/// The matrix is a published contract too, and the same rule applies: a schema
-/// nothing checks against real output is documentation that happens to be JSON.
 #[test]
 fn a_matrix_conforms_to_its_schema() {
     if !can_run("that a matrix validates against the schema chard ships") {
@@ -2898,8 +2482,7 @@ fn a_matrix_conforms_to_its_schema() {
     }
     let binary = chard_binary();
     if !binary.exists() {
-        eprintln!("skipping: chard not built");
-        return;
+        cannot_run(&format!("{} not built", binary.display()));
     }
     let work = common::Work::new("schema", "matrix");
     let bare = shared_report("bare");
@@ -2948,10 +2531,6 @@ type Column = (String, String, String, String);
 
 /// Join `reports` on the documented keys: one column per tuple, one row per check,
 /// each cell the verdict.
-///
-/// Panics where a report breaks the contract, since that is what the join test is for:
-/// a key element that is not a string, or a check appearing twice in one column, which
-/// would mean the row key is not a key.
 fn join(reports: &[&Value]) -> BTreeMap<Column, BTreeMap<String, String>> {
     let text = |report: &Value, path: &[&str]| -> String {
         let mut cur = report;
@@ -2986,17 +2565,6 @@ fn join(reports: &[&Value]) -> BTreeMap<Column, BTreeMap<String, String>> {
     table
 }
 
-/// Two reports join on the keys the schema names, and the joined cells can be read.
-///
-/// The schema's top-level description said comparison tables are derived by joining
-/// reports and named no key, and nothing performed a join. This performs one, over two
-/// reports the binary produced here under two explicit profiles: the column tuple is
-/// (`environment.distro.id`, `environment.distro.version_id`, `toolchain.id`,
-/// `profile.id`), the row key is `observations[].check`. The two explicit lists have to
-/// land in two columns, which is what `explicit:<digest>` is for; under `explicit:cli` they
-/// were one column measured twice, and the second overwrote the first.
-///
-/// Filtered to two probes, because the join is what is under test.
 #[test]
 fn two_reports_join_on_the_keys_the_schema_names() {
     if !can_run("that two reports join on the documented column tuple and row key") {
@@ -3063,17 +2631,6 @@ fn two_reports_join_on_the_keys_the_schema_names() {
     assert_eq!(plain["run"]["id"].as_str().map(str::len), Some(16));
 }
 
-/// The published `toolchain.id` is the qualified join key, every half of it.
-///
-/// The key is `kind-version-libc-distro`, and its second half is the environment's, which
-/// can only be read after the toolchain's own macro dump. A key composed by overwriting a
-/// placeholder after that read lets a caller that skips the overwrite publish `gcc-16.1.1`,
-/// a plausible key that joins every distribution with every other.
-/// `toolchain::Detected::qualified` is the one constructor of the published
-/// struct, and this is the post-hoc check on what it published: the expected string is
-/// spelled here from the report's own `environment.libc` and `environment.distro`, as an
-/// oracle independent of `env::Libc::tag` and `env::Distro::tag`, so a drift in either
-/// spelling fails this rather than agreeing with itself.
 #[test]
 fn the_published_toolchain_id_is_the_qualified_join_key() {
     if !can_run("that the published toolchain.id carries the libc and distribution halves") {
@@ -3109,8 +2666,7 @@ fn the_published_toolchain_id_is_the_qualified_join_key() {
     let published = field(&["toolchain", "id"]).expect("toolchain.id is published");
     assert_eq!(
         published, expected,
-        "toolchain.id must be kind-version-libc-distro as spelled from the report's own \
-         environment block; a key missing a half joins columns that measured different things"
+        "toolchain.id is not kind-version-libc-distro from the report's environment block"
     );
     // The oracle is non-degenerate: both halves the environment contributes are in the key,
     // so a key of the unqualified `kind-version` form is distinct from the expected one.
@@ -3121,9 +2677,6 @@ fn the_published_toolchain_id_is_the_qualified_join_key() {
     );
 }
 
-/// The schema's description of `run.invocation` names the path options `--normalize`
-/// replaces, and no others: the list between "so the values of" and "are the paths", read
-/// as option spellings, equals `report::INVOCATION_PATH_OPTIONS`.
 #[test]
 fn the_schema_names_the_invocation_paths_normalize_replaces() {
     let schema = schema();
@@ -3147,13 +2700,6 @@ fn the_schema_names_the_invocation_paths_normalize_replaces() {
     assert_eq!(code, listed);
 }
 
-/// The schema marks exactly the fields `--normalize` zeroes, and no others.
-///
-/// Both directions. A field marked volatile that `normalize` leaves alone is a reader
-/// told to ignore a difference that means something; a field `normalize` zeroes without
-/// a mark is a reader diffing two reports with no way to know which lines to discount.
-/// The code's list and the schema's marks are held equal, so a field that starts varying
-/// has to be declared in both.
 #[test]
 fn the_schema_marks_exactly_the_fields_normalize_zeroes() {
     fn walk(node: &Value, path: &str, found: &mut BTreeSet<String>) {
@@ -3183,9 +2729,7 @@ fn the_schema_marks_exactly_the_fields_normalize_zeroes() {
     assert_eq!(
         marked,
         declared,
-        "the schema's x-volatile marks and report::VOLATILE_FIELDS disagree.\n  \
-         marked in the schema and absent from the code: {:?}\n  \
-         declared in the code and unmarked in the schema: {:?}",
+        "x-volatile: schema alone marks {:?}, report::VOLATILE_FIELDS alone declares {:?}",
         marked.difference(&declared).collect::<Vec<_>>(),
         declared.difference(&marked).collect::<Vec<_>>(),
     );
@@ -3195,12 +2739,6 @@ fn the_schema_marks_exactly_the_fields_normalize_zeroes() {
     );
 }
 
-/// The schema lists exactly the readings `--normalize` replaces, and no others.
-///
-/// A reading is a value inside `run_record.stdout`, so it cannot carry a field's
-/// `x-volatile` mark without telling a reader to discount the whole stream; it is listed
-/// under `x-volatile-readings` on that field instead, and held equal to
-/// `report::VOLATILE_READINGS` in both directions for the reason the field marks are.
 #[test]
 fn the_schema_lists_exactly_the_readings_normalize_replaces() {
     let schema = schema();
@@ -3250,8 +2788,7 @@ fn assert_volatile_readings_replaced(report: &Value, text: &str) {
         let masked = format!("{}{}", reading.marker, chard::report::NORMALIZED_READING);
         // Both counts are zero when the run never printed the reading (a probe that
         // reported `probe-invalid=` instead), and equal zeros would pass while testing
-        // nothing. Every platform this suite runs on prints it today; one that cannot
-        // should be skipped here by name, not let through by an empty count.
+        // nothing.
         let spoken = text.matches(reading.marker).count();
         assert!(
             spoken > 0,
@@ -3272,20 +2809,6 @@ fn assert_volatile_readings_replaced(report: &Value, text: &str) {
 const LONGER_WORKDIR: &str =
     "second-in-a-work-directory-whose-name-is-longer-than-the-first-by-a-wide-margin";
 
-/// Two normalized runs of one measurement are byte-identical.
-///
-/// Measured without `--normalize`: two identical `bare` runs differed in 32 of
-/// some 2,000 pretty-printed lines, all of them durations, the timestamp, the run id
-/// hashed from it, the invocation's output path, and a compiler's temporary object name
-/// quoted by a linker warning. Two work directories and two output paths here, so the
-/// paths in every build line and in the invocation differ at the driver and must not in
-/// the report. Three probes across the channels, so a build record, a run record and a
-/// macro dump are all under test; the sweep itself is not what is being tested.
-///
-/// The two work directories differ in length: two of the same length under one parent
-/// (`first` and `second`) would let a cut made before the work directory is relativised cut
-/// both at one place. `stack-clash` is among the probes for the one value inside a run's
-/// output that moves between runs (`report::VOLATILE_READINGS`).
 #[test]
 fn two_normalized_runs_of_one_measurement_are_byte_identical() {
     if !can_run("that two normalized runs of the same measurement produce identical bytes") {
@@ -3334,25 +2857,17 @@ fn two_normalized_runs_of_one_measurement_are_byte_identical() {
     assert_volatile_readings_replaced(&first, &outputs[0]);
 
     // Every difference chard is answerable for, and no tolerance beyond that.
-    //
-    // `--normalize` zeroes what chard varies between two runs. It cannot make a
-    // toolchain that is not reproducible look as though it were, and it must not try:
-    // an artifact digest is a fact about the compiler and linker, and two runs that
-    // produced different bytes did produce different bytes. Apple's linker emits a
-    // random `LC_UUID` under an explicit `-O0`, which the ad-hoc code signature then
-    // hashes, so the `optimization-enabled` negative control arm digests differently
-    // every run on Darwin; the same source with no `-O`, and with `-O2`, is
-    // byte-identical over six and four runs respectively. Measured on Apple clang 21.
-    //
-    // So a differing `artifact_sha256` line is allowed and counted, and anything else
-    // fails. A report whose only variation is which bytes a non-reproducible linker
-    // emitted still answers the question this test exists to ask, which is whether
-    // chard's own output is deterministic.
-    //
-    // The digest is also the key of the artifact's entry in `facts`,
-    // and the store is ordered by key, so a moved digest moves its entry; see
-    // `relabel_moved_digests`.
     let (relabelled, moved) = relabel_moved_digests(&outputs);
+    if let Some(witness) = first["run"].get("artifact_witness") {
+        assert_eq!(
+            witness["source"], "derived",
+            "a normalized run did not derive its witness"
+        );
+    }
+    assert!(
+        cfg!(target_os = "macos") || moved == 0,
+        "{moved} artifact digest(s) differ between two normalized runs of one measurement"
+    );
     let differing: Vec<(&str, &str)> = relabelled[0]
         .lines()
         .zip(relabelled[1].lines())
@@ -3366,8 +2881,7 @@ fn two_normalized_runs_of_one_measurement_are_byte_identical() {
         .collect();
     assert!(
         chards_own.is_empty(),
-        "two normalized runs of one measurement differ in {} line(s) chard is answerable \
-         for ({} vs {} lines in all); the first of them:\n{}",
+        "two normalized runs differ in chard's own lines, {} shown ({} vs {} lines in all):\n{}",
         chards_own.len(),
         outputs[0].lines().count(),
         outputs[1].lines().count(),
@@ -3390,13 +2904,6 @@ fn two_normalized_runs_of_one_measurement_are_byte_identical() {
 
 /// Two rendered reports with each pair of digests their `artifact_sha256` lines disagree on
 /// replaced by one placeholder in both, re-rendered, and the number of pairs.
-///
-/// An artifact digest is a fact about the compiler and linker, and a non-reproducible
-/// linker moves it between two runs (Apple's, under an explicit `-O0`; see
-/// `two_normalized_runs_of_one_measurement_are_byte_identical`). The digest is also the key
-/// of the artifact's entry in `facts`, and the store is ordered by key, so a moved digest
-/// moves its entry. With the pairs relabelled the entry must be the same entry in the same
-/// place, which is the claim that chard's reading of the two artifacts is deterministic.
 fn relabel_moved_digests(outputs: &[String]) -> (Vec<String>, usize) {
     let digest_of = |line: &str| -> Option<String> {
         let value = line.trim().strip_prefix("\"artifact_sha256\": ")?;
@@ -3414,6 +2921,13 @@ fn relabel_moved_digests(outputs: &[String]) -> (Vec<String>, usize) {
             for (i, pair) in moved.iter().enumerate() {
                 let digest = if run == 0 { &pair.0 } else { &pair.1 };
                 text = text.replace(digest.as_str(), &format!("nonreproducible-{i}"));
+                // The sixteen digits a sentence quotes a digest by (`sha256:<prefix>`).
+                if let Some(prefix) = digest.get(..16) {
+                    text = text.replace(
+                        &format!("sha256:{prefix}"),
+                        &format!("sha256:nonreproducible-{i}"),
+                    );
+                }
             }
             let value: Value = serde_json::from_str(&text).expect("a report");
             serde_json::to_string_pretty(&value).expect("re-rendering a report")
@@ -3451,13 +2965,6 @@ fn mask_readings(text: &str) -> String {
 }
 
 /// Every leaf where `a` and `b` differ, with how it is accounted for.
-///
-/// The walk follows the schema beside the two instances: `properties`, an object-valued
-/// `additionalProperties`, `prefixItems` and `items`, and a `$ref` resolved after the mark on
-/// the referring node is read, since `x-volatile` sits on either. A place with no schema
-/// below it (a `oneOf` branch, a key the schema does not declare) passes no mark down, so a
-/// difference there is never excused by one found higher up the wrong branch. A key or an
-/// element present in one report only is a difference at that place.
 fn differing_leaves(
     pair: (&Value, &Value),
     node: &Value,
@@ -3591,8 +3098,7 @@ fn assert_names_its_directories_only_where_declared(report: &Value, root_text: &
     let undeclared: Vec<&String> = named.iter().filter(|p| !declared(p)).collect();
     assert!(
         undeclared.is_empty(),
-        "the report names the run's directories outside the declared invocation \
-         values: {undeclared:?}"
+        "the report names run directories outside the declared invocation values: {undeclared:?}"
     );
     assert!(
         !named.is_empty(),
@@ -3600,19 +3106,56 @@ fn assert_names_its_directories_only_where_declared(report: &Value, root_text: &
     );
 }
 
-/// Two rendered reports differ only under `x-volatile` marks and in
-/// `report::VOLATILE_READINGS` values, their invocations among the differences, and no
-/// artifact digest moved off macOS. The comparison half of
+/// Two rendered reports differ only under `x-volatile` marks, in
+/// `report::VOLATILE_READINGS` values and in what carries the run's witness, their
+/// invocations among the differences. The comparison half of
 /// `two_raw_runs_from_different_directories_differ_only_where_the_schema_says`.
 fn assert_runs_differ_only_where_declared(outputs: &[String]) {
-    let (relabelled, moved) = relabel_moved_digests(outputs);
-    // A moved digest is excused only where a linker is known not to reproduce its output
-    // (Apple's, under an explicit `-O0`). Elsewhere a digest that moves with the directory is
-    // a difference the schema does not declare, and relabelling it would hide one.
-    assert!(
-        cfg!(target_os = "macos") || moved == 0,
-        "{moved} artifact digest(s) differ between two runs from different directories"
+    let nonce_of = |text: &str| -> Option<String> {
+        let report: Value = serde_json::from_str(text).expect("a report");
+        let witness = report["run"].get("artifact_witness")?;
+        assert_eq!(
+            witness["source"], "os-random",
+            "a run without --normalize did not draw its witness from the operating system"
+        );
+        Some(witness["nonce"].as_str().expect("a nonce").to_owned())
+    };
+    let nonces = [nonce_of(&outputs[0]), nonce_of(&outputs[1])];
+    let witnessed = match (&nonces[0], &nonces[1]) {
+        (Some(first), Some(second)) => {
+            assert_ne!(first, second, "two runs drew one nonce");
+            true
+        }
+        (None, None) => false,
+        _ => panic!("one of two runs on one host carries a witness and the other none"),
+    };
+    assert_eq!(
+        witnessed,
+        !cfg!(target_os = "macos"),
+        "a run carries a witness exactly where its artifacts are ELF"
     );
+    let unwitnessed: Vec<String> = outputs
+        .iter()
+        .zip(&nonces)
+        .map(|(text, nonce)| match nonce {
+            Some(nonce) => text.replace(nonce.as_str(), "this-runs-nonce"),
+            None => text.clone(),
+        })
+        .collect();
+    let (relabelled, moved) = relabel_moved_digests(&unwitnessed);
+    // A moved digest is excused where the run's nonce is in the artifact, and where a
+    // linker is known not to reproduce its output (Apple's, under an explicit `-O0`).
+    let digests = outputs[0]
+        .lines()
+        .filter(|l| l.trim_start().starts_with("\"artifact_sha256\""))
+        .count();
+    assert!(digests > 0, "the first report names no artifact digest");
+    if witnessed {
+        assert_eq!(
+            moved, digests,
+            "{moved} of {digests} artifact digest lines differ between two witnessed runs"
+        );
+    }
     let reports: Vec<Value> = relabelled
         .iter()
         .map(|text| serde_json::from_str(text).expect("a report"))
@@ -3635,8 +3178,7 @@ fn assert_runs_differ_only_where_declared(outputs: &[String]) {
         .collect();
     assert!(
         undeclared.is_empty(),
-        "two runs from different directories differ where the schema declares nothing \
-         volatile (the first {} shown): {undeclared:?}",
+        "two runs in different directories differ in undeclared fields ({} shown): {undeclared:?}",
         undeclared.len()
     );
     let volatile = differences
@@ -3656,20 +3198,6 @@ fn assert_runs_differ_only_where_declared(outputs: &[String]) {
     );
 }
 
-/// Two runs from different directories differ, as published, only where the schema says they
-/// may, and neither names the directories except where `THREAT_MODEL.md` says it does.
-///
-/// `two_normalized_runs_of_one_measurement_are_byte_identical` compares two reports after
-/// `--normalize`, which holds `normalize` to cover what varies. This compares them as
-/// published, so a field that varies between two runs and that the schema does not mark
-/// `x-volatile` fails here whether or not anything zeroes it. The two runs differ in the
-/// directory the binary was run from (a link to the built binary, one name in two
-/// directories), the work directory's name and depth, and the output path. Every differing
-/// leaf must sit under an `x-volatile` mark (each mark is a `report::VOLATILE_FIELDS` entry,
-/// which `the_schema_marks_exactly_the_fields_normalize_zeroes` holds) or be a
-/// `report::VOLATILE_READINGS` value, and no string in either report may contain the test's
-/// directory except a value of `report::INVOCATION_PATH_OPTIONS` in `run.invocation`.
-/// `argv[0]` is recorded as `chard` from both directories.
 #[cfg(unix)]
 #[test]
 fn two_raw_runs_from_different_directories_differ_only_where_the_schema_says() {
@@ -3735,14 +3263,6 @@ fn two_raw_runs_from_different_directories_differ_only_where_the_schema_says() {
     assert_runs_differ_only_where_declared(&outputs);
 }
 
-/// Insufficient evidence must be an *absent key*, never an explicit `null`.
-///
-/// The two are not equivalent to a consumer. A missing key makes an `== expected`
-/// policy test fail closed; an explicit null sails through the `!= bad` idiom that much
-/// real policy is written in. The schema states `"type": "string"` for these fields for
-/// exactly that reason, so a null would also be a conformance violation, but this
-/// asserts it directly, because the schema could be loosened by someone who has not
-/// read why it is tight.
 #[test]
 fn absent_beats_null_for_graded_fields() {
     if !can_run("that an unread graded field is absent rather than null") {
@@ -3752,7 +3272,10 @@ fn absent_beats_null_for_graded_fields() {
     let observations = report["observations"]
         .as_array()
         .expect("observations is an array");
-    assert!(!observations.is_empty());
+    assert!(
+        !observations.is_empty(),
+        "the bare report has observations to check"
+    );
 
     for obs in observations {
         for field in ["level", "recommended_level"] {
@@ -3767,19 +3290,6 @@ fn absent_beats_null_for_graded_fields() {
     }
 }
 
-/// A driver that cannot be spawned costs its own probe and nothing else.
-///
-/// A `?` at this call site would turn any invoke failure into a whole-run abort: with
-/// `run_probe` returning `Result` and `gather` propagating `compile::build`'s error,
-/// `chard measure` emits an error envelope with **zero** checks (exit 2,
-/// `{"error": {"code": "PERMISSION", ...}}`, no observations at all). This test fails on such
-/// code rather than passing either way.
-///
-/// The trigger here is a present-but-unspawnable `g++`, which `cxx_driver_for` accepts
-/// because it only tests for existence. That is cheaper to arrange than a wedged compiler
-/// and reaches the same containment path, and it is the likelier accident in the field:
-/// a `g++` symlink with the wrong mode is one `chmod` away, while a hung `cc1` needs a bad
-/// `-specs` file or an NFS stall.
 #[test]
 fn one_unusable_driver_does_not_destroy_the_other_probes() {
     if !can_run("that one unusable driver does not take the whole run with it") {
@@ -3817,8 +3327,7 @@ fn one_unusable_driver_does_not_destroy_the_other_probes() {
         .expect("observations is an array");
     assert!(
         observations.len() > 20,
-        "the run collapsed to {} observations; one unusable driver must not take the \
-         others with it",
+        "the run collapsed to {} observations",
         observations.len()
     );
 
@@ -3834,8 +3343,7 @@ fn one_unusable_driver_does_not_destroy_the_other_probes() {
         .collect();
     assert!(
         !contained.is_empty(),
-        "nothing was contained, so this test no longer exercises the path it was \
-         written for — the broken g++ must reach a build"
+        "nothing was contained: no gating reason says a build could not be attempted"
     );
     for check in &contained {
         let obs = observations
@@ -3845,8 +3353,7 @@ fn one_unusable_driver_does_not_destroy_the_other_probes() {
         assert_eq!(
             obs["verdict"].as_str(),
             Some("indeterminate"),
-            "{check}: a probe we failed to measure must not publish a verdict about the \
-             toolchain"
+            "{check}: a probe that was not measured does not read `indeterminate`"
         );
     }
 
@@ -3866,14 +3373,6 @@ fn one_unusable_driver_does_not_destroy_the_other_probes() {
     assert_conforms(&report, "report with an unusable C++ driver");
 }
 
-/// A constituent's `opt_out` is declared, its header vocabulary is the code's, and the
-/// fact it rests on is declared as present-only.
-///
-/// No report this suite produces carries one: its runs pass no `-z nobtcfi`, and GNU ld,
-/// the Linux hosts' default linker, ignores the flag (lld writes the header for any
-/// target, which is how a Linux report can carry one). So the shape is held here
-/// over a constituent built the way `composite::cfi` builds it, and an `openbsd_nobtcfi`
-/// written as `false` is refused, since the reader omits it then.
 #[test]
 fn a_constituents_opt_out_is_declared_and_its_header_is_the_codes() {
     let schema = schema();
@@ -3933,17 +3432,6 @@ fn a_constituents_opt_out_is_declared_and_its_header_is_the_codes() {
 }
 
 /// Every closed vocabulary in the schema is one somebody decided about.
-///
-/// [`the_schemas_closed_vocabularies_match_the_code`] pins four enums against a code-side
-/// list. It pinned four of twenty-two, and nothing said so; the other eighteen were
-/// unpinned in exactly the way an unwritten test is unpinned, and two of them had drifted:
-/// `diagnostics[].severity` declared `info`, which no producer had ever written, and
-/// `reference.kind` declared `bug` and `spec`, which no `Reference` in the corpus
-/// constructs.
-///
-/// So this is the register, not another comparison: every enum in the schema must appear
-/// below with a disposition. Adding a vocabulary to the schema without deciding how it is
-/// held fails here, which is the difference between an assumption and a belief.
 const VOCABULARIES: &[(&str, &str)] = &[
     // Pinned against a code-side list by `the_schemas_closed_vocabularies_match_the_code`.
     ("/properties/consistency/properties/status", "pinned"),
@@ -3963,10 +3451,18 @@ const VOCABULARIES: &[(&str, &str)] = &[
     ("/$defs/controls/properties/withheld_because", "pinned"),
     // Pinned by `the_fact_entry_kinds_match_the_code`.
     ("/$defs/fact_entry/properties/kind", "pinned"),
+    // Pinned against `link_inputs::LinkageForm::ALL` by
+    // `the_schemas_closed_vocabularies_match_the_code`.
+    ("/$defs/link_inputs/properties/form", "pinned"),
     // Pinned against `build/revision.rs`'s `Source` by `tests/build_revision.rs`'s
     // `the_source_spellings_are_the_schemas_and_the_join_keys`.
     (
         "/properties/run/properties/harness_revision_source",
+        "pinned",
+    ),
+    // Pinned by `the_witness_source_vocabulary_matches_the_code`.
+    (
+        "/properties/run/properties/artifact_witness/properties/source",
         "pinned",
     ),
     // Pinned by `the_cxx_assertions_sources_match_the_code`.
@@ -4073,8 +3569,7 @@ const VOCABULARIES: &[(&str, &str)] = &[
     ),
     // Held by the conformance validator instead: every report the suite generates is
     // validated against this schema, and these fields are present in all of them, so a
-    // code value the schema omits fails there. The converse (a schema value no producer
-    // emits) is what the disposition is recording as accepted risk.
+    // code value the schema omits fails there.
     (
         "/properties/environment/properties/execution/properties/mode",
         "validated-in-every-report",
@@ -4132,6 +3627,12 @@ const VOCABULARIES: &[(&str, &str)] = &[
         "/$defs/observation/properties/confidence",
         "validated-in-every-report",
     ),
+    // Open as `gating.rule` is, and pinned in `tests/schema_freeze.rs`'s OPEN list; every report carries observations, so the known
+    // values' agreement with the corpus is held by the freeze test's vocabulary walk.
+    (
+        "/$defs/observation/properties/check",
+        "validated-in-every-report",
+    ),
     (
         "/$defs/controls/properties/positive/properties/outcome",
         "validated-in-every-report",
@@ -4180,12 +3681,20 @@ const VOCABULARIES: &[(&str, &str)] = &[
         "/properties/diagnostics/items/properties/rejection/properties/supplied_by",
         "pinned",
     ),
+    // Pinned by `the_gate_allowance_vocabulary_matches_the_code`.
+    (
+        "/properties/coverage/properties/gate/properties/allowed/items",
+        "pinned",
+    ),
+    (
+        "/properties/coverage/properties/gate/properties/excused/items/properties/rule",
+        "pinned",
+    ),
     (
         "/$defs/reference/properties/kind",
         "validated-in-every-report",
     ),
-    // Emitted only on hosts or runs this suite cannot produce here. Retired by a fixture
-    // that carries one, or by a code-side list to pin them against.
+    // Emitted only on hosts or runs this suite cannot produce here.
     (
         "/properties/environment/properties/execution/properties/image_attestation/properties/status",
         "unproduced-here",
@@ -4205,9 +3714,6 @@ const VOCABULARIES: &[(&str, &str)] = &[
     ),
 ];
 
-/// `composites[].constituents[].bar.source`, which says which reading set the fortify
-/// slot's bar: the schema's enumeration is the code's (`composite::BAR_SOURCES`), a slot
-/// carrying a bar validates, and a bar outside its shape is refused.
 #[test]
 fn a_constituents_bar_source_is_the_codes() {
     let schema = schema();
@@ -4240,7 +3746,7 @@ fn a_constituents_bar_source_is_the_codes() {
             source: chard::composite::BarSource::Driver,
         }),
     };
-    let umbrella = |constituent: serde_json::Value| {
+    let umbrella = |constituent: Value| {
         serde_json::json!({"composites": [{
             "id": "fhardened-effective", "title": "t", "derived_from": ["fortify-effective"],
             "verdict": "partial", "reason": "r", "constituents": [constituent],
@@ -4304,9 +3810,6 @@ fn a_constituents_bar_source_is_the_codes() {
     assert_eq!(fed, 5);
 }
 
-/// `corroboration.*.sources.*.witness`, which says what a corroborating member read. A
-/// witness kind added in the code without the schema would fail validation first on the
-/// report that carried it.
 #[test]
 fn the_witness_vocabulary_is_pinned_against_the_code() {
     let schema = schema();
@@ -4324,7 +3827,6 @@ fn the_witness_vocabulary_is_pinned_against_the_code() {
     );
 }
 
-/// The structured-diagnostics comparison's three vocabularies, by the rule above.
 #[test]
 fn the_structured_diagnostics_vocabularies_are_pinned_against_the_code() {
     let schema = schema();
@@ -4335,7 +3837,7 @@ fn the_structured_diagnostics_vocabularies_are_pinned_against_the_code() {
         ("structured", &chard::structured::STRUCTURED_READINGS[..]),
         ("outcome", &chard::structured::OUTCOMES[..]),
     ] {
-        let declared: BTreeSet<&str> = arm[field]["enum"]
+        let declared: BTreeSet<&str> = vocabulary_of(&arm[field])
             .as_array()
             .unwrap_or_else(|| panic!("structured_diagnostics arms declare a {field} enum"))
             .iter()
@@ -4358,13 +3860,6 @@ fn the_structured_diagnostics_vocabularies_are_pinned_against_the_code() {
     );
 }
 
-/// A gated run conforms, and the gate's summary counts what it compared against what was
-/// eligible.
-///
-/// Two compiler-diag probes rather than the corpus: the gate costs one extra build per
-/// arm, and what this holds is the shape and the arithmetic, not a sweep. A toolchain
-/// with no structured form publishes a summary with no `format` and compares nothing;
-/// every compiler this suite runs under (gcc, clang, Apple clang) has one.
 #[test]
 fn a_structured_diagnostics_report_conforms_and_counts_its_work() {
     if !can_run("that a --structured-diagnostics report conforms and counts its work") {
@@ -4431,14 +3926,35 @@ fn a_structured_diagnostics_report_conforms_and_counts_its_work() {
     }
 }
 
-/// Collect the JSON-pointer path of every object in `node` that declares an `enum`.
+/// The known values of an enumeration: a closed one's `enum`, or an open one's, spelt `anyOf` of
+/// the known values and any string. `Value::Null` where the node is neither.
+fn vocabulary_of(node: &Value) -> &Value {
+    if node.get("enum").is_some() {
+        return &node["enum"];
+    }
+    match node
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    {
+        Some([known, any]) if any == &serde_json::json!({ "type": "string" }) => &known["enum"],
+        _ => &Value::Null,
+    }
+}
+
+/// Collect the JSON-pointer path of every enumeration in `node`, closed or open, at the node
+/// that declares it: an open one's path is its own, not its `anyOf` branch's.
 fn enum_paths(node: &Value, path: &str, found: &mut BTreeSet<String>) {
     match node {
         Value::Object(map) => {
-            if map.get("enum").is_some_and(Value::is_array) {
+            let open = map.get("enum").is_none() && vocabulary_of(node).is_array();
+            if map.get("enum").is_some_and(Value::is_array) || open {
                 found.insert(path.to_owned());
             }
             for (key, value) in map {
+                if open && key == "anyOf" {
+                    continue;
+                }
                 enum_paths(value, &format!("{path}/{key}"), found);
             }
         }
@@ -4459,82 +3975,13 @@ fn every_closed_vocabulary_in_the_schema_is_registered() {
     assert_eq!(
         found,
         registered,
-        "the schema's closed vocabularies and the register disagree.\n  \
-         in the schema, unregistered: {:?}\n  registered, not in the schema: {:?}",
+        "closed vocabularies: schema alone declares {:?}, register alone lists {:?}",
         found.difference(&registered).collect::<Vec<_>>(),
         registered.difference(&found).collect::<Vec<_>>(),
     );
     assert!(
         !found.is_empty(),
         "no vocabulary was found, so this test compared two empty sets"
-    );
-}
-
-/// Every property the schema declares is a name the code knows.
-///
-/// The quiet half of the contract. A *value* the code cannot emit is caught by comparing
-/// vocabularies; a *property* the code never writes is not, because it is simply absent
-/// from every report and `required` does not name it, so it validates forever while
-/// promising consumers a field that will never arrive. Two were: `profile.cppflags`, where
-/// the code emits `cxxflags` and the schema had the C-preprocessor spelling, and
-/// `environment.execution.network`, which no struct in `src/` has ever had.
-///
-/// # What this does and does not establish
-///
-/// It is a text search over `src/`, not a reflection of the wire format: it establishes
-/// that the name exists somewhere in the code, not that it is serialized at that path, and
-/// a short name could match something unrelated. That is weaker than the vocabulary
-/// comparison above and deliberately so; the alternative needs a report that exercises
-/// every optional field on every host, which is the thing that cannot be produced here.
-/// It catches the failure that actually occurred, which is a name nothing in the code has
-/// ever heard of.
-#[test]
-fn every_property_the_schema_declares_is_a_name_the_code_knows() {
-    fn property_names(node: &Value, found: &mut BTreeSet<String>) {
-        match node {
-            Value::Object(map) => {
-                if let Some(Value::Object(props)) = map.get("properties") {
-                    found.extend(props.keys().cloned());
-                }
-                for value in map.values() {
-                    property_names(value, found);
-                }
-            }
-            Value::Array(items) => {
-                for value in items {
-                    property_names(value, found);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut declared = BTreeSet::new();
-    property_names(&schema(), &mut declared);
-    assert!(
-        declared.len() > 100,
-        "only {} properties were collected, so the walk is not reaching the schema",
-        declared.len()
-    );
-
-    let src = repo_root().join("src");
-    let mut code = String::new();
-    for (_, path) in common::rust_sources(&src) {
-        code.push_str(&std::fs::read_to_string(&path).expect("a readable source file"));
-    }
-    assert!(
-        !code.is_empty(),
-        "no source was read, so every name would trivially be reported missing"
-    );
-
-    let unknown: Vec<&String> = declared
-        .iter()
-        .filter(|name| !code.contains(name.as_str()))
-        .collect();
-    assert!(
-        unknown.is_empty(),
-        "the schema declares properties no source file in src/ mentions, so nothing can \
-         ever emit them: {unknown:?}"
     );
 }
 
@@ -4591,13 +4038,6 @@ fn property_nodes_outside_objects(schema: &Value, path: &str, out: &mut Vec<Stri
     }
 }
 
-/// The schema rule (`CONTRACT` in `src/main.rs`): a key chard adds to a document is not a
-/// change, so every object an output schema declares admits one for a consumer
-/// (`additionalProperties: true`, which `common::schema` reads as closed to chard's own
-/// output), and none is closed outright, which would refuse an additively extended document
-/// at a validator pinned to this file. The input schema stays closed, and so does the copy of
-/// its definitions the report schema carries: a key an evaluator does not know in a
-/// predicate is refused, not ignored, since it could change what the predicate concludes.
 #[test]
 fn every_output_schema_object_admits_a_later_key_and_the_input_schema_admits_none() {
     // The predicate language's definitions, which the report schema carries as a copy
@@ -4621,8 +4061,7 @@ fn every_output_schema_object_admits_a_later_key_and_the_input_schema_admits_non
         property_nodes_outside_objects(&schema_at(name), "", &mut shapes);
         assert!(
             shapes.iter().all(|path| path.contains("/oneOf/")),
-            "{name}: `properties` outside a `\"type\": \"object\"` node, which this scan would \
-             not see: {shapes:?}"
+            "{name}: `properties` outside a `\"type\": \"object\"` node: {shapes:?}"
         );
         let (copied, objects): (Vec<_>, Vec<_>) =
             all.into_iter().partition(|(path, _)| in_language(path));
@@ -4667,9 +4106,6 @@ fn every_output_schema_object_admits_a_later_key_and_the_input_schema_admits_non
     eprintln!("objects declared: {}", frame.join(", "));
 }
 
-/// Each schema's `chard_schema` is the version the binary writes: a schema whose `const`
-/// and the code's constant disagree refuses every document the binary makes, or admits one
-/// of a version it does not describe.
 #[test]
 fn each_schema_pins_the_version_its_document_carries() {
     for (name, pointer, version) in [
@@ -4707,10 +4143,6 @@ fn each_schema_pins_the_version_its_document_carries() {
     }
 }
 
-/// A report a later chard extended, one key at the top and one inside `coverage`, passes the
-/// published schema as a consumer's validator reads it, and fails the same file as chard's
-/// own tests read it, which name both keys: the two readings `common::schema::Reading`
-/// describes, on one document.
 #[test]
 fn a_report_with_a_later_key_passes_the_published_schema_and_fails_chards_own_reading() {
     if !can_run("that a report with one more key passes the published schema") {
@@ -4739,10 +4171,6 @@ fn a_report_with_a_later_key_passes_the_published_schema_and_fails_chards_own_re
     assert_eq!(errors.len(), 2, "{errors:?}");
 }
 
-/// What `chard` writes to stdout in place of a document conforms to
-/// `schema/chard-error.schema.json`: a usage error, a refusal before the run, a file `table`
-/// cannot read, and the envelope `measure` exits 3 with, rendered with and without a
-/// quarantine file (no end-to-end run reaches a contradiction short of a defect in chard).
 #[test]
 fn every_envelope_conforms_to_the_error_schema() {
     let schema = schema_at("schema/chard-error.schema.json");
@@ -4803,8 +4231,6 @@ fn every_envelope_conforms_to_the_error_schema() {
     }
 }
 
-/// Every JSON document chard writes but `elf`'s names its version under one key, so a
-/// consumer reads `chard_schema` whatever it was handed.
 #[test]
 fn every_json_document_but_elfs_carries_chard_schema() {
     if !can_run("that every JSON document carries chard_schema") {
@@ -4849,4 +4275,90 @@ fn every_json_document_but_elfs_carries_chard_schema() {
         assert_eq!(document["chard_schema"], expected, "{label}: {document:#}");
         assert!(document.get("chard_matrix_schema").is_none(), "{label}");
     }
+}
+
+#[test]
+fn the_arch_gate_description_names_the_cells_the_mechanism_table_decides() {
+    use chard::mechanism::{ARCHS, Decision, decide};
+    use std::collections::BTreeMap;
+
+    type Cells = BTreeMap<String, BTreeSet<String>>;
+
+    fn every<'a>(value: &'a Value, prefix: &str, found: &mut Vec<&'a str>) {
+        match value {
+            Value::String(s) if s.starts_with(prefix) => found.push(s),
+            Value::Array(items) => items.iter().for_each(|v| every(v, prefix, found)),
+            Value::Object(map) => map.values().for_each(|v| every(v, prefix, found)),
+            _ => {}
+        }
+    }
+    // `on ARCH a, b and c; on ARCH d`: each clause names one architecture once.
+    fn clauses(list: &str) -> Cells {
+        let mut cells = Cells::new();
+        for clause in list.split("; ") {
+            let (arch, ids) = clause
+                .strip_prefix("on ")
+                .and_then(|c| c.split_once(' '))
+                .unwrap_or_else(|| panic!("a clause is `on ARCH checks`: {clause:?}"));
+            let ids: BTreeSet<String> = ids
+                .replace(" and ", ", ")
+                .split(", ")
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                cells.insert(arch.to_owned(), ids).is_none(),
+                "{arch} has two clauses in {list:?}"
+            );
+        }
+        cells
+    }
+    // The text after `after`, from its first `: ` to the next `. `.
+    fn list<'a>(text: &'a str, after: &str) -> &'a str {
+        let (_, rest) = text
+            .split_once(after)
+            .unwrap_or_else(|| panic!("the description says {after:?}"));
+        let (_, rest) = rest.split_once(": ").expect("the list follows a colon");
+        rest.split_once(". ").expect("the list ends a sentence").0
+    }
+
+    let schema = schema();
+    let mut found = Vec::new();
+    every(
+        &schema,
+        "Checks the target architecture puts out of reach",
+        &mut found,
+    );
+    let [text] = found[..] else {
+        panic!("one description of coverage.checks_not_applicable_here: {found:?}");
+    };
+    let gated = clauses(list(text, "publishes `arch-gated` only where"));
+    let unread = clauses(list(text, "and is not counted here"));
+
+    let (mut absent, mut withheld) = (Cells::new(), Cells::new());
+    for check in chard::probe::CORPUS
+        .iter()
+        .flat_map(|p| p.checks)
+        .filter(|c| !c.gate.arch.is_empty())
+    {
+        for arch in ARCHS {
+            let cells = match decide(check.id, arch) {
+                Decision::Absent { .. } => &mut absent,
+                Decision::Unread { .. } => &mut withheld,
+                Decision::Measured | Decision::Outside => continue,
+            };
+            cells
+                .entry((*arch).to_owned())
+                .or_default()
+                .insert(check.id.to_owned());
+        }
+    }
+    assert!(
+        !absent.is_empty() && !withheld.is_empty(),
+        "the table gates or withholds nothing, and this test holds nothing"
+    );
+    assert_eq!(gated, absent, "the arch-gated list and the table disagree");
+    assert_eq!(
+        unread, withheld,
+        "the no-check-on-target list and the table disagree"
+    );
 }

@@ -8,6 +8,18 @@
 //! classification `env::read_uid_map` gives the maps the kernel writes is held here too: the
 //! whole map is identity or it is not, never its first line.
 #![cfg(target_os = "linux")]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::fs::Permissions;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -16,9 +28,6 @@ use chard::env::{FileRead, UidExtent, UidMap, read_file, read_uid_map};
 
 mod common;
 
-/// Every error but `ENOENT` reads `Unreadable`, whatever it says about the path: a symlink
-/// loop, a non-directory in the path, a directory at the path and, as a user the mode binds,
-/// a file this user may not read and a parent this user may not search.
 #[test]
 fn absence_is_enoent_alone_and_content_is_a_readable_file_and_the_rest_is_unreadable() {
     let work = common::Work::new("platform-reads", "read-file");
@@ -169,12 +178,6 @@ fn uid_map_rows() -> Vec<(&'static str, &'static str, UidMap)> {
     ]
 }
 
-/// Only the whole map `0 0 4294967295`, as the kernel pads it or whitespace normalised, is
-/// identity. A one-id map (`unshare -U --map-user=1000`) maps one id to itself and is a
-/// user namespace, as is a map of several extents whose first maps an id to itself, and
-/// one with no extent written; a line that is not three numbers of ASCII digits within
-/// `u32` is malformed. This host's own map is read last, and is identity where the suite
-/// runs outside a user namespace.
 #[test]
 fn only_the_whole_identity_map_is_identity() {
     let rows = uid_map_rows();

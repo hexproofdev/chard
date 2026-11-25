@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: BSD-3-Clause
+{ path = "alloc::vec::Vec", reason = "no allocator: buffers are the caller's" },
+{ path = "alloc::boxed::Box", reason = "no allocator" },
+{ path = "alloc::string::String", reason = "no allocator" },

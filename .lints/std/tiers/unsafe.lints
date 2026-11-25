@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier unsafe: only crates on the repository's unsafe allowlist.
+clippy.undocumented_unsafe_blocks = "deny"
+clippy.multiple_unsafe_ops_per_block = "deny"
+clippy.unnecessary_safety_comment = "deny"
+clippy.unnecessary_safety_doc = "deny"
+clippy.fn_to_numeric_cast_any = "deny"
+rust.missing_unsafe_on_extern = "deny"         # edition 2021; harmless on 2024
+rust.unsafe_attr_outside_unsafe = "deny"
+rust.deprecated_safe_2024 = "deny"

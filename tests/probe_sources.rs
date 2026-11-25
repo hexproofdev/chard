@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The probes' own preconditions, exercised on the host compiler.
-//!
-//! A probe that checks a precondition and exits distinctly when it does not hold makes
-//! a claim about its C source, and the unit tests in `src/probe.rs` can only cover the
-//! Rust half of it: that a given exit status is read as a withheld verdict with a named
-//! cause. These tests build the probe with the host `cc`, run it, and read the status
-//! the binary returns, in both directions. The intact probe establishes its
-//! precondition; a copy with the mechanism removed fails loud instead of measuring.
-//!
-//! Every mutation is a rewrite of the embedded source that asserts it matched exactly
-//! once, so a probe whose spelling changed fails here rather than testing a copy that was
-//! never mutated. Every status is read from `chard_selfreport.h`, where the probes define
-//! it, rather than written as a number a second time.
-//!
-//! What runs here is decided by the host compiler and libc, so the module says which arm
-//! it exercised. A Mach-O host runs the probes and reads their statuses; it cannot read
-//! their artifacts, and the tests that need that say so through [`common::capability_gap`].
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 mod common;
 
@@ -59,8 +56,7 @@ fn rewritten(source: &str, from: &str, to: &str) -> String {
     assert_eq!(
         source.matches(from).count(),
         1,
-        "the mutation {from:?} must match the probe source exactly once; the probe's \
-         spelling has changed and this test no longer mutates what it says it does"
+        "the mutation {from:?} does not match the probe source exactly once"
     );
     source.replace(from, to)
 }
@@ -93,14 +89,342 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The overflow probe reports gcc's major version, which the decoder reads an unoptimized
-/// gcc build by, and reports it as the compiler's own `__GNUC__`.
-///
-/// Without the line every unoptimized gcc 8 or later build that ran the guard reads
-/// `indeterminate`, and no recorded-evidence test notices, since those feed the decoder
-/// stdout already captured. So the probe is built and run here: under gcc its stdout
-/// carries `gcc-major=` once, equal to `__GNUC__` as `cc -dM -E` reports it; under clang
-/// it carries none.
+/// `rwx_segment` of a linked program on an ELF host.
+fn rwx_segment_of(bin: &Path) -> Option<bool> {
+    chard::elf::facts_for(bin)
+        .unwrap_or_else(|why| {
+            panic!(
+                "{}: chard's reader refused the artifact: {why}",
+                bin.display()
+            )
+        })
+        .rwx_segment
+}
+
+#[test]
+fn the_rwx_arm_input_survives_gc_sections_by_its_root() {
+    if !can_run("that the RWX arm's input survives --gc-sections") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "the RWX arm's input under --gc-sections",
+            "the host links artifacts that are not ELF, with a linker that takes neither \
+             --gc-sections nor the input's section syntax",
+        );
+        return;
+    }
+    let work = common::Work::new("probe-sources", "rwx-input");
+    let check = probe::find("link-defaults")
+        .and_then(|p| p.checks.iter().find(|c| c.id == "rwx-segment-absent"))
+        .expect("rwx-segment-absent is a link-defaults check");
+    let inputs = check.positive_inputs();
+    assert_eq!(inputs.len(), 1, "the arm links one input of its own");
+    let source = write_probe(&work, "link-defaults", &|s| s.to_owned());
+    let input = work.write(inputs[0].source_name, inputs[0].source);
+    let gc = [
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+    ];
+    let link = |tag: &str, flags: &[&str], with_input: bool| {
+        let bin = work.path(tag);
+        let mut cc = Command::new("cc");
+        cc.args(flags).arg("-o").arg(&bin).arg(&source);
+        if with_input {
+            cc.arg(&input);
+        }
+        let out = cc.current_dir(work.dir()).output().expect("spawning cc");
+        assert!(
+            out.status.success(),
+            "cc could not build {tag} with {flags:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        bin
+    };
+    let arm: Vec<&str> = gc.iter().chain(check.positive).copied().collect();
+    let rooted = rwx_segment_of(&link("rwx-arm-gc", &arm, true));
+    assert_eq!(rooted, Some(true), "the arm as built holds an RWX segment");
+    assert_eq!(
+        rwx_segment_of(&link("rwx-arm-gc-unrooted", &gc, true)),
+        Some(false),
+        "without the root the collecting link drops the section, so the root is what keeps it"
+    );
+    assert_eq!(
+        rwx_segment_of(&link("rwx-clean-gc", &gc, false)),
+        Some(false),
+        "the probe alone holds none"
+    );
+}
+
+/// One reading of a `link-defaults` check: its id, verdict, level and gating rule, as JSON text.
+type Reading = (String, String, String, String);
+
+/// `chard measure --profile explicit --flags FLAGS` over the `link-defaults` probe with the host
+/// `cc`, `extra` appended to the command line, read back as one [`Reading`] per check.
+fn link_defaults_readings(
+    work: &common::Work,
+    tag: &str,
+    flags: &str,
+    extra: &[&str],
+) -> Vec<Reading> {
+    let report = work.path(&format!("{tag}.json"));
+    let out = Command::new(common::chard_binary())
+        .args([
+            "measure",
+            "--cc",
+            "cc",
+            "--profile",
+            "explicit",
+            "--flags",
+            flags,
+        ])
+        .args(extra)
+        .args(["--probe", "link-defaults", "--execution", "host"])
+        .arg("--workdir")
+        .arg(work.path(&format!("{tag}-work")))
+        .arg("--output")
+        .arg(&report)
+        .output()
+        .expect("spawning chard");
+    assert!(
+        report.exists(),
+        "{tag}: chard published no report:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("reading the report"))
+            .expect("the report is JSON");
+    let field = |o: &serde_json::Value, at: &str| {
+        o.pointer(at)
+            .map_or_else(|| "-".to_owned(), ToString::to_string)
+    };
+    value["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .map(|o| {
+            (
+                field(o, "/check"),
+                field(o, "/verdict"),
+                field(o, "/level"),
+                field(o, "/gating/rule"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn rwx_segment_absent_input_reaches_its_positive_arm_alone() {
+    if !can_run("that rwx-segment-absent's input reaches its positive arm alone")
+        || !common::require_binary(&common::chard_binary(), "the link-defaults measurement")
+    {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "rwx-segment-absent's input handed to its positive arm alone",
+            "the host's artifacts are not ELF, so link-defaults' segment checks read nothing",
+        );
+        return;
+    }
+    let work = common::Work::new("probe-sources", "rwx-handed");
+    let header = work.write("plain_selection.h", "typedef int chard_plain_selection;\n");
+    let input = probe::find("link-defaults")
+        .and_then(|p| p.checks.iter().find(|c| c.id == "rwx-segment-absent"))
+        .map(|c| c.positive_inputs()[0].source_name)
+        .expect("rwx-segment-absent's input");
+    let selection = format!("-O2 -include {}", header.display());
+    for (tag, flags) in [("plain", "-O2"), ("selection", selection.as_str())] {
+        link_defaults_readings(&work, tag, flags, &[]);
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.path(&format!("{tag}.json"))).expect("reading the report"),
+        )
+        .expect("the report is JSON");
+        let observations = report["observations"].as_array().expect("observations");
+        let mut handed = Vec::new();
+        for o in observations {
+            for (arm, at) in [
+                ("measured", "/build/argv"),
+                ("positive", "/controls/positive/build/argv"),
+                ("negative", "/controls/negative/build/argv"),
+            ] {
+                let names = o
+                    .pointer(at)
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|argv| argv.iter().any(|w| w.as_str() == Some(input)));
+                if names {
+                    handed.push(format!("{} {arm}", o["check"].as_str().unwrap_or("?")));
+                }
+            }
+        }
+        assert_eq!(
+            handed,
+            ["rwx-segment-absent positive"],
+            "{tag}: the builds handed {input}"
+        );
+        // Under the selection the negative is the check's own build, so the scan above read it.
+        if tag == "selection" {
+            let negative = observations
+                .iter()
+                .find(|o| o["check"] == "rwx-segment-absent")
+                .and_then(|o| o.pointer("/controls/negative/build/argv"))
+                .and_then(|a| a.as_array())
+                .expect("rwx-segment-absent's negative argv");
+            assert!(
+                negative
+                    .iter()
+                    .any(|w| w.as_str() == Some("link-defaults-rwx-segment-absent-neg")),
+                "the negative is not a build of its own under a header selection: {negative:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_chard_name_no_source_tests_moves_no_link_defaults_reading() {
+    if !can_run("that a CHARD_ name no source tests moves no link-defaults reading")
+        || !common::require_binary(&common::chard_binary(), "the link-defaults measurement")
+    {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "a CHARD_ name no source tests, and a profile's own RWX section",
+            "the host's artifacts are not ELF, so link-defaults' segment checks read nothing",
+        );
+        return;
+    }
+    let work = common::Work::new("probe-sources", "rwx-define");
+    let own_source = work.write(
+        "own_rwx.c",
+        "__asm__(\".section .own.rwx,\\\"awx\\\"\\n\\t.byte 0\\n\\t.previous\");\n",
+    );
+    let own = work.path("own_rwx.o");
+    let compiled = Command::new("cc")
+        .arg("-c")
+        .arg("-o")
+        .arg(&own)
+        .arg(&own_source)
+        .output()
+        .expect("spawning cc");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let measure = |tag: &str, flags: &str, ldflags: &[&str]| {
+        link_defaults_readings(&work, tag, flags, ldflags)
+    };
+    let plain = measure("plain", "-O2", &[]);
+    let defined = measure("defined", "-O2 -DCHARD_RWX_SEGMENT", &[]);
+    assert!(!plain.is_empty(), "the plain run read no check");
+    assert_eq!(
+        defined, plain,
+        "a define no probe source tests moved a link-defaults reading"
+    );
+    let rwx = |readings: &[Reading]| {
+        readings
+            .iter()
+            .find(|r| r.0 == "\"rwx-segment-absent\"")
+            .map(|r| r.1.clone())
+            .expect("rwx-segment-absent is read")
+    };
+    let measured = rwx(&plain);
+    assert_eq!(
+        measured, "\"off\"",
+        "the plain -O2 link lays out no RWX segment"
+    );
+    let own = own.display().to_string();
+    let linked = measure("own-section", "-O2", &["--ldflags", &own]);
+    assert_eq!(
+        rwx(&linked),
+        "\"on\"",
+        "a profile whose own link input declares an RWX section reads on"
+    );
+    // The positive arm's input stays in the work directory, as every source chard writes
+    // there does.
+    let named = probe::find("link-defaults")
+        .and_then(|p| p.checks.iter().find(|c| c.id == "rwx-segment-absent"))
+        .map(|c| c.positive_inputs()[0].source_name)
+        .expect("rwx-segment-absent's input");
+    let left = work.path("plain-work").join(named);
+    assert!(left.is_file(), "the plain run left {}", left.display());
+    refused_as_a_relative_input(&work, "plain", named);
+    let absolute = left.display().to_string();
+    let reused = measure("absolute", "-O2", &["--ldflags", &absolute]);
+    assert_eq!(
+        rwx(&reused),
+        "\"on\"",
+        "a profile naming the arm's input by its absolute path links it, and reads on"
+    );
+}
+
+/// `link-defaults` measured with `input` in `--ldflags`, into the work directory and report
+/// `tag`'s run used ([`link_defaults_readings`]), is refused as configuration, naming the
+/// word and its list, and leaves the earlier report as it was.
+fn refused_as_a_relative_input(work: &common::Work, tag: &str, input: &str) {
+    let before = std::fs::read(work.path(&format!("{tag}.json"))).expect("the earlier report");
+    let refused = Command::new(common::chard_binary())
+        .args([
+            "measure",
+            "--cc",
+            "cc",
+            "--profile",
+            "explicit",
+            "--flags",
+            "-O2",
+        ])
+        .args([
+            "--ldflags",
+            input,
+            "--probe",
+            "link-defaults",
+            "--execution",
+            "host",
+        ])
+        .arg("--workdir")
+        .arg(work.path(&format!("{tag}-work")))
+        .arg("--output")
+        .arg(work.path(&format!("{tag}.json")))
+        .output()
+        .expect("spawning chard");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&refused.stdout).expect("the refusal's envelope is JSON");
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        refused.status.code() == Some(2)
+            && envelope["error"]["code"] == "CONFIGURATION"
+            && message.contains(&format!("{input:?} in --ldflags, an input file")),
+        "a relative input is refused: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read(work.path(&format!("{tag}.json"))).expect("the earlier report"),
+        before,
+        "the refusal left the earlier report as it was"
+    );
+}
+
+#[test]
+fn the_rwx_decoder_withholds_an_unstated_segment_answer() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/elf/elf64-le-x86_64-exec-dt-bind-now.elf");
+    let mut facts = chard::elf::facts_for(&path).expect("the fixture reads");
+    let mut read = |answer: Option<bool>| {
+        facts.rwx_segment = answer;
+        let view = Live {
+            macros: None,
+            elf: Some(&facts),
+        };
+        predicate::evaluate(elf_static::rwx_segment(), &view)
+            .expect("a live view is complete")
+            .outcome
+    };
+    assert_eq!(read(None), Outcome::Indeterminate);
+    assert_eq!(read(Some(false)), Outcome::Absent);
+    assert_eq!(read(Some(true)), Outcome::Present);
+}
+
 #[test]
 fn the_overflow_probe_reports_gccs_major_version_as_the_compiler_defines_it() {
     if !can_run("the overflow probe's gcc-major line") {
@@ -140,15 +464,6 @@ fn the_overflow_probe_reports_gccs_major_version_as_the_compiler_defines_it() {
     }
 }
 
-/// The level-3 probe's discrimination rests on the compiler not knowing the heap
-/// object's size, and the probe checks that for itself.
-///
-/// Intact, at fortify level 2 and `-O2`, the probe survives its own overflow: the size
-/// is opaque, the static query answers unknown, and the level-2 wrappers install no
-/// check. With the `volatile` removed from `want`, `malloc(16)` is a constant and level
-/// 2 would fire exactly like level 3, a false `on:3` on both compilers, so the probe exits
-/// with the status the header names instead of reaching the copy at all. The status is what
-/// `detect_fortify_runtime` withholds on, so the false positive is unreachable from either end.
 #[test]
 fn the_heap_probe_keeps_its_size_opaque_and_exits_distinctly_when_it_cannot() {
     if !can_run("that the level-3 probe's discrimination rests on a checked precondition") {
@@ -162,8 +477,7 @@ fn the_heap_probe_keeps_its_size_opaque_and_exits_distinctly_when_it_cannot() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "the intact probe at level 2 must survive: the size is opaque and nothing \
-         bounds the copy. stdout: {}\nstderr: {}",
+        "the intact probe at level 2 did not survive. stdout: {}\nstderr: {}",
         text(&out.stdout),
         text(&out.stderr)
     );
@@ -185,8 +499,7 @@ fn the_heap_probe_keeps_its_size_opaque_and_exits_distinctly_when_it_cannot() {
     assert_eq!(
         out.status.code(),
         Some(opacity_lost),
-        "with the volatile gone the size is a constant and the probe must refuse to \
-         measure rather than fire at level 2 as if it were level 3. stdout: {}\nstderr: {}",
+        "without the volatile the probe did not refuse to measure. stdout: {}\nstderr: {}",
         text(&out.stdout),
         text(&out.stderr)
     );
@@ -197,15 +510,6 @@ fn the_heap_probe_keeps_its_size_opaque_and_exits_distinctly_when_it_cannot() {
     );
 }
 
-/// The known-object probe overflows into a guard it declares, and checks that the
-/// guard is where it needs to be.
-///
-/// Both compilers place file-scope statics in an order of their own, and the probe's
-/// header comment records which. What is pinned here is the property rather than the
-/// order: on this host's `cc`, unoptimised and at `-O2`, one guard follows `dst` and
-/// the intact probe reaches its copy. A copy with the three objects forced onto 256-byte
-/// boundaries can have nothing at `dst + 16`, and the probe then exits with the status
-/// the header names instead of writing into memory it does not declare.
 #[test]
 fn the_known_object_probe_overflows_into_a_guard_it_declares_or_says_it_cannot() {
     if !can_run("that the known-object probe's overflow lands in memory the probe declares") {
@@ -252,8 +556,7 @@ fn the_known_object_probe_overflows_into_a_guard_it_declares_or_says_it_cannot()
     assert_eq!(
         out.status.code(),
         Some(layout),
-        "with every object on its own 256-byte boundary nothing can sit at dst+16, and \
-         the probe must decline rather than overflow. stdout: {}\nstderr: {}",
+        "with every object 256-byte aligned the probe did not decline. stdout: {}\nstderr: {}",
         text(&out.stdout),
         text(&out.stderr)
     );
@@ -283,24 +586,6 @@ fn the_known_object_probe_overflows_into_a_guard_it_declares_or_says_it_cannot()
     );
 }
 
-/// The heap probe's safety margin is glibc chunk arithmetic, and under glibc the probe
-/// asserts the geometry the arithmetic assumes.
-///
-/// Intact, the probe finds the geometry it expects on this host: a 16-byte request is a
-/// 32-byte chunk with `32 - sizeof(size_t)` usable bytes, 24 on LP64 and 28 on i386.
-/// That holds where glibc's `MALLOC_ALIGNMENT` is 16 (LP64 and i386); on an 8-byte-aligned
-/// 32-bit target such as armhf the probe declines, and this intact arm fails there by
-/// design, as the probe's header comment explains.
-/// Spelled `3 * sizeof(size_t)`, the expectation would agree at 24 and say 12 on i386, and
-/// this test and the opacity test above would fail in Debian 12 i386 (gcc 12.2.0, glibc
-/// 2.36) with `malloc_usable_size(dst) is 28, expected 12`.
-///
-/// A request of 100 bytes has a usable size the margin was not computed from, and an
-/// allocation slipped in between `dst` and `src` moves the neighbour whose size field
-/// the copy overwrites; either way the probe exits with the header's status before
-/// copying. On a host whose C library is not glibc the assertions are compiled out,
-/// because the margin is not claimed there; that arm is announced rather than silently
-/// passed.
 #[test]
 fn the_heap_probe_declines_a_chunk_geometry_its_margin_was_not_computed_from() {
     if !can_run("that the heap probe's margin rests on an asserted chunk geometry") {
@@ -323,8 +608,7 @@ fn the_heap_probe_declines_a_chunk_geometry_its_margin_was_not_computed_from() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "the intact probe must find the chunk geometry its margin is computed from on \
-         this host and survive its own copy. stdout: {}\nstderr: {}",
+        "the intact probe did not find its chunk geometry and survive. stdout: {}\nstderr: {}",
         text(&out.stdout),
         text(&out.stderr)
     );
@@ -356,16 +640,14 @@ fn the_heap_probe_declines_a_chunk_geometry_its_margin_was_not_computed_from() {
     // The expectation the refusal states is the one for this target's size_t, which is
     // the width of the `usize` this test was built for: the probe and the test are both
     // native to the host.
-    let expected = format!("expected {}", 32 - std::mem::size_of::<usize>());
+    let expected = format!("expected {}", 32 - size_of::<usize>());
     assert!(
         text(&out.stderr).contains(&expected),
         "the refusal states the usable size 32 - sizeof(size_t), {expected:?}: {}",
         text(&out.stderr)
     );
 
-    // The neighbour's position is the other half of the premise. A third allocation
-    // between the two puts `src` one chunk further on; the store to a volatile keeps
-    // the compiler from dropping an allocation nothing reads.
+    // The neighbour's position is the other half of the premise.
     let displaced = write_probe(&work, "fortify-dynamic-object", &|s| {
         rewritten(
             s,
@@ -388,14 +670,6 @@ fn the_heap_probe_declines_a_chunk_geometry_its_margin_was_not_computed_from() {
     );
 }
 
-/// The shared header refuses to be included before a libc header.
-///
-/// Included first it would report `__USE_FORTIFY_LEVEL=?` for a build at level 2, with no
-/// diagnostic, and the report's own convention would read that as the compiler defining
-/// nothing. The header fails the preprocess on the platforms whose libc guard macro
-/// it knows, and this test reads the error back from the host `cc` in the wrong order
-/// and sees the right order still compile. The clause exercised is the host's; a host
-/// the header names no guard for announces that rather than passing on nothing.
 #[test]
 fn the_self_report_header_refuses_to_be_included_before_a_libc_header() {
     if !can_run("that the self-report header's include order is enforced at preprocess time") {
@@ -461,11 +735,6 @@ fn the_self_report_header_refuses_to_be_included_before_a_libc_header() {
     );
 }
 
-/// Every probe that includes `chard_selfreport.h` includes a system header before it,
-/// which is the order the header's own guard enforces on Linux, Apple and the BSDs.
-///
-/// Read from the embedded sources rather than compiled, so a host whose libc the guard
-/// names no clause for still checks it.
 #[test]
 fn every_probe_includes_a_libc_header_before_the_self_report_header() {
     // A probe with no system header at all fails its clean build on OpenBSD 7.9, FreeBSD
@@ -484,8 +753,7 @@ fn every_probe_includes_a_libc_header_before_the_self_report_header() {
         fed += 1;
         assert!(
             lines[..own].iter().any(|l| l.starts_with("#include <")),
-            "{}: {} includes chard_selfreport.h before any system header, which the \
-             header's guard refuses on every libc it names",
+            "{}: {} includes chard_selfreport.h before any system header",
             p.id,
             p.source_name
         );
@@ -493,17 +761,6 @@ fn every_probe_includes_a_libc_header_before_the_self_report_header() {
     assert!(fed > 0, "no probe includes chard_selfreport.h");
 }
 
-/// The canary probe stays eligible when the array threshold is raised.
-///
-/// The observable is a `__stack_chk_fail` reference. With one 64-byte array the probe
-/// qualified only under the array rule, and `--param ssp-buffer-size=128` removed the
-/// reference on both compilers while the protector stayed fully on; the controls
-/// force `-all` and `-fno-stack-protector`, so they discriminated and the check read
-/// `off` for a hardened toolchain. The alloca construct qualifies under plain
-/// `-fstack-protector` at any threshold, and this pins that: the compiler's own
-/// assembly references the symbol at the raised threshold and does not with the
-/// protector off. On an ELF host the linked artifact is also read through chard's
-/// reader, which is the channel the check uses; a Mach-O host announces that arm.
 #[test]
 fn the_canary_probe_keeps_its_observable_when_the_array_threshold_is_raised() {
     if !can_run("that raising --param ssp-buffer-size alone does not remove the canary") {
@@ -535,8 +792,7 @@ fn the_canary_probe_keeps_its_observable_when_the_array_threshold_is_raised() {
     };
     assert!(
         assembly("raised", &raised).contains("stack_chk_fail"),
-        "plain -fstack-protector with the array threshold at 128 must still instrument \
-         the alloca function"
+        "-fstack-protector with ssp-buffer-size=128 left no stack_chk_fail in the assembly"
     );
     assert!(
         !assembly("off", &off).contains("stack_chk_fail"),
@@ -568,17 +824,6 @@ fn the_canary_probe_keeps_its_observable_when_the_array_threshold_is_raised() {
     );
 }
 
-/// The stack-clash probe declines an allocation the address space below its frame
-/// cannot hold, rather than reading where the wrapped access landed.
-///
-/// The probe allocates eight times `RLIMIT_STACK`. Under a limit of 2^57 bytes that is
-/// 2^60, more than any 64-bit user stack's address, so `sp - n` wraps. A probe that
-/// allocated anyway would, on 4-level x86_64, make a non-canonical access whose fault arrives
-/// with `si_addr` 0, the distance would become the frame's own address, and a probing-off
-/// build would print ratio 0, which reads `present`. Measured 2026-10-05 with gcc
-/// 16.1.1 and clang 22.1.8 at `-O2 -fno-stack-clash-protection` on Fedora 44 x86_64, and
-/// at `16 TiB` to `1 PiB` the same way (ratios 0, 24, 15 and 1). The limit is raised in a
-/// shell for the probe alone; a hard limit that does not allow it is a host's, announced.
 #[test]
 fn the_stack_clash_probe_declines_an_allocation_that_wraps_below_the_frame() {
     if !can_run("that the stack-clash probe declines an allocation wrapping below the frame") {
@@ -620,8 +865,7 @@ fn the_stack_clash_probe_declines_an_allocation_that_wraps_below_the_frame() {
     assert_eq!(
         (out.status.code(), text(&out.stdout).trim()),
         (Some(declined), "SCPRT probe-invalid=address-wrap"),
-        "an allocation larger than the frame's address must be declined by name, not \
-         read. stderr: {}",
+        "an allocation larger than the frame's address was not declined by name. stderr: {}",
         text(&out.stderr)
     );
 }
@@ -678,11 +922,6 @@ const TRAP_GROUPS: &[&str] = &[
 /// group and optimization level, each with why. Every row must still read `off` where its
 /// family is measured; a row that reads anything else is stale and fails, so the list
 /// cannot outlive its reason.
-///
-/// clang's `local-bounds` is not exempt: the trap is not the check's only form
-/// (`-fno-sanitize-trap=local-bounds` calls `__ubsan_handle_local_out_of_bounds`), and the
-/// probe's third function gives it an array to check, so it reads `on` as any other trapped
-/// group does.
 const OFF_WITHOUT_A_CONSTRUCT: &[(&str, &str, &str, &str)] = &[(
     "clang",
     "object-size",
@@ -692,26 +931,6 @@ const OFF_WITHOUT_A_CONSTRUCT: &[(&str, &str, &str, &str)] = &[(
 )];
 
 /// The clause a [`ModeCase`] must read under, by class where the name is the machine's.
-///
-/// The predicate's `on` is read under a clause per trap word, named for the word (`ud2`
-/// and `ud1` on x86_64, `brk` on aarch64), so a table of clause names is a table of one
-/// machine: written with the x86_64 names, the test fails natively on Fedora 44 aarch64
-/// (gcc 16.2.1, clang 22.1.8; 2026-10-07 and 2026-10-08) over four readings whose outcome
-/// is right and whose clause is `brk`. `Trap` names the class
-/// instead, and the test resolves it per object through [`trap_clauses_for`], from the
-/// predicate's own clause list, so there is no second table of trap words to drift from
-/// the first.
-///
-/// A `Trap` row still carries one word, the x86_64 clause the compiler's trap reads under
-/// (`ud2` for gcc, `ud1` for clang), and the rule is: the object's set of trap clauses must
-/// be non-empty and contain the clause read; where the set contains the row's word, the
-/// clause read must equal it; where it does not, membership is the whole check. So on
-/// x86_64, where the set is `{ud1, ud2}`, each row keeps the per-compiler pin the table had
-/// before the class, and a gcc build read under `ud1` fails. On aarch64 the set is `{brk}`,
-/// the one clause both compilers' traps read under, so no finer pin exists there and the
-/// row's word is not consulted. The word is not a second table of machine words: it is the
-/// clause id itself, and a row whose word no machine's set contains is held to membership
-/// alone, never passed by its word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Under {
     /// A trap clause of the predicate for the machine the object was built for, pinned to
@@ -824,10 +1043,7 @@ const MODE_CASES: &[ModeCase] = &[
         Some(LOCAL_BOUNDS_FLOOR),
     ),
     // local-bounds in handler mode beside a trapped group that checks arrays too
-    // (2026-10-07). Were the third function's access checked by `bounds` as well, clang at
-    // -O2 would fold the local-bounds handler call beneath the dominating bounds trap and the
-    // build would read `on`; the access is one `bounds` does not check, so the handler is
-    // seen at -O2 as at -O0.
+    // (2026-10-07).
     (
         "clang",
         &[
@@ -931,22 +1147,6 @@ const MODE_CASES: &[ModeCase] = &[
     ),
 ];
 
-/// The groups the probe's third and fourth functions exist for read as any other group
-/// does, and a group left in handler mode beside trapped ones is withheld whichever
-/// function holds its construct.
-///
-/// Without a construct for `function` (clang) and `object-size` (gcc),
-/// `-fsanitize=undefined -fsanitize-trap=undefined -fno-sanitize-trap=function` and
-/// `-fno-sanitize-trap=object-size` would read `on` over a build that called the runtime for
-/// that group, and clang's `local-bounds`, which the feature witness does not cover, would
-/// read `off` over a build that trapped. With its construct on an access `bounds` also
-/// checks, `local-bounds` in handler mode beside a trapped `bounds` would read `on` at -O2,
-/// its handler call folded beneath the `bounds` trap on the same access. Each family's cases are
-/// built with every driver of that family here; a driver that refuses a flag set is a gap, since
-/// gcc has no `function` or `local-bounds` group. The `local-bounds` rows read as written from
-/// clang 20 ([`LOCAL_BOUNDS_FLOOR`]); under an older clang each is held to what its object is
-/// there, and its own reading is announced as an arm not exercised, naming the version seen. Counts
-/// what it fed.
 #[test]
 fn a_group_left_in_handler_mode_beside_trapped_groups_is_withheld() {
     if !can_run("that a group in handler mode beside trapped groups is withheld") {
@@ -968,8 +1168,7 @@ fn a_group_left_in_handler_mode_beside_trapped_groups_is_withheld() {
     let mut below = Vec::new();
     // The trap clauses the objects built here can read under, computed per object and
     // collected by machine as every distinct set read there, printed with the tally so the
-    // frame a `Under::Trap` row was held to is on record. Two sets under one machine would
-    // mean two objects of that machine were searched for different trap patterns.
+    // frame a `Under::Trap` row was held to is on record.
     let mut trap_clauses: BTreeMap<String, BTreeSet<BTreeSet<String>>> = BTreeMap::new();
     for (driver, family) in &drivers {
         for (i, (for_family, flags, ..)) in MODE_CASES.iter().enumerate() {
@@ -998,9 +1197,7 @@ fn a_group_left_in_handler_mode_beside_trapped_groups_is_withheld() {
                 Under::Trap(word) => {
                     assert!(
                         !traps.is_empty(),
-                        "{driver} ({family}) {flags:?}: the predicate has no trap clause whose \
-                         patterns were searched on this {} object, so a trap row has nothing \
-                         to be held to",
+                        "{driver} ({family}) {flags:?}: no trap clause searched on this {} object",
                         facts.machine
                     );
                     if traps.contains(*word) {
@@ -1268,21 +1465,6 @@ fn published_off(driver: &str, flags: &[&str], e: &Evaluation) -> bool {
         .is_none()
 }
 
-/// A trap configuration of any one sanitizer group reads something other than `off`.
-///
-/// A probe holding one function that exercises six groups would read
-/// `-fsanitize=integer-divide-by-zero -fsanitize-trap=integer-divide-by-zero` `off` under gcc
-/// 16.1.1 and clang 22.1.8, as every group without a construct there (`vla-bound`,
-/// `unreachable`, the float, nullability and implicit-conversion groups and the rest): the
-/// check would read the absence of a trap in constructs that do not exist as no trap mode. Each
-/// group the drivers here accept is built in trap mode at -O0 and -O2, and each reading is `on` (a
-/// construct traps), or `indeterminate` (a construct traps beside a handler call, or the group has
-/// no construct and the compiler reports a sanitizer enabled), unless [`OFF_WITHOUT_A_CONSTRUCT`]
-/// names it with the reason its `off` is earned. The predicate's own reading is held to that
-/// wherever the compiler answers `__has_feature` ([`compiler_answers_feature`]); where it answers
-/// nothing (gcc 13.3.0) the predicate reads `absent` and the published verdict is held instead, the
-/// driver's own words naming the group trapped ([`published_off`]). Counts what it fed and what
-/// each driver refused.
 #[test]
 fn a_trap_configuration_of_any_one_sanitizer_group_does_not_read_off() {
     if !can_run("that a trap configuration of any one sanitizer group does not read off") {
@@ -1366,8 +1548,7 @@ fn a_trap_configuration_of_any_one_sanitizer_group_does_not_read_off() {
     );
     assert!(
         fed - refused >= TRAP_GROUPS.len(),
-        "the drivers here accepted {} of {fed} trap configurations; the group list has \
-         drifted from what they spell",
+        "the drivers here accepted only {} of {fed} trap configurations",
         fed - refused
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -1435,21 +1616,8 @@ fn compiler_answers_feature(driver: &str, flags: &[&str]) -> bool {
     answered
 }
 
-/// The probe's construct functions and its feature witness are each load-bearing.
-///
-/// Intact, a flagless build reads `off` and a build enabling only `-fsanitize=return`,
-/// a group neither compiler instruments in C, reads `indeterminate` under the witness.
-/// With the second, third or fourth function renamed out of `elf::code::SCANS`, the
-/// flagless build reads `indeterminate` under `groups-unsearched`, as an object without that
-/// function is read; with the witness removed, the `return` build reads `off` at the
-/// predicate over a sanitizer the probe never exercised, a reading this probe does not
-/// publish. Whether the compiler answers `__has_feature` is asked
-/// of its preprocessor, not of the probe ([`compiler_answers_feature`]; gcc 13.3.0 does not,
-/// so there the intact `return` build reads as the unwitnessed one does); either way the
-/// `return` build's `off` is withheld at publication from the compile's own words
-/// ([`published_off`]).
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "one table of six probe rewrites, each read against the predicate and, for the \
               sanitizer builds, the publication rule"
@@ -1560,28 +1728,13 @@ fn the_ubsan_probe_withholds_off_without_its_constructs_or_its_witness() {
         if flags == only_return {
             assert!(
                 !published_off("cc", flags, &e),
-                "{tag} with {flags:?}: the compile's words name return trapped and nothing \
-                 trapped, so the published verdict is withheld whatever the predicate read"
+                "{tag} with {flags:?}: the verdict is published off, not withheld"
             );
         }
     }
     assert_eq!(fed, 6, "every case was built and read");
 }
 
-/// Every probe source the host compiler accepts in its default dialect is accepted in the
-/// oldest dialect a supported compiler defaults to: gnu89 for C (gcc before 5) and C++98
-/// for C++ (g++ before 6).
-///
-/// The arms never pass `-std=`: a probe must not change the dialect the profile chose, so
-/// a source that needs C99 or C++11 does not build where the default is older, and every
-/// check it holds reads `build-failed` there: under gcc 4.8.4 (Ubuntu 14.04) a loop-scoped
-/// declaration does that, and under g++ 4.8.4 and 5.4.0 and clang++ 3.4.0 and 3.8.0
-/// `nullptr` and brace initialisation do. The host compiles each
-/// source under `-fsyntax-only` twice, as the profile leaves it and in the oldest dialect. A
-/// source the host rejects as it stands (the diagnostic probes, errors by design on a
-/// current compiler) says nothing about the dialect and is counted apart. A header or
-/// builtin the old compilers lack (`__get_cpuid_count`, `__builtin___clear_cache`) is not a
-/// dialect property and is not exercised here.
 #[test]
 fn every_probe_source_builds_in_the_oldest_default_dialect() {
     let verifies = "that the probe sources build under gnu89 and C++98";
@@ -1601,13 +1754,17 @@ fn every_probe_source_builds_in_the_oldest_default_dialect() {
         "cpp" => Some(true),
         _ => None,
     };
-    // The frame: every distinct C or C++ source the corpus embeds, probe and auxiliary.
-    let mut sources = std::collections::BTreeMap::new();
+    // The frame: every distinct C or C++ source the corpus embeds, probe, auxiliary and a
+    // positive arm's own input.
+    let mut sources = BTreeMap::new();
     for p in probe::CORPUS {
         sources.insert(p.source_name, p.source);
         for aux in p.aux_libs {
             sources.insert(aux.source_name, aux.source);
         }
+    }
+    for input in probe::POSITIVE_INPUTS {
+        sources.insert(input.source_name, input.source);
     }
     sources.retain(|name, _| cxx_of(name.as_ref()).is_some());
     // Checked against the directory the sources are embedded from, so a source the corpus
@@ -1662,13 +1819,11 @@ fn every_probe_source_builds_in_the_oldest_default_dialect() {
     assert_eq!(checked + rejected_as_they_stand.len(), fed);
     assert!(
         checked > fed / 2,
-        "only {checked} of {fed} sources built as they stand, so this checked almost nothing: \
-         {rejected_as_they_stand:?}"
+        "only {checked} of {fed} sources built as they stand: {rejected_as_they_stand:?}"
     );
     assert!(
         failures.is_empty(),
-        "{} of {checked} probe sources do not build in the oldest default dialect, so their \
-         checks read build-failed on gcc before 5 or g++ before 6:\n{}",
+        "{} of {checked} probe sources do not build in the oldest default dialect:\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -1775,25 +1930,6 @@ fn strip_keeps_the_section(work: &common::Work, frame: &[&probe::Probe], linked:
     }
 }
 
-/// Every probe with a macro-channel check keeps its `.chard.report` through a
-/// `--gc-sections` link on a toolchain without the `retain` attribute.
-///
-/// The macro channel reads that section, and a check over an artifact without one is
-/// withheld under `artifact-lacks-self-report` rather than read from the preprocessor
-/// dump, so a probe that lost the section to an honest linker would withhold an honest
-/// column. `used` keeps the array through the compiler; `retain` (gcc 11, clang 13,
-/// binutils 2.36) marks the section `SHF_GNU_RETAIN` for the linker, and this test takes
-/// it away, as a toolchain older than those has no attribute to apply. What keeps the
-/// section then is a reference from the probe's own code, which `macro_report.c` and
-/// `exceptions.c` had and `cxx_assertions.cpp` did not: linked `-O2 -Wl,--gc-sections`
-/// with a header lacking `retain`, g++ 16.1.1 and clang++ 22.1.8 both produced that
-/// probe with no `.chard.report` (Fedora 44 x86_64, measured 2026-10-20), and this test
-/// failed on it before the reference was added.
-///
-/// The control is the same probe with its reference taken out: built the same way, the
-/// section must be gone, or this host's linker keeps unreferenced sections and the test
-/// would be holding nothing. An object probe is compiled and not linked, so it keeps the
-/// section whatever the linker does; it is built `-c` and read for the frame's sake.
 #[test]
 fn every_macro_channel_probe_keeps_its_self_report_through_gc_sections_without_retain() {
     let verifies = "that a macro-channel probe keeps its .chard.report under --gc-sections \
@@ -1854,10 +1990,7 @@ fn every_macro_channel_probe_keeps_its_self_report_through_gc_sections_without_r
                 defined.len()
             ),
             Err(absence) => panic!(
-                "{}: linked -O2 -Wl,--gc-sections with no `retain`, the artifact {absence}; \
-                 its macro checks would be withheld under artifact-lacks-self-report on \
-                 every toolchain older than gcc 11 or clang 13 that links with \
-                 --gc-sections",
+                "{}: linked -O2 -Wl,--gc-sections with no `retain`, the artifact {absence}",
                 p.id
             ),
         }
@@ -1893,22 +2026,10 @@ fn every_macro_channel_probe_keeps_its_self_report_through_gc_sections_without_r
     );
     match self_report_read(&bin).expect("the frame's artifacts were readable, so this one is") {
         Err(report::SelfReportAbsence::Unlisted { .. }) => {}
-        other => panic!(
-            "the control kept its section ({other:?}): this host's linker does not collect \
-             an unreferenced section under --gc-sections, so the reference was not what \
-             this test held"
-        ),
+        other => panic!("the control kept its section ({other:?}) under --gc-sections"),
     }
 }
 
-/// Every compiler-diag probe's canary fires on each C compiler this host has (`cc`, and
-/// `gcc` and `clang` where they are on PATH): built with `-c` and no warning flag, and again
-/// with `-Werror`, each prints `unused variable` on the canary's line. A probe without the
-/// pin (`CANARY_WITHOUT_PRAGMA` in `src/probe.rs`, whose unit test requires its controls to
-/// pass `-Wall`) builds with `-Wall`, and a compiler family the probe's checks are gated
-/// off (`Gate::compiler_unsupported`) does not build it. That unit test reads each source
-/// for the shapes that silence the canary on any compiler; this measures it on the
-/// compilers here, so a shape it does not list fails on this host.
 #[test]
 fn every_compiler_diag_probe_s_canary_fires_on_the_host_compilers() {
     if !can_run("every compiler-diag probe's canary fires on the host compilers") {
@@ -1982,16 +2103,6 @@ fn every_compiler_diag_probe_s_canary_fires_on_the_host_compilers() {
     eprintln!("canary: {built} builds under {compilers:?}, every one printed the canary's warning");
 }
 
-/// A macro defined as `?` reads as that value from the self-report, on the section and on
-/// stdout alike, and its check is withheld rather than read as undefined.
-///
-/// Were the header to write `name=?` for an undefined macro and for one defined as `?`,
-/// `-D__EXCEPTIONS=?` would read as undefined and the macro checks would publish `off` from
-/// it. It writes `name undefined`, which no `name=value` line spells. Each of the seven
-/// macros a macro-channel check turns on is defined as `?` in its own build, and the
-/// check must read `indeterminate`, neither `absent` nor `present`; the build with none of
-/// them defined is the other arm, where the undefined spelling still reads undefined and the
-/// checks still decide.
 #[test]
 fn a_macro_defined_as_a_question_mark_is_not_read_as_undefined() {
     const READS: [(&str, &str); 7] = [
@@ -2036,7 +2147,7 @@ fn a_macro_defined_as_a_question_mark_is_not_read_as_undefined() {
     };
     let outcome = |check: &str, macros: &BTreeMap<String, String>| {
         let p = predicate::for_check(check).unwrap_or_else(|| panic!("{check} has a predicate"));
-        let live = predicate::Live {
+        let live = Live {
             macros: Some(macros),
             elf: None,
         };
@@ -2058,8 +2169,7 @@ fn a_macro_defined_as_a_question_mark_is_not_read_as_undefined() {
             assert_eq!(
                 outcome(check, &macros),
                 Outcome::Indeterminate,
-                "{define}: {check} over the {channel} must withhold a macro defined as `?`, \
-                 neither reading it undefined nor crediting it"
+                "{define}: {check} over the {channel} did not withhold a macro defined as `?`"
             );
         }
     }

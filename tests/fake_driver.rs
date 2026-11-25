@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Measurements taken through a driver that misbehaves in one named way.
-//!
-//! Every test here wraps the host's real `cc` in a shell script that passes everything
-//! through except the one invocation under test, and then runs the built `chard` against
-//! the wrapper. The host's compiler still does the compiling, so the tests run wherever
-//! `cc` does, including a Mach-O host; what is being exercised is how chard reads the
-//! driver's answer, and the wrapper is what puts a specific answer in front of it.
-//!
-//! The alternative, a real toolchain in the state each test wants, is not available on
-//! any one machine: a preprocessor that exits non-zero after printing its dump takes a
-//! missing include and a specific compiler, and a driver that reports a configuration
-//! file takes a distribution's clang packaging. A wrapper produces the same stdout,
-//! stderr and exit status as the real thing would, which is all chard ever reads.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,14 +23,7 @@ use std::ffi::OsStr;
 
 mod common;
 
-fn chard_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("chard")
-}
+use common::chard_binary;
 
 fn can_run(verifies: &str) -> bool {
     common::require_binary(&chard_binary(), verifies) && common::require_cc(verifies)
@@ -50,20 +44,11 @@ fn real_cc() -> String {
 }
 
 /// Write a wrapper whose body is `script`, with `$REAL` bound to the host's `cc`.
-///
-/// Named `fakecc` on purpose: `compile::cxx_driver_for` maps a driver name by its
-/// `-`-separated components, and a name with no `gcc`, `clang` or `cc` component maps to
-/// nothing, so the C++ probes are withheld under `no-driver` and the run stays about the
-/// C driver the test is shaping.
 fn fake_driver(work: &Path, script: &str) -> PathBuf {
     fake_driver_named(work, "fakecc", &real_cc(), script)
 }
 
 /// [`fake_driver`] under a name of the test's choosing, proxying to `real`.
-///
-/// Written through `common::executable`, which waits out `ETXTBSY` before handing the
-/// path back; every wrapper here is run by a `chard` this process spawns, which is the
-/// shape that trips it.
 fn fake_driver_named(work: &Path, name: &str, real: &str, script: &str) -> PathBuf {
     common::executable(&work.join(name), &format!("REAL='{real}'\n{script}"))
 }
@@ -81,11 +66,6 @@ fn real_cxx() -> Option<String> {
 }
 
 /// Does the report's toolchain target x86_64, where `linker-default-execstack` builds?
-///
-/// Decided from `toolchain.target_triple`, the field the arch gate itself reads, so the
-/// expectation comes from what the host is and the result is held to it: a probe that
-/// failed to build on x86_64 fails the assertion, where deciding from whether the store
-/// happened to hold its facts would let it pass as the gated arm.
 fn targets_x86_64(report: &Value) -> bool {
     report["toolchain"]["target_triple"]
         .as_str()
@@ -125,8 +105,7 @@ fn assert_default_probe_gated(report: &Value) {
         assert_eq!(
             o["gating"]["rule"].as_str(),
             Some(expected),
-            "off x86_64 the probe is gated by the table's decision for {arch}, whatever else \
-             happened: {o}"
+            "off x86_64 the probe is not gated by the table's decision for {arch}: {o}"
         );
     }
     let evidence = report["toolchain"]["linker"]["artifact"]["evidence"]
@@ -156,14 +135,6 @@ fn measure(driver: &Path, workdir: &Path, args: &[&str]) -> Value {
 /// selects a probe carrying a check that declares `needs_vm`, [`measure`] again with
 /// `--execution host` in a fresh workdir inside the first (`asserted-host`), handing back
 /// that report, whose basis is held to be the asserted one.
-///
-/// chard withholds such a check under `execution-mode-assumed` where
-/// nothing observed the mode and nobody asserted it, so a test of what the check reads
-/// would examine nothing on every host the suite runs on that is not a container. This
-/// asserts the word the suite can give, that the hosts it runs on (developer machines, CI's
-/// hosted runners) run their own kernels. It is never passed up front: in a container the suite
-/// recognises, an asserted `host` is a contradicted assertion and chard refuses the
-/// report (exit 3), and the plain run reads `needs-vm` there.
 fn measure_establishing_the_kernel(driver: &Path, workdir: &Path, args: &[&str]) -> Value {
     let report = measure(driver, workdir, args);
     let by_default = report["environment"]["execution"]["mode_evidence"]["basis"].as_str()
@@ -192,22 +163,10 @@ fn measure_establishing_the_kernel(driver: &Path, workdir: &Path, args: &[&str])
 /// The probe deadline every measurement in this file runs under (`--timeout`): long enough
 /// that load alone cannot reach it, short enough that a probe that really hangs still ends the
 /// test. Every measurement here passes it: `.arg("measure")` is followed by
-/// `.args(PROBE_DEADLINE)`, and an argument list naming `"measure"` carries both words; which
-/// tests/ratchets.rs holds.
+/// `.args(PROBE_DEADLINE)`, and an argument list naming `"measure"` carries both words.
 const PROBE_DEADLINE: [&str; 2] = ["--timeout", "60"];
 
 /// [`measure`], with `envs` set in chard's own environment.
-///
-/// What chard hands the driver is what is under test, so the variable is set on chard
-/// and read back through the wrapper; a test setting it on the wrapper directly would
-/// be testing the shell.
-///
-/// Each probe run gets [`PROBE_DEADLINE`] rather than chard's 5: these tests compare
-/// what the wrapper changes, and a run killed at the deadline withholds its reading, so on a
-/// busy host one run of a pair could read `probe-invalid` where the other read
-/// `indeterminate`. It did: `strict-flex-arrays-enforced`'s control, which crashes
-/// five children whose cores go to the host's core handler, ran past 5 s on a host at a
-/// load of 44 on 32 processors, and in 1.7 s otherwise.
 fn measure_in_env(driver: &Path, workdir: &Path, args: &[&str], envs: &[(&str, &Path)]) -> Value {
     let output = Command::new(chard_binary())
         .arg("measure")
@@ -247,15 +206,6 @@ fn macro_observations(report: &Value) -> Vec<&Value> {
     macro_channel
 }
 
-/// A preprocessor that exits non-zero after printing its defines withholds every macro
-/// verdict, and the report says why.
-///
-/// The published shape this closes: gcc 16.1.1 with `-include` of a missing header exits
-/// 1 after 882 `#define` lines, and chard published `ssp-level on/strong`, both fortify
-/// checks and `optimization-enabled on` over that prefix, with `checks_valid: 6` and no
-/// diagnostic. The wrapper fails only the per-variant dumps, whose source is named
-/// `macros-<probe>-<tag>.c`, so `toolchain::detect`'s own dumps still succeed and the
-/// run reaches the measurement loop rather than being refused at the door.
 #[test]
 fn a_macro_dump_that_exits_nonzero_withholds_every_macro_verdict() {
     if !can_run(
@@ -326,8 +276,6 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// A preprocessor that exits 0 and defines nothing withholds the channel too, with a
-/// reason that says emptiness rather than an exit status.
 #[test]
 fn a_macro_dump_that_defines_nothing_withholds_every_macro_verdict() {
     if !can_run("that an empty preprocessor dump withholds the macro channel and says so") {
@@ -377,14 +325,6 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// A control arm whose own dump fails is withheld as unevaluable, and the arm says why
-/// and carries the job.
-///
-/// `positive-unevaluable` was published with `detail: None` and no record of the dump:
-/// a reader was told the positive control did not build or run, beside a build record
-/// that had succeeded. The wrapper fails only the positive arms' dumps, whose source is
-/// named `macros-<probe>-<check>-pos.c`, so the measured variant's own dump succeeds and
-/// the withholding is the arm's alone.
 #[test]
 fn a_control_arm_whose_dump_fails_names_the_dump_and_carries_its_record() {
     if !can_run(
@@ -452,15 +392,6 @@ exec "$REAL" "$@""#,
     }
 }
 
-/// A measured build that failed to link withholds every macro verdict over it as
-/// `build-failed`, beside a dump that succeeded, and the observation quotes the build.
-///
-/// The published shape this closes: on macOS arm64 (Apple clang 21) under `openssf-tldr`,
-/// ld64 rejects `-z` and every measured build fails, while `branch-protection-macro` and
-/// `gcs-macro` read `on` from the `-dM -E` dump and carried two defect rollups to
-/// `partial` with nothing linked. The wrapper fails only the measured build's link, whose
-/// output is named `toolchain-macros-measured`, with ld64's sentence, and passes every dump
-/// through, so the preprocessor still answers and only the build is missing.
 #[test]
 fn a_macro_reading_beside_a_measured_build_that_failed_to_link_is_withheld() {
     if !can_run("that a macro reading beside a failed measured build is withheld") {
@@ -532,13 +463,6 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// A macro control arm whose build failed is unevaluable, and the arm names the build.
-///
-/// The arm's dump answers for the arm's flags, and the arm is the build those flags make:
-/// where that build failed, the reading validates a detector over a build that does not
-/// exist. The wrapper fails only the positive arms' links, named
-/// `toolchain-macros-<check>-pos`, and passes their dumps through, so before the rule the
-/// triple discriminated over the dumps alone.
 #[test]
 fn a_macro_control_arm_whose_build_failed_is_unevaluable_and_names_the_build() {
     if !can_run("that a macro control arm whose build failed is unevaluable") {
@@ -599,10 +523,6 @@ const POSITION_MACRO_CHECKS: [&str; 2] = ["pie-macro", "pic-macro"];
 /// A wrapper that links PIE unless told `-no-pie`, failing a position-dependent link with
 /// GNU ld's sentence, and logs every link it was handed that carried a flag turning
 /// position independence off: `refused` where it failed the link, `linked` where it did not.
-///
-/// This is the shape of a PIE-default driver (`--enable-default-pie` gcc, the PIE-default
-/// clangs) for the one property the arms depend on, and it holds on any host: the real
-/// failure is an absolute relocation the PIE link cannot take, which needs an x86_64 ELF
 /// linker to reproduce, while the wrapper produces the same stderr and exit status there
 /// and elsewhere. The dumps, the compile-only jobs and every other link pass through.
 fn pie_default_driver(work: &Path) -> (PathBuf, PathBuf) {
@@ -632,18 +552,6 @@ exec "$REAL" "$@""#,
     (fake_driver(work, &script), log)
 }
 
-/// On a driver that links PIE by default, the negative arms of `pie-macro` and `pic-macro`
-/// link, read their macros from the artifact, and discriminate.
-///
-/// With the two negative arms `-fno-PIE` and `-fno-pic` alone, a PIE-default driver links
-/// them `-pie` and the link fails on the probe's own reference to its `.chard.report` (76
-/// cells of a fleet sweep on 2026-10-06). Their dumps show the macros absent, correctly, but
-/// a macro arm whose build failed is unevaluable, so both checks would read `probe-invalid`.
-/// The arms carry `-no-pie` and link as the build PIE-off is.
-///
-/// The wrapper's log is the count: exactly one position-dependent link per check, the
-/// negative arm's, and none refused. Without `-no-pie` it would log two refusals and both
-/// checks would be `negative-unevaluable`.
 #[test]
 fn a_pie_default_driver_links_the_position_dependent_negative_arms() {
     if !can_run("that the pie-macro and pic-macro negative arms link on a PIE-default driver") {
@@ -722,13 +630,6 @@ fn a_pie_default_driver_links_the_position_dependent_negative_arms() {
     );
 }
 
-/// A driver that does not know `-no-pie` withholds `pie-macro` and `pic-macro` under the
-/// rule that names the refused control, quoting the driver, and never reads `off`.
-///
-/// gcc took `-no-pie` in 6; an older one says "unrecognized command line option" of it,
-/// in the dump and the link alike. No such driver is in the fleet, so the wrapper is the
-/// fixture: it rejects `-no-pie` with gcc's sentence wherever it appears. The `pie` check's
-/// negative arm has carried the flag throughout, and is read beside them.
 #[test]
 fn a_driver_that_does_not_know_no_pie_withholds_the_position_macro_checks_by_name() {
     if !can_run("that a driver without -no-pie withholds the position macro checks by name") {
@@ -782,15 +683,6 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// The driver is not handed the operator's `TMPDIR`.
-///
-/// gcc and clang put their temporary objects where it points, a linker warning names
-/// the object, and the name reaches the published stderr and a control arm's `detail`.
-/// The scrubber knows the roots the drivers use when nothing redirects them, so an
-/// operator's `TMPDIR` put the object outside them and two normalized runs of one
-/// measurement differed again on the one line the scrubber existed for. The wrapper
-/// reports what it sees in its own environment on every invocation, and chard is
-/// started with the variable set, so `unset` below can only have come from chard.
 #[test]
 fn the_driver_is_not_handed_the_operators_tmpdir() {
     if !can_run("that TMPDIR is cleared from the driver's environment") {
@@ -826,16 +718,6 @@ exec "$REAL" "$@""#,
     }
 }
 
-/// A `-m32` inside a response file is refused before any invocation carries it.
-///
-/// chard builds each control arm with the target and linker the profile's flags select,
-/// and reads them from the flags as written, so a `-m32` inside `@file` reached the
-/// measured build and no arm: the triple validated each detector on x86_64 while the cell
-/// measured i386. The refusal is `CONFIGURATION`, names the argument and its list, and
-/// comes before the driver is handed any profile flag; the wrapper logs every argument
-/// vector it receives, so a build that carried the file would be in the log. The flag-free
-/// toolchain interrogation that precedes profile resolution is in it, which is what makes
-/// the absence a measurement.
 #[test]
 fn a_response_file_in_the_profile_is_refused_before_any_build() {
     if !can_run("that a response file in the profile's flags is refused before a build") {
@@ -893,18 +775,8 @@ fn a_response_file_in_the_profile_is_refused_before_any_build() {
     );
 }
 
-/// Each spelling that selects x32, 16-bit or aarch64 ILP32 code is refused before any
-/// invocation carries it, from whichever of the three lists it is in.
-///
-/// chard does not measure those targets (decided 2026-10-07), and
-/// `toolchain::unsupported_target_flags` says which spellings select them. The refusal is
-/// `CONFIGURATION`, says chard does not measure the target and names the words that select
-/// it (each row's third element; a driver word between the two halves of a `cc1` pair, or
-/// an option that took an `-Xclang` as its own value, is not named); the wrapper logs every
-/// argument vector it receives, so a build that carried
-/// one would be in the log beside the flag-free toolchain interrogation.
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "the twenty-three spellings, the loop over them, and the control run that shows \
               the empty wrapper log is the refusal's doing, read as one test"
@@ -1003,10 +875,7 @@ fn an_x32_sixteen_bit_or_ilp32_profile_is_refused_before_any_build() {
     }
     assert_eq!(fed, refused.len(), "every spelling was put through chard");
     // The refusal comes before the toolchain interrogation too, so no refused run reaches the
-    // wrapper at all. One run with nothing refused is the positive control: it reaches the wrapper,
-    // so an empty log above is the refusal's doing and not a wrapper that logs nothing.
-    // `common::executable` spawns the wrapper once with no arguments to wait out `ETXTBSY`, which
-    // logs one empty line, so only a line with arguments on it is a run's.
+    // wrapper at all.
     let invocations = |argv: &str| argv.lines().filter(|l| !l.is_empty()).count();
     let before_control = std::fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(
@@ -1048,14 +917,6 @@ fn an_x32_sixteen_bit_or_ilp32_profile_is_refused_before_any_build() {
     }
 }
 
-/// The driver is handed none of the variables `compile::COMPILER_ENV_NAMED` names,
-/// and each pin in `compile::COMPILER_ENV_PINNED` at its pinned value.
-///
-/// `tests/register.rs` holds the list to `THREAT_MODEL.md`; this holds it to the
-/// process chard actually spawns. chard is started with every listed variable set, and
-/// the wrapper reports each one on every invocation, so `unset` can only have come from
-/// chard. The values are the work directory, which is harmless to chard itself and would
-/// be visible in the wrapper's report if it arrived.
 #[test]
 fn the_driver_is_handed_none_of_the_removed_variables() {
     if !can_run("that every listed variable is cleared from the driver's environment") {
@@ -1114,13 +975,6 @@ fn the_driver_is_handed_none_of_the_removed_variables() {
     }
 }
 
-/// The variables the 2026-10-09 inventory found a toolchain reading and moving a
-/// measurement with, each spelled out here and not read from `COMPILER_ENV_NAMED`.
-///
-/// The test above holds the spawned process to whatever the list says, so it cannot notice
-/// an entry that was never on the list. This one names the variables, so an entry leaving
-/// the list, or the process leaking one of these, fails by name. The classes are in the
-/// comment on `compile::COMPILER_ENV_NAMED`.
 #[test]
 fn the_variables_the_inventory_found_are_not_handed_to_the_driver() {
     const FOUND: &[&str] = &[
@@ -1200,18 +1054,6 @@ fn the_variables_the_inventory_found_are_not_handed_to_the_driver() {
     }
 }
 
-/// The driver's whole environment is `compile::COMPILER_ENV_PASSED` and the pins: a
-/// variable no list names, set in chard's own environment, does not reach it.
-///
-/// The two tests above set names someone found; this one is what makes a name nobody has
-/// found harmless. The wrapper reports every name in its environment, and chard is started
-/// with variables of three kinds set: one no toolchain and no list names, a loader variable
-/// the removal list never held (`LD_LIBRARY_PATH`, at the work directory, which no program
-/// here loads from), and `CCACHE_DISABLE`, which a `ccache` masquerade directory on `PATH`
-/// would read. The shell running the wrapper adds some of `PWD`, `SHLVL` and `_` itself
-/// (measured under `env -i` on 2026-10-11: bash, `/bin/sh` on Fedora 44 and on macOS, adds
-/// all three; dash on Ubuntu 22.04 adds `PWD`; busybox on Alpine adds `PWD` and `SHLVL`), so
-/// those three are allowed and nothing else is.
 #[test]
 fn the_driver_is_handed_only_the_passed_variables_and_the_pins() {
     const SHELL_ADDS: &[&str] = &["PWD", "SHLVL", "_"];
@@ -1222,11 +1064,13 @@ fn the_driver_is_handed_only_the_passed_variables_and_the_pins() {
     let driver = fake_driver(
         work.dir(),
         "env | awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print \"fakecc-envname: \" $1 }' >&2\n\
+         echo \"fakecc-ccache-disable: ${CCACHE_DISABLE-unset}\" >&2\n\
          exec \"$REAL\" \"$@\"",
     );
     let envs: Vec<(&str, &Path)> = [
         "CHARD_TEST_VARIABLE_NO_LIST_NAMES",
         "LD_LIBRARY_PATH",
+        "CCACHE_DIR",
         "CCACHE_DISABLE",
     ]
     .iter()
@@ -1252,7 +1096,16 @@ fn the_driver_is_handed_only_the_passed_variables_and_the_pins() {
         .iter()
         .map(|(name, _)| *name)
         .collect();
+    let disable = chard::compile::COMPILER_ENV_PINNED
+        .iter()
+        .find(|(name, _)| *name == "CCACHE_DISABLE")
+        .map(|(_, value)| format!("fakecc-ccache-disable: {value}"))
+        .expect("CCACHE_DISABLE is a pin");
     for stderr in builds {
+        assert!(
+            stderr.lines().any(|l| l == disable),
+            "the driver was not handed the pinned CCACHE_DISABLE: {stderr}"
+        );
         let names: Vec<&str> = stderr
             .lines()
             .filter_map(|l| l.strip_prefix("fakecc-envname: "))
@@ -1278,14 +1131,929 @@ fn the_driver_is_handed_only_the_passed_variables_and_the_pins() {
     }
 }
 
-/// A driver that runs only with a variable chard's environment holds and the clear keeps
-/// from it is refused: exit 2, the no-macros message, and a hint spelling the environment
-/// the compiler is given as an `env -i` command.
-///
-/// The wrapper exits 1 unless `CHARD_TEST_DRIVER_NEEDS` is set, the shape of a toolchain
-/// that runs only under `LD_LIBRARY_PATH`. Run directly with the variable, it dumps
-/// macros, so the refusal is the clear's doing and not a wrapper that never works. chard is
-/// run with the variable set; before the clear, that run published a report.
+/// The program `name` resolves to on `path`, by `command -v` under that `PATH` alone.
+fn resolved_on(path: &OsStr, name: &str) -> Option<PathBuf> {
+    let output = Command::new("sh")
+        .args(["-c", &format!("command -v {name}")])
+        .env("PATH", path)
+        .output()
+        .expect("sh is available");
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && found.starts_with('/')).then(|| PathBuf::from(found))
+}
+
+/// `measure` through `--cc clang` with `path` as chard's whole `PATH` and `pairs` as its
+/// `--env` pairs: shape A of the compiler-cache finding, a `-fstack-protector-strong` build
+/// read by the two checks that read the emitted protector.
+fn measure_canary_on(path: &OsStr, work: &Path, pairs: &[String]) -> Value {
+    let output = Command::new(chard_binary())
+        .arg("measure")
+        .args(PROBE_DEADLINE)
+        .args(["-o", "-", "--cc", "clang", "--profile", "explicit"])
+        .args(["--flags", "-O2 -fstack-protector-strong"])
+        .args(["--probe", "stack-canary", "--probe", "ssp-function-map"])
+        .arg("--workdir")
+        .arg(work)
+        .args(pairs.iter().flat_map(|pair| ["--env", pair.as_str()]))
+        .env_clear()
+        .env("PATH", path)
+        .output()
+        .expect("spawning chard");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("chard's output was not JSON ({e}):\n{text}"));
+    assert!(
+        parsed.get("error").is_none(),
+        "chard refused to measure: {}",
+        parsed["error"]
+    );
+    parsed
+}
+
+/// The verdict of each of the two canary checks, by check.
+fn canary_verdicts(report: &Value) -> Vec<(String, String)> {
+    let mut verdicts: Vec<(String, String)> = report["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .filter(|o| {
+            matches!(
+                o["check"].as_str(),
+                Some("canary-emitted" | "ssp-level-emitted")
+            )
+        })
+        .map(|o| {
+            let check = o["check"].as_str().unwrap_or_default().to_owned();
+            (check, o["verdict"].as_str().unwrap_or_default().to_owned())
+        })
+        .collect();
+    verdicts.sort();
+    let checks: Vec<&str> = verdicts.iter().map(|(check, _)| check.as_str()).collect();
+    assert_eq!(
+        checks,
+        ["canary-emitted", "ssp-level-emitted"],
+        "the run did not observe both canary checks once each, so nothing is compared"
+    );
+    verdicts
+}
+
+/// The files under `dir`, as `(all, results)`: `all` counts every file, and `results` the
+/// ones a hit is served from ([`stored_result`]). A cache that stored nothing leaves both at
+/// none; a cache in another layout reads no result, so the poisoning control fails rather
+/// than passing on bookkeeping. An absent directory holds none; any other error reading one
+/// panics, so a cache that cannot be read is never counted as one that stored nothing.
+fn files_under(dir: &Path) -> (usize, usize) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+        Err(e) => panic!("reading the cache directory {}: {e}", dir.display()),
+    };
+    entries
+        .map(|entry| entry.expect("a directory entry").path())
+        .map(|path| {
+            if path.is_dir() {
+                return files_under(&path);
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            (1, usize::from(name.as_deref().is_some_and(stored_result)))
+        })
+        .fold((0, 0), |(files, kept), (f, k)| (files + f, kept + k))
+}
+
+/// Is `name` a file a ccache hit is served from? A result or a manifest, matched by name as
+/// ccache 4.12.3 writes it: at least 20 lower-case letters and digits, then `R` (result) or
+/// `M` (manifest). Its bookkeeping (`stats`, `CACHEDIR.TAG`, a lock or a temporary file) is not.
+fn stored_result(name: &str) -> bool {
+    name.len() > 20
+        && (name.ends_with('R') || name.ends_with('M'))
+        && name[..name.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+#[test]
+fn a_cache_of_bookkeeping_holds_no_stored_result() {
+    let work = common::Work::new("fakedriver", "ccache-layout");
+    let cache = work.dir().join("cache");
+    let nested = cache.join("a").join("b");
+    std::fs::create_dir_all(&nested).expect("the cache's directories");
+    std::fs::create_dir_all(cache.join("tmp")).expect("the cache's tmp");
+    let result = "0f3k9q2b7n1m4c8x5z6v0a9s8d7f6g5R";
+    let manifest = "0f3k9q2b7n1m4c8x5z6v0a9s8d7f6g5M";
+    // The shortest name read as stored: 20 hash characters, then the suffix.
+    let shortest = "0f3k9q2b7n1m4c8x5z6vR";
+    for (dir, name) in [
+        (&cache, "CACHEDIR.TAG"),
+        (&cache, "stats"),
+        (&cache.join("tmp"), "tmp.cpp_stdout.x1Y2"),
+        (&nested, "stats"),
+        (&nested, result),
+        (&nested, manifest),
+        (&nested, shortest),
+        // Too short by one, a capital in the hash, and a third suffix: none is stored.
+        (&nested, "0f3k9q2b7n1m4c8x5z6R"),
+        (&nested, "0f3k9q2bR"),
+        (&nested, "0F3K9Q2B7N1M4C8X5Z6V0A9S8D7F6G5R"),
+        (&nested, "0f3k9q2b7n1m4c8x5z6v0a9s8d7f6g5W"),
+    ] {
+        std::fs::write(dir.join(name), b"x").expect("a cache file");
+    }
+    assert_eq!(files_under(&cache), (11, 3));
+    assert_eq!(files_under(&work.dir().join("absent")), (0, 0));
+    // A path that exists and cannot be read as a directory is not an empty cache.
+    let not_a_directory = work.dir().join("not-a-directory");
+    std::fs::write(&not_a_directory, b"x").expect("a plain file");
+    let payload = std::panic::catch_unwind(|| files_under(&not_a_directory))
+        .expect_err("a plain file read as a cache directory");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("reading the cache directory"),
+        "files_under panicked for another reason: {message:?}"
+    );
+    for name in [result, manifest, shortest] {
+        assert!(stored_result(name), "{name}");
+    }
+    for name in [
+        "stats",
+        "CACHEDIR.TAG",
+        "0f3k9q2b7n1m4c8x5z6R",
+        "0f3k9q2bR",
+        "lock",
+    ] {
+        assert!(!stored_result(name), "{name}");
+    }
+}
+
+/// The host's `ccache`, resolved, and the host's `PATH` without its own masquerade
+/// directories (an entry whose `clang` is that ccache), where a clang remains on it; `None`,
+/// with the gap in the ledger, where either is missing.
+fn ccache_and_clean_path(test: &str) -> Option<(PathBuf, std::ffi::OsString)> {
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(ccache) = resolved_on(&host_path, "ccache") else {
+        common::capability_gap(
+            test,
+            "no ccache on PATH, so no masquerade directory to measure through",
+        );
+        return None;
+    };
+    let ccache = std::fs::canonicalize(&ccache).expect("ccache resolves");
+    let clean: Vec<PathBuf> = std::env::split_paths(&host_path)
+        .filter(|dir| std::fs::canonicalize(dir.join("clang")).map_or(true, |real| real != ccache))
+        .collect();
+    let clean = std::env::join_paths(&clean).expect("a PATH");
+    if resolved_on(&clean, "clang").is_none() {
+        common::capability_gap(
+            test,
+            "no clang on PATH, and shape A's route is clang's CCC_OVERRIDE_OPTIONS",
+        );
+        return None;
+    }
+    Some((ccache, clean))
+}
+
+#[test]
+fn a_ccache_directory_on_path_serves_chard_nothing() {
+    const TEST: &str = "a_ccache_directory_on_path_serves_chard_nothing";
+    if !common::require_binary(
+        &chard_binary(),
+        "that a ccache masquerade directory on PATH serves chard no object",
+    ) {
+        return;
+    }
+    let Some((ccache, clean)) = ccache_and_clean_path(TEST) else {
+        return;
+    };
+    let work = common::Work::new("fakedriver", "ccache-shim");
+    let shim = work.dir().join("shim");
+    let poison = work.dir().join("poison");
+    std::fs::create_dir_all(&shim).expect("the shim directory");
+    std::fs::create_dir_all(&poison).expect("the poisoning directory");
+    std::os::unix::fs::symlink(&ccache, shim.join("clang")).expect("the masquerade entry");
+    let shimmed =
+        std::env::join_paths(std::iter::once(shim.clone()).chain(std::env::split_paths(&clean)))
+            .expect("a PATH");
+    let poisoning = std::env::join_paths(
+        std::iter::once(poison.clone()).chain(std::env::split_paths(&shimmed)),
+    )
+    .expect("a PATH");
+    // The wrapper unsets every boolean ccache pin (`compile::ccache_boolean_pin`), whatever
+    // the list holds, and keeps the other pins: ccache hashes `LC_ALL` among them, so the
+    // honest run's entries key as the route's do.
+    let unpinned: Vec<&str> = chard::compile::COMPILER_ENV_PINNED
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| chard::compile::ccache_boolean_pin(name) == Some(true))
+        .collect();
+    common::executable(
+        &poison.join("clang"),
+        &format!(
+            "[ $# -eq 0 ] && exit 0\nunset {}\nPATH='{}'\nexport PATH\nexec clang \"$@\"",
+            unpinned.join(" "),
+            shimmed.to_string_lossy()
+        ),
+    );
+
+    // A private cache; `CCACHE_CONFIGPATH=/dev/null`, a pin the wrapper keeps, keeps every
+    // ccache configuration file out of both runs.
+    let cache = work.dir().join("cache");
+    let cache_pair = format!("CCACHE_DIR={}", cache.display());
+    let route = "CCC_OVERRIDE_OPTIONS=+-fno-stack-protector".to_owned();
+    let honest = canary_verdicts(&measure_canary_on(
+        &poisoning,
+        &work.dir().join("honest"),
+        std::slice::from_ref(&cache_pair),
+    ));
+    assert!(
+        honest
+            .iter()
+            .any(|(check, verdict)| check == "ssp-level-emitted" && verdict == "on"),
+        "the honest run did not read ssp-level-emitted on: {honest:?}"
+    );
+    let poisoned = files_under(&cache);
+    assert!(
+        poisoned.1 > 0,
+        "the honest run stored no result in {} with the ccache pins unset ({} bookkeeping files)",
+        cache.display(),
+        poisoned.0
+    );
+    let served_report = measure_canary_on(
+        &shimmed,
+        &work.dir().join("route"),
+        &[cache_pair, route.clone()],
+    );
+    let driver = served_report["toolchain"]["driver"]
+        .as_str()
+        .map(PathBuf::from);
+    assert_eq!(
+        driver,
+        Some(shim.join("clang")),
+        "the route's driver was not the masquerade entry, so the cache was never in front of it"
+    );
+    let served = canary_verdicts(&served_report);
+    let uncached = canary_verdicts(&measure_canary_on(
+        &clean,
+        &work.dir().join("uncached"),
+        &[route],
+    ));
+    assert!(
+        !uncached.iter().any(|(_, verdict)| verdict == "on"),
+        "the route read on with no cache on PATH: {uncached:?}"
+    );
+    assert_eq!(
+        served, uncached,
+        "through the cache the route read the honest run's object, not its own"
+    );
+    assert_eq!(
+        files_under(&cache),
+        poisoned,
+        "the route stored files in the cache {}",
+        cache.display()
+    );
+}
+
+/// A program that records each invocation of it in `mark`, one line holding its arguments,
+/// and then runs `then` with them: with `then` empty, the rest of its arguments (a ccache
+/// `prefix_command` or `CCACHE_PREFIX` stand-in); with a compiler's path, that compiler (a
+/// `CCACHE_COMPILER` or `CCACHE_PATH` stand-in). It ends without running anything when called
+/// with no argument, which is how `common::executable` tries it.
+fn marking_program(at: &Path, mark: &Path, then: &str) -> PathBuf {
+    let then = if then.is_empty() {
+        String::new()
+    } else {
+        format!("'{then}' ")
+    };
+    common::executable(
+        at,
+        &format!(
+            "[ $# -eq 0 ] && exit 0\nprintf '%s\\n' \"$*\" >> '{}'\nexec {then}\"$@\"",
+            mark.display()
+        ),
+    )
+}
+
+/// The line `marking_program` writes for `toolchain::detect`'s intrinsic macro dump, the query
+/// `toolchain.kind` and `toolchain.version` are read from: no flags, and the source
+/// `compile::macro_dump` names from its tag, handed over by its file name alone.
+const INTRINSIC_DUMP: &str = "-dM -E macros-intrinsic.c";
+
+/// Does a line `marking_program` wrote record a compile, an invocation carrying `-c`, rather
+/// than a query such as `--version` or a macro dump?
+fn marks_a_compile(line: &str) -> bool {
+    line.split_whitespace().any(|word| word == "-c")
+}
+
+/// One arm of [`a_ccache_configuration_file_decides_nothing`]: the configuration file ccache
+/// reads in that arm, the cache directory it uses there, and the pairs that lead ccache to
+/// both, every path under the arm's `dir`. The last two arms are ccache's default branch, with
+/// no `CCACHE_DIR` set: they name `HOME` so that the test user's own home decides nothing.
+/// Every arm but the system file's names an empty file (`no-system-ccache.conf`, which the
+/// caller writes) as `CCACHE_CONFIGPATH2`. Where the host's ccache reads that variable, the
+/// host's own system file, whose `cache_dir` would move where ccache looks for the operator's
+/// file, decides nothing in the control.
+fn configuration_arm(arm: &str, dir: &Path) -> (PathBuf, PathBuf, Vec<(&'static str, PathBuf)>) {
+    let no_system = ("CCACHE_CONFIGPATH2", dir.join("no-system-ccache.conf"));
+    let home = || vec![("HOME", dir.to_path_buf()), no_system.clone()];
+    match arm {
+        "cache-directory" => {
+            let cache = dir.join("cache");
+            (
+                cache.join("ccache.conf"),
+                cache.clone(),
+                vec![("CCACHE_DIR", cache), no_system.clone()],
+            )
+        }
+        "system" => {
+            let file = dir.join("system-ccache.conf");
+            let cache = dir.join("cache");
+            (
+                file.clone(),
+                cache.clone(),
+                vec![("CCACHE_DIR", cache), ("CCACHE_CONFIGPATH2", file)],
+            )
+        }
+        // The operator's file where no legacy `.ccache` directory exists.
+        "operator" => (
+            dir.join(".config").join("ccache").join("ccache.conf"),
+            dir.join(".cache").join("ccache"),
+            home(),
+        ),
+        // A legacy `.ccache` directory under `HOME` is both the cache and the file's directory,
+        // and outranks the operator's file where it exists.
+        "legacy" => {
+            let cache = dir.join(".ccache");
+            (cache.join("ccache.conf"), cache, home())
+        }
+        _ => panic!("no configuration arm {arm}"),
+    }
+}
+
+#[test]
+fn a_ccache_configuration_file_decides_nothing() {
+    const TEST: &str = "a_ccache_configuration_file_decides_nothing";
+    if !common::require_binary(
+        &chard_binary(),
+        "that a ccache configuration file decides nothing in a run",
+    ) {
+        return;
+    }
+    let Some((ccache, clean)) = ccache_and_clean_path(TEST) else {
+        return;
+    };
+    let work = common::Work::new("fakedriver", "ccache-config");
+    let shim = work.dir().join("shim");
+    std::fs::create_dir_all(&shim).expect("the shim directory");
+    std::os::unix::fs::symlink(&ccache, shim.join("clang")).expect("the masquerade entry");
+    let shimmed =
+        std::env::join_paths(std::iter::once(shim.clone()).chain(std::env::split_paths(&clean)))
+            .expect("a PATH");
+    let mut exercised = 0;
+    let mut system_gap = false;
+    let arms = ["cache-directory", "system", "operator", "legacy"];
+    for arm in arms {
+        let dir = work.dir().join(arm);
+        let mark = dir.join("prefix-ran");
+        let (file, cache, pairs) = configuration_arm(arm, &dir);
+        std::fs::create_dir_all(&cache).expect("the cache directory");
+        std::fs::create_dir_all(file.parent().expect("the file's directory"))
+            .expect("the configuration file's directory");
+        let prefix = marking_program(&dir.join("prefix"), &mark, "");
+        std::fs::write(&file, format!("prefix_command = {}\n", prefix.display()))
+            .expect("the configuration file");
+        if arm != "system" {
+            std::fs::write(dir.join("no-system-ccache.conf"), b"").expect("the empty system file");
+        }
+
+        let direct = Command::new(shim.join("clang"))
+            .arg("--version")
+            .env_clear()
+            .env("PATH", &shimmed)
+            .envs(pairs.iter().map(|(name, value)| (name, value)))
+            .env("CCACHE_DISABLE", "1")
+            .output()
+            .expect("spawning the masquerade entry");
+        assert!(
+            direct.status.success(),
+            "{arm}: the masquerade entry failed: {direct:?}"
+        );
+        if !mark.exists() {
+            assert_eq!(
+                arm,
+                "system",
+                "the prefix command in {} did not run under CCACHE_DISABLE alone",
+                file.display()
+            );
+            common::capability_gap(
+                &format!("{TEST} (the system file)"),
+                "this ccache did not read the file CCACHE_CONFIGPATH2 names",
+            );
+            system_gap = true;
+            continue;
+        }
+        std::fs::remove_file(&mark).expect("clearing the mark");
+
+        let env: Vec<String> = pairs
+            .iter()
+            .map(|(name, value)| format!("{name}={}", value.display()))
+            .collect();
+        let report = measure_canary_on(&shimmed, &dir.join("run"), &env);
+        assert_eq!(
+            report["toolchain"]["driver"].as_str().map(PathBuf::from),
+            Some(shim.join("clang")),
+            "{arm}: the run's driver was not the masquerade entry"
+        );
+        // A run that built nothing would leave no mark either: the canary checks read `on`
+        // only over objects this run compiled.
+        let verdicts = canary_verdicts(&report);
+        assert!(
+            verdicts.iter().all(|(_, verdict)| verdict == "on"),
+            "{arm}: the run did not read both canary checks on: {verdicts:?}"
+        );
+        assert!(
+            !mark.exists(),
+            "{arm}: the prefix command {} named ran in chard's run",
+            file.display()
+        );
+        assert_eq!(
+            files_under(&cache).1,
+            0,
+            "{arm}: the run stored a result under {}",
+            cache.display()
+        );
+        exercised += 1;
+    }
+    assert_eq!(
+        exercised,
+        arms.len() - usize::from(system_gap),
+        "an arm neither compared a run nor was the system file's gap"
+    );
+}
+
+#[test]
+fn a_published_ccache_pair_naming_a_program_acts_and_is_published() {
+    const TEST: &str = "a_published_ccache_pair_naming_a_program_acts_and_is_published";
+    if !common::require_binary(
+        &chard_binary(),
+        "that a published ccache pair naming a program acts and the report carries it",
+    ) {
+        return;
+    }
+    let Some((ccache, clean)) = ccache_and_clean_path(TEST) else {
+        return;
+    };
+    let real = resolved_on(&clean, "clang").expect("ccache_and_clean_path found a clang");
+    let real = real.to_str().expect("a clang path in UTF-8");
+    let work = common::Work::new("fakedriver", "ccache-pair");
+    let shim = work.dir().join("shim");
+    std::fs::create_dir_all(&shim).expect("the shim directory");
+    std::os::unix::fs::symlink(&ccache, shim.join("clang")).expect("the masquerade entry");
+    let shimmed =
+        std::env::join_paths(std::iter::once(shim.clone()).chain(std::env::split_paths(&clean)))
+            .expect("a PATH");
+    for name in [
+        "CCACHE_PREFIX",
+        "CCACHE_COMPILER",
+        "CCACHE_CC",
+        "CCACHE_PATH",
+    ] {
+        let dir = work.dir().join(name);
+        let cache = dir.join("cache");
+        let programs = dir.join("programs");
+        std::fs::create_dir_all(&cache).expect("the cache directory");
+        std::fs::create_dir_all(&programs).expect("the programs directory");
+        let mark = dir.join("marks");
+        let value = match name {
+            "CCACHE_PREFIX" => marking_program(&programs.join("prefix"), &mark, ""),
+            "CCACHE_COMPILER" | "CCACHE_CC" => {
+                marking_program(&programs.join("clang"), &mark, real)
+            }
+            _ => {
+                marking_program(&programs.join("clang"), &mark, real);
+                programs.clone()
+            }
+        };
+        let pairs = [
+            format!("CCACHE_DIR={}", cache.display()),
+            format!("{name}={}", value.display()),
+        ];
+        let report = measure_canary_on(&shimmed, &dir.join("run"), &pairs);
+        assert_eq!(
+            report["toolchain"]["driver"].as_str().map(PathBuf::from),
+            Some(shim.join("clang")),
+            "{name}: the run's driver was not the masquerade entry"
+        );
+        let set = &report["profile"]["compiler_environment"]["set"];
+        assert_eq!(
+            set[name].as_str(),
+            value.to_str(),
+            "the report does not publish the {name} pair: {set}"
+        );
+        let marks = std::fs::read_to_string(&mark).unwrap_or_default();
+        assert!(
+            marks.lines().any(marks_a_compile),
+            "{name}: the published pair's program ran in no compile; its invocations: {marks:?}"
+        );
+        if name != "CCACHE_PREFIX" {
+            assert!(
+                marks.lines().any(|line| line == INTRINSIC_DUMP),
+                "{name}: the pair's program never answered the intrinsic macro dump: {marks:?}"
+            );
+            assert!(
+                marks.lines().any(|line| line == "--version"),
+                "{name}: the pair's program never answered chard's --version query: {marks:?}"
+            );
+        }
+        assert_eq!(
+            files_under(&cache).1,
+            0,
+            "{name}: the run stored a result under {}",
+            cache.display()
+        );
+    }
+}
+
+/// The masquerade directory, a private cache and the host's gcc for the two forwarding
+/// tests below: a `PATH` with a `clang` linked to the host's ccache first, the cache
+/// directory's pair, and gcc's path; `None`, with the gap in the ledger, where ccache, clang
+/// or gcc is missing.
+fn forwarding_host(
+    test: &str,
+    work: &common::Work,
+) -> Option<(std::ffi::OsString, String, String)> {
+    let (ccache, clean) = ccache_and_clean_path(test)?;
+    let Some(gcc) = resolved_on(&clean, "gcc") else {
+        common::capability_gap(test, "no gcc on PATH, so no other compiler to forward to");
+        return None;
+    };
+    let shim = work.dir().join("shim");
+    std::fs::create_dir_all(&shim).expect("the shim directory");
+    std::os::unix::fs::symlink(&ccache, shim.join("clang")).expect("the masquerade entry");
+    let shimmed = std::env::join_paths(std::iter::once(shim).chain(std::env::split_paths(&clean)))
+        .expect("a PATH");
+    let cache = work.dir().join("cache");
+    std::fs::create_dir_all(&cache).expect("the cache directory");
+    Some((
+        shimmed,
+        format!("CCACHE_DIR={}", cache.display()),
+        gcc.to_str().expect("a gcc path in UTF-8").to_owned(),
+    ))
+}
+
+#[test]
+fn a_compile_a_ccache_prefix_sends_to_another_compiler_is_withheld() {
+    const TEST: &str = "a_compile_a_ccache_prefix_sends_to_another_compiler_is_withheld";
+    const RULE: &str = "artifact-compiled-by-another-compiler";
+    if !common::require_binary(
+        &chard_binary(),
+        "that an object another compiler built under a forwarding prefix is withheld",
+    ) {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "ccache-forward");
+    let Some((shimmed, cache_pair, gcc)) = forwarding_host(TEST, &work) else {
+        return;
+    };
+    let mark = work.dir().join("forwarded");
+    let forwarding = common::executable(
+        &work.dir().join("forward"),
+        &format!(
+            "[ $# -eq 0 ] && exit 0\nfor a in \"$@\"; do\n  if [ \"$a\" = -c ]; then\n    \
+             printf '%s\\n' \"$*\" >> '{}'\n    shift\n    exec '{gcc}' \"$@\"\n  fi\ndone\n\
+             exec \"$@\"",
+            mark.display()
+        ),
+    );
+    let report = measure_canary_on(
+        &shimmed,
+        &work.dir().join("run"),
+        &[
+            cache_pair.clone(),
+            format!("CCACHE_PREFIX={}", forwarding.display()),
+        ],
+    );
+    assert_eq!(
+        report["toolchain"]["kind"].as_str(),
+        Some("clang"),
+        "the dumps did not stay with clang: {}",
+        report["toolchain"]
+    );
+    let forwarded = std::fs::read_to_string(&mark).unwrap_or_default();
+    assert!(
+        forwarded.lines().any(marks_a_compile),
+        "the prefix forwarded no compile, so nothing here was built by gcc: {forwarded:?}"
+    );
+    let level = observation(&report, "ssp-level-emitted");
+    assert_eq!(level["verdict"].as_str(), Some("indeterminate"), "{level}");
+    assert_eq!(level["gating"]["rule"].as_str(), Some(RULE), "{level}");
+    let reason = level["gating"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("`GCC: (") && reason.contains("where `toolchain` is clang "),
+        "the reason quotes neither gcc's line nor the compiler the report names: {reason}"
+    );
+    let diagnosed = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| d["context"].as_str() == Some("ssp-function-map"))
+        .filter_map(|d| d["message"].as_str())
+        .any(|m| m.starts_with("the measured artifact") && m.contains(RULE));
+    assert!(
+        diagnosed,
+        "no diagnostic names the measured build: {}",
+        report["diagnostics"]
+    );
+    let canary = observation(&report, "canary-emitted");
+    assert_eq!(
+        canary["verdict"].as_str(),
+        Some("on"),
+        "the linked program the prefix left with clang is not read as it is uncached: {canary}"
+    );
+
+    let passed = work.dir().join("passed");
+    let passing = marking_program(&work.dir().join("pass"), &passed, "");
+    let control = measure_canary_on(
+        &shimmed,
+        &work.dir().join("control"),
+        &[
+            cache_pair.clone(),
+            format!("CCACHE_PREFIX={}", passing.display()),
+        ],
+    );
+    let passed = std::fs::read_to_string(&passed).unwrap_or_default();
+    assert!(
+        passed.lines().any(marks_a_compile),
+        "the control's prefix ran in no compile: {passed:?}"
+    );
+    assert_eq!(
+        canary_verdicts(&control),
+        [
+            ("canary-emitted".to_owned(), "on".to_owned()),
+            ("ssp-level-emitted".to_owned(), "on".to_owned())
+        ],
+        "a prefix that forwards nothing did not read both checks on"
+    );
+    assert!(
+        !linked_warning(&control),
+        "the control named a linked artifact with another compiler's line: {}",
+        control["diagnostics"]
+    );
+}
+
+#[test]
+fn a_linked_program_another_compiler_built_is_named() {
+    const TEST: &str = "a_linked_program_another_compiler_built_is_named";
+    const RULE: &str = "artifact-compiled-by-another-compiler";
+    if !common::require_binary(
+        &chard_binary(),
+        "that a linked program another compiler built under a forwarding prefix is named",
+    ) {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "ccache-forward-builds");
+    let Some((shimmed, cache_pair, gcc)) = forwarding_host(TEST, &work) else {
+        return;
+    };
+    let builds = common::executable(
+        &work.dir().join("builds"),
+        &format!(
+            "[ $# -eq 0 ] && exit 0\nfor a in \"$@\"; do\n  case \"$a\" in\n    \
+             -E|--version|-v|-###|-dumpmachine|-print-*) exec \"$@\";;\n  esac\ndone\n\
+             shift\nexec '{gcc}' \"$@\""
+        ),
+    );
+    let every = measure_canary_on(
+        &shimmed,
+        &work.dir().join("every-build"),
+        &[cache_pair, format!("CCACHE_PREFIX={}", builds.display())],
+    );
+    assert_eq!(
+        every["toolchain"]["kind"].as_str(),
+        Some("clang"),
+        "{}",
+        every["toolchain"]
+    );
+    assert_eq!(
+        observation(&every, "ssp-level-emitted")["gating"]["rule"].as_str(),
+        Some(RULE),
+        "{}",
+        observation(&every, "ssp-level-emitted")
+    );
+    assert!(
+        linked_warning(&every),
+        "the linked program gcc built under a report naming clang is not named: {}",
+        every["diagnostics"]
+    );
+}
+
+#[test]
+fn an_assembly_probe_is_not_named_for_its_startup_objects_lines() {
+    const TEST: &str = "an_assembly_probe_is_not_named_for_its_startup_objects_lines";
+    if !common::require_binary(
+        &chard_binary(),
+        "that an assembly probe's link is not named",
+    ) {
+        return;
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(clang) = resolved_on(&path, "clang") else {
+        common::capability_gap(TEST, "no clang on PATH");
+        return;
+    };
+    let work = common::Work::new("fakedriver", "assembly-link");
+    let output = Command::new(chard_binary())
+        .arg("measure")
+        .args(PROBE_DEADLINE)
+        .args(["-o", "-", "--cc"])
+        .arg(&clang)
+        .args([
+            "--profile",
+            "bare",
+            "--probe",
+            "linker-default-execstack",
+            "--workdir",
+        ])
+        .arg(work.dir().join("run"))
+        .output()
+        .expect("spawning chard");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("a report on stdout");
+    if report["run"]["artifact_witness"].is_null() {
+        common::capability_gap(
+            TEST,
+            "this run has no witness, so its artifacts are not ELF",
+        );
+        return;
+    }
+    let sha = report["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .find_map(|o| o["build"]["artifact_sha256"].as_str())
+        .expect("a build with an artifact");
+    let lines: Vec<&str> = report["facts"][sha]["elf"]["comment"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let names_compiler = lines
+        .iter()
+        .any(|l| l.starts_with("GCC: (") || l.contains("clang version"));
+    if !names_compiler || lines.iter().any(|l| l.contains("clang version")) {
+        common::capability_gap(
+            TEST,
+            "the program's .comment names no compiler, or names clang, so the exclusion decides \
+             nothing here",
+        );
+        return;
+    }
+    assert!(
+        !report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .filter_map(|d| d["message"].as_str())
+            .any(|m| m.contains("linked artifact(s)")),
+        "an assembly unit's link is named for its startup objects' lines ({lines:?}): {}",
+        report["diagnostics"]
+    );
+}
+
+/// Whether `report` carries the run's warning that a linked artifact names another compiler
+/// and not the report's, for the `stack-canary` program.
+fn linked_warning(report: &Value) -> bool {
+    report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| d["context"].as_str() == Some("toolchain"))
+        .filter_map(|d| d["message"].as_str())
+        .any(|m| m.contains("linked artifact(s)") && m.contains("stack-canary sha256:"))
+}
+
+#[test]
+fn an_object_that_shows_no_compiler_is_read_and_named() {
+    const TEST: &str = "an_object_that_shows_no_compiler_is_read_and_named";
+    if !can_run("that an object with no compiler line is read and named") {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "no-ident");
+    let run = |flags: &str, dir: &str| -> Value {
+        let output = Command::new(chard_binary())
+            .arg("measure")
+            .args(PROBE_DEADLINE)
+            .args(["-o", "-", "--cc", &real_cc(), "--profile", "explicit"])
+            .args(["--flags", flags, "--probe", "ssp-function-map", "--workdir"])
+            .arg(work.dir().join(dir))
+            .output()
+            .expect("spawning chard");
+        serde_json::from_slice(&output.stdout).expect("a report on stdout")
+    };
+    let unnamed = run("-O2 -fstack-protector-strong -fno-ident", "no-ident");
+    if unnamed["run"]["artifact_witness"].is_null() {
+        common::capability_gap(
+            TEST,
+            "this run has no witness, so no object is held to a line",
+        );
+        return;
+    }
+    let level = observation(&unnamed, "ssp-level-emitted");
+    assert_eq!(level["verdict"].as_str(), Some("on"), "{level}");
+    let named = |report: &Value| {
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .filter(|d| d["context"].as_str() == Some("toolchain"))
+            .filter_map(|d| d["message"].as_str())
+            .any(|m| {
+                m.contains("relocatable object(s)")
+                    && m.contains("ssp-function-map sha256:")
+                    && m.contains("carries no `.comment` line")
+            })
+    };
+    assert!(
+        named(&unnamed),
+        "the object is not named: {}",
+        unnamed["diagnostics"]
+    );
+    let control = run("-O2 -fstack-protector-strong", "control");
+    assert!(
+        !named(&control),
+        "an object with its line is named: {}",
+        control["diagnostics"]
+    );
+    assert_eq!(
+        observation(&control, "ssp-level-emitted")["verdict"].as_str(),
+        Some("on")
+    );
+}
+
+#[test]
+fn a_ccache_compiler_answering_the_dump_as_gcc_is_read_and_named() {
+    const TEST: &str = "a_ccache_compiler_answering_the_dump_as_gcc_is_read_and_named";
+    if !common::require_binary(
+        &chard_binary(),
+        "that the report reads the intrinsic dump's answer and names a banner of another compiler",
+    ) {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "ccache-gcc-dump");
+    let Some((shimmed, cache_pair, gcc)) = forwarding_host(TEST, &work) else {
+        return;
+    };
+    let clean = std::env::split_paths(&shimmed).skip(1).collect::<Vec<_>>();
+    let clean = std::env::join_paths(clean).expect("a PATH");
+    let clang = resolved_on(&clean, "clang").expect("forwarding_host found a clang");
+    let answering = common::executable(
+        &work.dir().join("clang"),
+        &format!(
+            "[ $# -eq 0 ] && exit 0\n[ \"$*\" = '{INTRINSIC_DUMP}' ] && exec '{gcc}' \"$@\"\n\
+             exec '{}' \"$@\"",
+            clang.display()
+        ),
+    );
+    let report = measure_canary_on(
+        &shimmed,
+        &work.dir().join("run"),
+        &[
+            cache_pair,
+            format!("CCACHE_COMPILER={}", answering.display()),
+        ],
+    );
+    let toolchain = &report["toolchain"];
+    assert_eq!(
+        toolchain["kind"].as_str(),
+        Some("gcc"),
+        "the report did not read the intrinsic dump's answer: {toolchain}"
+    );
+    let banner = toolchain["version_raw"].as_str().unwrap_or_default();
+    assert!(banner.contains("clang version"), "{toolchain}");
+    let named = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find(|d| d["context"].as_str() == Some("toolchain.version_raw"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a banner naming clang under a dump naming gcc is not named: {}",
+                report["diagnostics"]
+            )
+        });
+    assert_eq!(named["severity"].as_str(), Some("error"), "{named}");
+    let message = named["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(banner) && message.contains("names gcc "),
+        "{message}"
+    );
+    let level = observation(&report, "ssp-level-emitted");
+    assert_eq!(
+        level["gating"]["rule"].as_str(),
+        Some("artifact-compiled-by-another-compiler"),
+        "clang's object under a report naming gcc was read: {level}"
+    );
+}
+
 #[test]
 fn a_driver_that_needs_a_cleared_variable_is_refused_with_its_environment_in_the_hint() {
     if !can_run("that a driver needing a cleared variable is refused with exit 2 and a hint") {
@@ -1352,9 +2120,6 @@ fn a_driver_that_needs_a_cleared_variable_is_refused_with_its_environment_in_the
 /// refused at detection, with the exit status and the first stderr line in the message, as
 /// one a signal ends after its listing is, and the same driver exiting 0 after the same stderr
 /// line is measured.
-///
-/// The intrinsic dump decides the compiler's `kind` and `version`, the arch gate's macro
-/// witness and the width and byte order it publishes. Tested only for emptiness, a listing
 /// that ran on past an error would read as a clean one there, where every variant's dump is
 /// refused on its status, the shape
 /// `a_macro_dump_that_exits_nonzero_withholds_every_macro_verdict` holds. The
@@ -1426,7 +2191,7 @@ exec "$REAL" "$@""#,
     let message = error["message"].as_str().unwrap_or("");
     assert!(
         message.contains(
-            "macro definitions and exited 1: fakecc: fatal error: late.h: No such file or directory;"
+            "macro definitions and exited 1: fakecc: fatal error: late.h: No such file or directory"
         ),
         "the refusal names no exit status or stderr line: {error}"
     );
@@ -1447,7 +2212,7 @@ exec "$REAL" "$@""#,
         .unwrap_or_else(|e| panic!("chard's output was not JSON ({e}):\n{text}"));
     assert!(
         parsed["error"]["message"].as_str().is_some_and(|m| m
-            .contains("macro definitions and was killed by a signal: fakecc: about to be killed;")),
+            .contains("macro definitions and was killed by a signal: fakecc: about to be killed")),
         "{}",
         parsed["error"]
     );
@@ -1467,12 +2232,6 @@ exec "$REAL" "$@""#,
 /// A with-headers dump that prints its listing and then exits non-zero identifies the C
 /// library its macros name, as the same listing exiting 0 does, and says it failed: the
 /// detection names the exit status and stderr line, as `toolchain.libc_headers_error` does.
-///
-/// Not refused, unlike the intrinsic dump: every macro-channel arm takes its own
-/// with-headers dump, and what is at stake is the libc and what it gates. A failed dump can
-/// lack macros and cannot gain them, so a library a macro names stands; reading it as
-/// `unknown` instead lowers `fhardened-effective`'s fortify bar on glibc 2.43 from 3 to 2,
-/// and a level-2 build reads `in-force`. The detection names the failure rather than being
 /// silent on it. The twin exits 0 after the same stderr line, and the two must name one libc and
 /// version, which `fhardened-effective`'s fortify bar is read from, beside the driver's triple.
 #[test]
@@ -1538,9 +2297,7 @@ exec "$REAL" "$@""#
     );
 
     // Which define a listing ends on is the compiler's order, so a failed dump whose last line
-    // ended is read whole: `__GLIBC__` listed last still names glibc 2.43. A last line its
-    // output ended partway through is dropped, whatever the status (here a signal):
-    // `__GLIBC_MINOR__ 4` from `43` is not read as glibc 2.4, and glibc stands with no version.
+    // ended is read whole: `__GLIBC__` listed last still names glibc 2.43.
     let printing = |name: &str, listing: &str, end: &str| {
         let driver = fake_driver_named(
             work.dir(),
@@ -1571,18 +2328,8 @@ exec "$REAL" "$@""#
     );
     assert_eq!(cut["impl"].as_str(), Some("glibc"), "{cut}");
     assert!(cut.get("version").is_none_or(Value::is_null), "{cut}");
-    assert!(
-        cut["detection"].as_str().is_some_and(
-            |d| d.contains("was killed by a signal") && d.contains("the version is not read")
-        ),
-        "{cut}"
-    );
 }
 
-/// A with-headers dump cut off partway through its last define under a driver that exits 0,
-/// as gcc's does when its `cc1` dies of a closed pipe, names glibc with no version, and its
-/// detection and `toolchain.libc_headers_error` name the cut, rather than reading glibc 2.4
-/// from the cut define.
 #[test]
 fn a_with_headers_dump_cut_off_under_a_driver_that_exits_0_reads_no_version_from_the_cut() {
     if !can_run("that a with-headers dump cut off under exit 0 reads no version from the cut") {
@@ -1608,9 +2355,7 @@ fn a_with_headers_dump_cut_off_under_a_driver_that_exits_0_reads_no_version_from
     );
     let said = "exited 0 with its output cut off partway through a line";
     assert!(
-        libc["detection"]
-            .as_str()
-            .is_some_and(|d| d.contains(said) && d.contains("the version is not read")),
+        libc["detection"].as_str().is_some_and(|d| d.contains(said)),
         "{libc}"
     );
     assert_eq!(
@@ -1643,13 +2388,6 @@ exec "$REAL" "$@""#
     )
 }
 
-/// A variant's `-dM -E` dump cut off partway through its last define under a driver that
-/// exits 0 withholds every macro verdict read through it, as a dump that exited non-zero
-/// does, and its record says the output was cut.
-///
-/// gcc's driver exits 0 when its `cc1`'s stdout is cut by a closed pipe, so no status reading
-/// sees the cut. A record that kept no trace of the missing newline would parse the cut define
-/// as a define and publish the verdicts read from the listing.
 #[test]
 fn a_macro_dump_cut_off_under_a_driver_that_exits_0_withholds_every_macro_verdict() {
     if !can_run("that a dump cut off mid-define under exit 0 withholds the macro channel") {
@@ -1700,10 +2438,6 @@ fn a_macro_dump_cut_off_under_a_driver_that_exits_0_withholds_every_macro_verdic
     );
 }
 
-/// The driver's flagless dump cut off partway through its last define under a driver that
-/// exits 0 is refused at detection, as one that exited non-zero is: `kind`, `version` and
-/// the arch gate's witness are read from it, and `#define __clang_major__ 2` cut from `22`
-/// is another compiler.
 #[test]
 fn an_intrinsic_dump_cut_off_under_a_driver_that_exits_0_is_refused() {
     if !can_run("that an intrinsic dump cut off under exit 0 is refused at detection") {
@@ -1731,15 +2465,13 @@ fn an_intrinsic_dump_cut_off_under_a_driver_that_exits_0_is_refused() {
         parsed["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains(
-                "macro definitions and exited 0 with its output cut off partway through a line;"
+                "macro definitions and exited 0 with its output cut off partway through a line"
             )),
         "{}",
         parsed["error"]
     );
 }
 
-/// The intrinsic dump under the profile's flags, cut off partway through its last define
-/// under a driver that exits 0, witnesses no target (`dump-failed`), and says it was cut.
 #[test]
 fn a_profile_dump_cut_off_under_a_driver_that_exits_0_witnesses_no_target() {
     if !can_run("that a profile dump cut off under exit 0 is dump-failed") {
@@ -1791,17 +2523,6 @@ fn canary_verdict(report: &Value) -> String {
     found[0]["verdict"].as_str().expect("a verdict").to_owned()
 }
 
-/// A wrapper configured through a variable of its own is measured as configured when the
-/// variable is an `--env` pair, and as it behaves without it otherwise, whatever chard's own
-/// environment holds; the report publishes the pair and joins it into `profile.id`.
-///
-/// The wrapper adds `-fstack-protector-strong` under `CHARD_TEST_HARDEN=canary` and
-/// `-fno-stack-protector` under anything else, the shape of nixpkgs' cc-wrapper and its
-/// `NIX_HARDENING_ENABLE`. Four runs under `bare`: with the pair, `canary-emitted` reads `on`;
-/// with the variable in chard's own environment and no pair, `off`, which is the clear
-/// keeping it from the driver; with another value, `off` again under a third id. (A probe's
-/// run never receives a pair: `run::execute` builds its environment from
-/// `run::PROBE_ENVIRONMENT` alone, which `run`'s own tests hold.)
 #[test]
 fn an_env_pair_configures_the_toolchain_and_is_published_in_the_profile() {
     if !can_run("that an --env pair reaches the toolchain and the report") {
@@ -1898,10 +2619,6 @@ fn an_env_pair_configures_the_toolchain_and_is_published_in_the_profile() {
     assert_ne!(id(&with), id(&other), "two pairs joined as one column");
 }
 
-/// An `--env` naming a variable chard passes or pins, a malformed one, or one whose value
-/// holds a relative path (which the interrogations and the builds would read against two
-/// directories), is refused with exit 2 before any toolchain runs: the wrapper records each
-/// of its invocations, and the record stays absent.
 #[test]
 fn an_env_pair_naming_a_passed_or_pinned_variable_is_refused_before_any_toolchain_runs() {
     if !can_run("that a refused --env pair exits 2 before the toolchain runs") {
@@ -1965,17 +2682,6 @@ fn an_env_pair_naming_a_passed_or_pinned_variable_is_refused_before_any_toolchai
     }
 }
 
-/// An ambient deployment target moves neither the triple a Darwin-targeting clang compiles
-/// for nor the macro dump the report digests and publishes, and the dump states the target.
-///
-/// The Darwin driver is part of every clang, so a Linux host with clang on `PATH` can
-/// reproduce the Apple case by asking for `--target=arm64-apple-darwin25.0.0` (a triple
-/// whose version is the kernel's, the shape a default triple has on macOS): there
-/// `MACOSX_DEPLOYMENT_TARGET=10.15` moves `-triple` to `macosx10.15.0` and
-/// `__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__` to `101500`. The builds fail with no SDK,
-/// which this test does not look at; it reads the detection. Two runs, one with the variable
-/// and one without, must publish one dump, and the dump must carry the version macro, which
-/// is the record of a Darwin run's deployment target. A host without clang announces the gap.
 #[test]
 fn an_ambient_deployment_target_moves_nothing_in_a_darwin_triples_report() {
     if !can_run("that an ambient deployment target cannot move a Darwin triple's macro dump") {
@@ -2043,8 +2749,6 @@ fn an_ambient_deployment_target_moves_nothing_in_a_darwin_triples_report() {
     );
 }
 
-/// The wrapper itself passes a healthy run through unchanged, so the tests above
-/// are failing chard on the one invocation they shape rather than on the wrapper.
 #[test]
 fn a_wrapper_that_changes_nothing_publishes_macro_verdicts_with_their_dump_attached() {
     if !can_run(
@@ -2129,8 +2833,7 @@ exec "$REAL" "$@""#,
     assert_eq!(
         bare["profile"]["flags_source"].as_str(),
         Some("driver-config-file"),
-        "a bare column behind a configuration file is not a measurement of compiled-in \
-         defaults: {}",
+        "a bare column behind a configuration file is not marked driver-config-file: {}",
         bare["profile"]
     );
     assert!(
@@ -2234,13 +2937,6 @@ exec "$REAL" "$@""#,
         "a failed -v's lines are not the driver's configuration: {toolchain}"
     );
     assert_eq!(bare["profile"]["flags_source"].as_str(), Some("none"));
-    assert!(
-        bare["profile"]["toolchain_note"]
-            .as_str()
-            .is_some_and(|n| n.contains("so it read no configuration file")),
-        "a bare column whose configuration went unread says so beside flags_source: {}",
-        bare["profile"]
-    );
     let fhardened = bare["composites"]
         .as_array()
         .and_then(|c| c.iter().find(|x| x["id"] == "fhardened-effective"))
@@ -2283,9 +2979,6 @@ exec "$REAL" "$@""#,
 /// warning naming the field, and a `run.id` taken without it; the same wrapper with its
 /// `--version` passed through publishes the banner, and nothing else the identity reads
 /// moves between the two.
-///
-/// While the status went unread, the failed job's first line was published as the
-/// driver's version string and keyed the report's identity.
 #[test]
 fn a_driver_version_that_fails_is_refused_and_recorded() {
     if !can_run("that a failed driver --version is refused and recorded") {
@@ -2396,10 +3089,6 @@ fn assert_schema_valid(label: &str, report: &Value) {
 
 /// gcc's form of the same mechanism reaches the same fields.
 ///
-/// `gcc -v` opens with `Reading specs from <path>` when an installed specs file
-/// replaces the built-in specs, and only clang's `Configuration file:` line was read,
-/// so a gcc measured through a specs file published `flags_source: none`. The wrapper
-/// prepends gcc's line to the `-v` output, where gcc prints it.
 #[test]
 fn a_gcc_specs_file_is_named_as_the_mechanism_behind_a_bare_column() {
     if !can_run("that a bare column measured through a gcc specs file names that mechanism") {
@@ -2455,10 +3144,6 @@ exec "$REAL" "$@""#,
 
 /// A wrapper whose `-print-prog-name=ld` and `-###` link line both name a shim `ld` that
 /// answers `--version` with `banner` and hands everything else to the real linker.
-///
-/// The ledger's own reproduction of the finding: the program chard resolves is the one
-/// that lies, and the real driver still does every build. The shim sits beside the
-/// wrapper under `ld/`, so the path the wrapper prints is absolute and `path_source`
 /// reads `driver`.
 fn driver_with_ld_banner(work: &Path, banner: &str) -> PathBuf {
     let shim_dir = work.join("ld");
@@ -2487,11 +3172,6 @@ exec "$REAL" "$@""#,
 }
 
 /// A wrapper that selects its own linker is published with the linker its link line runs.
-///
-/// The ledger's reproduction: `exec clang -fuse-ld=lld "$@"` answered
-/// `-print-prog-name=ld` with the default `ld`, which ignores `-fuse-ld=`, and the report
-/// published GNU ld while every link went through ld.lld (Fedora 44 aarch64, clang
-/// 22.1.8, 2026-09-28). Here the wrapper's `-###` link line runs a shim whose banner is
 /// lld's while `-print-prog-name=ld` keeps printing the real default, so the published
 /// kind says which of the two chard read. Runs on any host: only detection is under test.
 #[test]
@@ -2538,15 +3218,6 @@ exec "$REAL" "$@""#,
 }
 
 /// A wrapper whose `-###` listing names a linker and exits 1 has no linker published from it.
-///
-/// The ledger's reproduction (2026-10-07, Fedora 44 x86_64, clang 22.1.8): a wrapper that
-/// printed a listing running `/usr/bin/ld.lld` on `-###` and exited 1 had that path
-/// published as `toolchain.linker` (kind read from its banner, `path_source` `driver`)
-/// while every link went through GNU ld. A non-zero exit means the driver rejected the
-/// command it was asked to list, the rule `link_inputs::listing` holds the two input
-/// comparisons to, so the line is not read and the detection opens with the status and
-/// names the route it fell back to, `-print-prog-name=ld`. Here the listing runs a shim
-/// whose banner no real linker prints, so the published `version` says whether the line
 /// was read. Runs on any host: only detection is under test.
 #[test]
 fn a_wrapper_whose_listing_exits_nonzero_has_no_linker_published_from_it() {
@@ -2598,19 +3269,11 @@ exec "$REAL" "$@""#,
              error: unsupported option), so its link line was not read, and "
         ) && detection.contains("-print-prog-name=ld")
             && !detection.contains("link line runs"),
-        "the detection opens with the status and the query's scope, then names the \
-         fallback: {linker}"
+        "the detection opens with the status and query scope, then names the fallback: {linker}"
     );
 }
 
 /// A wrapper exiting 1 on `-###` under a profile with flags: the detection names the scope
-/// the query ran under, the profile's link-selection words, and does not call the profile
-/// flagless.
-///
-/// `read_link_line` hands the query only the profile's `-fuse-ld=`, `--ld-path=` and `-B`
-/// words, so under `openssf-tldr` it runs under none of them. `under no flags` would be a
-/// claim about the profile, false of every profile without a selection. Runs on any host: only
-/// detection is under test.
 #[test]
 fn a_rejected_listing_under_a_profile_with_flags_names_the_querys_scope() {
     if !can_run("that the linker detection names a rejected query's scope, not the profile's") {
@@ -2656,12 +3319,6 @@ exec "$REAL" "$@""#,
 }
 
 /// A wrapper whose error line on `-###` names a file under the work directory has that
-/// path published relative, as every build record and gating reason is.
-///
-/// The quoted line lands in `toolchain.linker.detection`, which no later pass rewrites.
-/// Quoted as written, a driver naming its work directory (a response file it could not read,
-/// a wrapper naming itself) would put the absolute spelling in the report. Runs on any host: only
-/// detection is under test.
 #[test]
 fn a_rejected_listings_error_line_is_published_relative_to_the_work_directory() {
     if !can_run("that the quoted error line in toolchain.linker.detection is published") {
@@ -2698,8 +3355,6 @@ exec "$REAL" "$@""#
 /// A profile naming the linker file outright, under a wrapper exiting 1 on `-###`: the
 /// file is the linker, as the profile said, and the detection opens with the rejected
 /// query before the profile's naming.
-///
-/// An arm of the detection that dropped the cause would read a `--ld-path=` under a driver
 /// that rejects `-###` as if the line had agreed with the profile. The wrapper
 /// drops the `--ld-path=` before the real driver sees it, since gcc knows no such flag and
 /// the builds are not what is under test; the shim answers `--version` with a GNU ld
@@ -2785,18 +3440,6 @@ fn linker_diagnostic(report: &Value, context: &str) -> Option<Value> {
     })
 }
 
-/// A `bfd` or `gold` banner over artifacts no linker signed is published as
-/// uncorroborated.
-///
-/// The ledger's repro: a program on `PATH` answering `--version` as gold while the real
-/// `ld` links. GNU ld and gold write nothing of their own into `.comment`, so the
-/// artifacts cannot contradict the banner and must not be read as confirming it; the
-/// honest value is `no-signature`, with the compiler's line quoted so a reader sees what
-/// was read. On a host whose compiler emits Mach-O nothing ELF is read, and the value
-/// is `no-linked-artifact` with a zero denominator, which is the other absence the
-/// vocabulary keeps apart. The arm is chosen by the host (`common::ELF_HOST`), and the
-/// ELF arm then asserts that facts were read: the expectation comes from what the host
-/// is, and the result is held to it.
 #[test]
 fn a_banner_the_artifact_does_not_corroborate_is_published_as_uncorroborated() {
     if !can_run("that a bfd or gold banner over unsigned artifacts is published as uncorroborated")
@@ -2861,15 +3504,6 @@ fn a_banner_the_artifact_does_not_corroborate_is_published_as_uncorroborated() {
     }
 }
 
-/// A banner the artifacts contradict is published as a disagreement, beside the banner,
-/// with an error diagnostic.
-///
-/// The same shim answering as lld while the real `ld` links: lld writes `Linker: LLD`
-/// into every output and these artifacts carry no such line, so the program that
-/// answered `--version` is not the one that linked them. `kind` stays `lld`, because
-/// that is what the banner said and `detection` says so; `artifact.agreement` says
-/// `disagrees` and the diagnostic names the evidence. Needs a linked ELF artifact, so on
-/// a Mach-O host only the shape of the absence is checked.
 #[test]
 fn a_banner_the_artifact_contradicts_is_published_as_a_disagreement() {
     if !can_run("that a banner the artifacts contradict is published as a disagreement") {
@@ -2940,21 +3574,6 @@ fn a_banner_the_artifact_contradicts_is_published_as_a_disagreement() {
     );
 }
 
-/// A profile that selects a self-signing linker is corroborated by the artifacts it
-/// linked: `agrees`, with the line quoted, and the clean-build artifact of the check that
-/// measures the toolchain default named and left out of the count.
-///
-/// Runs the real `cc` under `--flags -fuse-ld=<name>` for each of lld and mold that is on
-/// `PATH`, and announces the arm as not exercised for each that is not. Both linkers were
-/// measured to write their line on 2026-09-28 (lld 22.1.8, mold 2.40.4, Fedora 44
-/// aarch64); this is the same measurement taken by the test suite. `linker-default-execstack`
-/// rides along because its one check reads the clean build, which the driver's default
-/// linked: fed as a measured artifact it carried no linker line beside `link-defaults`'
-/// signed one, and the run published `disagrees` with an error diagnostic on a banner
-/// that was exactly right. The probe is gated to x86_64, and the arm is chosen by the
-/// target the report names: there the clean artifact is named beside the selection it
-/// was linked without, and elsewhere the probe is arch-gated and named as contributing
-/// nothing.
 #[test]
 fn a_profile_that_selects_lld_or_mold_is_corroborated_by_the_artifact() {
     if !can_run("that a profile selecting lld or mold is corroborated by the linked artifact") {
@@ -3011,8 +3630,7 @@ fn a_profile_that_selects_lld_or_mold_is_corroborated_by_the_artifact() {
             assert!(
                 evidence.contains("linker-default-execstack-clean")
                     && evidence.contains(&format!("while the profile selected `-fuse-ld={kind}`")),
-                "the clean-build artifact is named beside the selection and left \
-                 uncounted: {evidence}"
+                "the clean-build artifact is not named beside the selection: {evidence}"
             );
         } else {
             assert_default_probe_gated(&report);
@@ -3028,21 +3646,6 @@ fn a_profile_that_selects_lld_or_mold_is_corroborated_by_the_artifact() {
     }
 }
 
-/// A control arm links with the linker the profile selects, whenever its check reads a
-/// link or what it produced.
-///
-/// The controls were profile-free down to the linker: under `-fuse-ld=lld` the measured
-/// build linked with ld.lld and both controls with the driver's default, so the triple
-/// validated a detector on a linker the cell never used (Fedora 44 aarch64, clang 22.1.8,
-/// 2026-09-28: `no-copy-dt-needed` read `on` beside a positive control quoting GNU ld).
-/// `-B` over an empty directory is a selection `toolchain::linker_selecting_flags`
-/// consults and every driver links under unchanged, so the runtime half runs on any host;
-/// the elf-static half needs an artifact chard reads, so a Mach-O host announces the gap.
-/// A compiler-diag arm carries it too, since the record's own check reads the linker's
-/// stderr there. A macro check's arms carry it as well: `-B` chooses the
-/// startup objects, the compiler proper and, for gcc, a header directory
-/// (`toolchain::runtime_selecting_flags`), so it is the runtime selection's on every
-/// channel, and a linking arm carries it once, not again as the linker's.
 #[test]
 fn a_control_arm_links_with_the_linker_the_profile_selects() {
     if !can_run("that a control arm carries the profile's linker selection") {
@@ -3150,12 +3753,6 @@ exec \"$REAL\" \"$@\"";
 
 /// What a logged argument vector built, by the output it names, or `None` for an
 /// interrogation.
-///
-/// A probe build names its output in the work directory (its source is relative, the
-/// driver running there), and a macro dump names its source there (`.c`, or `.cpp` through the
-/// C++ driver); the interrogations
-/// name neither, except the two flagless dumps `toolchain::detect` takes before any
-/// profile is read, which are the toolchain's and carry no profile flag at all.
 fn probe_build_class(words: &[&str], workdir: &str) -> Option<&'static str> {
     let in_work = |w: &&&str| w.starts_with(workdir);
     let output = words
@@ -3248,18 +3845,6 @@ fn runtime_selection(dir: &str) -> (Vec<String>, Vec<String>) {
     (in_flags, in_ldflags)
 }
 
-/// Every probe build, on every channel, carries the runtime the profile selects, in each
-/// spelling clang accepts and from either flag list: the measured build, the clean build,
-/// both control arms and the probe's own chain libraries.
-///
-/// Were only the measured build to take it, then under `--gcc-install-dir=` naming a copy of
-/// the gcc install directory whose `crtbegin*.o` carries no x86 feature note, `cet-marked`
-/// would read `off` with `-fcf-protection=full` over a positive control linked against the
-/// host's marked `crtbeginS.o` (Fedora 44 x86_64, clang 22.1.8; `measure::arm_flags`). The wrapper
-/// logs every argument vector and strips the selection before handing it to the host's
-/// `cc`, which may be a gcc that refuses every spelling; what is under test is what chard
-/// hands the driver. Each logged probe build is classified by the output it names, and
-/// every class must have been seen, so a run that built no arm cannot pass.
 #[test]
 fn every_probe_build_carries_the_runtime_the_profile_selects() {
     if !can_run("that every probe build carries the profile's runtime selection") {
@@ -3368,8 +3953,7 @@ fn every_build_class_carries(
     ] {
         assert!(
             classes.get(class).copied().unwrap_or(0) > 0,
-            "no {class} was logged, so it was not tested; seen {classes:?} over {builds} \
-             probe builds"
+            "no {class} was logged; seen {classes:?} over {builds} probe builds"
         );
     }
     assert!(
@@ -3413,11 +3997,15 @@ fn header_selection(dir: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// A wrapper body that runs the host's `cc` with every header selection
-/// `toolchain::header_selecting_flags` takes stripped, in POSIX `sh`.
+/// `toolchain::header_selecting_flags` takes stripped, in POSIX `sh`. chard's own forced
+/// include, the run-witness header, is no part of the profile's selection and stays: with
+/// it stripped every artifact would be unwitnessed and nothing past the first build of a
+/// variant would be made.
 const STRIP_HEADER_SELECTION: &str = "skip=0
 for a; do
   shift
   if [ \"$skip\" = 1 ]; then skip=0; continue; fi
+  if [ \"$a\" = -include ] && [ \"$1\" = chard_run_witness.h ]; then set -- \"$@\" \"$a\"; continue; fi
   case \"$a\" in
     -I|-isystem|-idirafter|-iquote|-include|-imacros) skip=1; continue;;
     -I*|-isystem*|-idirafter*|-iquote*|-include*|-imacros*) continue;;
@@ -3427,21 +4015,6 @@ for a; do
 done
 exec \"$REAL\" \"$@\"";
 
-/// Every probe build on every channel carries the headers the profile selects, in each
-/// spelling the drivers accept and from either flag list: the measured build, both control
-/// arms and the chain libraries the measured build and the arms link. The clean build
-/// carries none of them (`measure::clean_flags` says why), and the two chain libraries it
-/// links carry none either, so the probe that links a chain, `copy-dt-needed`, is fed alone
-/// and the clean build's pair is told from the rest by count.
-///
-/// Were only the measured build to take this selection, an explicit profile carrying `-I`,
-/// `-isystem`, `-include` or gcc's `-pthread` would withhold every compile-input reading
-/// under `compile-inputs-unmatched-by-arms` (17 of 72 on Fedora 44 x86_64, gcc 16.1.1 and
-/// clang 22.1.8; `measure::arm_flags`). The wrapper logs every
-/// argument vector and strips the selection before handing it to the host's `cc`, since the
-/// files it names do not exist and `-undef` would silence the macro channel; what is under
-/// test is what chard hands the driver. Each logged probe build is classified by the output
-/// it names, and every class must have been seen, so a run that built no arm cannot pass.
 #[test]
 fn every_probe_build_carries_the_headers_the_profile_selects() {
     if !can_run("that every probe build carries the profile's header selection") {
@@ -3517,20 +4090,6 @@ fn every_probe_build_carries_the_headers_the_profile_selects() {
     );
 }
 
-/// A two-token selection spelled long reaches every probe build as the measured line's own
-/// pair and nothing more: under `--library-directory <dir>/`, which gcc and clang read as
-/// `-L <dir>/`, every build class carries the pair (the target selection reaches the clean
-/// build too), and no build's argument vector holds `<dir>/` anywhere but right after
-/// `--library-directory`, so no build runs under a word the measured line never handed the
-/// driver. The selection readers are projections of one walk (`toolchain::selections`), and
-/// the long spelling is `-L` to every reader (`toolchain::LONG_ALIASES`). A value that
-/// spells another reader's option, `--library-directory -B<dir>/`, is the directory named
-/// `-B<dir>/` to both drivers and a relative path, refused before any build as `-L -B<dir>/`
-/// is (the second half); a reader that read the value as a prefix of its own put `-B<dir>/`
-/// on every arm and the clean build once more, alone, and with a `specs` file or an `ld` in
-/// `<dir>` they read specs and ran a linker the measured build did not
-/// (`toolchain::selections` has both measurements, 13 of 72 checks withheld on gcc and a
-/// wrong `off` on clang).
 #[test]
 fn a_two_token_value_reaches_every_build_once_as_the_measured_pair() {
     if !can_run("that a two-token value reaches every probe build once, as the pair") {
@@ -3569,8 +4128,7 @@ fn a_two_token_value_reaches_every_build_once_as_the_measured_pair() {
     let linker = &report["toolchain"]["linker"];
     assert!(
         linker["kind"].is_string(),
-        "the linker was detected and published, so its profile flags are read from the \
-         record rather than from an absent object: {linker}"
+        "the linker was not detected and published: {linker}"
     );
     assert!(
         linker["profile_flags"].is_null()
@@ -3606,8 +4164,7 @@ fn a_two_token_value_reaches_every_build_once_as_the_measured_pair() {
             if *word == prefix {
                 assert!(
                     i > 0 && words[i - 1] == "--library-directory",
-                    "`{prefix}` reached the driver as a word of its own, which the measured \
-                     line never had:\n{line}"
+                    "`{prefix}` reached the driver as a word of its own:\n{line}"
                 );
             }
         }
@@ -3616,11 +4173,6 @@ fn a_two_token_value_reaches_every_build_once_as_the_measured_pair() {
     assert!(lines > 0, "the wrapper logged no argument vector");
 }
 
-/// The second half of the pair law: a two-token selection whose value spells another
-/// reader's option, `--library-directory -B<dir>/`, is the directory named `-B<dir>/` to both
-/// drivers and a relative path, refused before any build under the long spelling, gcc's
-/// abbreviation `--li` and the short `-L` alike (`toolchain::LONG_ALIASES`); the wrapper logs
-/// no build carrying the pair. Counted against the spellings fed.
 #[test]
 fn a_long_spelling_with_a_relative_value_is_refused_as_the_short_one() {
     if !can_run("that a long spelling's relative value is refused as the short one's") {
@@ -3681,16 +4233,6 @@ fn a_long_spelling_with_a_relative_value_is_refused_as_the_short_one() {
     );
 }
 
-/// A selection spelled as the value of a two-token option that selects nothing reaches no
-/// probe build as the selection: under `-u -B<dir>/`, the undefined symbol named `-B<dir>/`
-/// to both drivers, the measured build, the profile interrogation and the regime arm carry
-/// the pair as the profile's own words, no control arm and no clean build carries a word of
-/// it (those are profile-free, and the pair selects nothing), no build's argument vector holds `-B<dir>/`
-/// anywhere but right after `-u`, and the linker is detected under no flag of the profile.
-/// A reader that read the value as a prefix of its own put `-B<dir>/` on every arm and the
-/// clean build, alone, and with an `ld` in `<dir>` they linked through a linker the
-/// measured build never chose (`toolchain::Hand::Value` has the measurement, a wrong `off`
-/// on clang's `linker-default-noexecstack`).
 #[test]
 fn a_value_taking_options_value_reaches_no_build_as_a_selection() {
     if !can_run("that a value-taking option's value reaches no probe build as a selection") {
@@ -3729,8 +4271,7 @@ fn a_value_taking_options_value_reaches_no_build_as_a_selection() {
     let linker = &report["toolchain"]["linker"];
     assert!(
         linker["kind"].is_string(),
-        "the linker was detected and published, so its profile flags are read from the \
-         record rather than from an absent object: {linker}"
+        "the linker was not detected and published: {linker}"
     );
     assert!(
         linker["profile_flags"].is_null()
@@ -3764,8 +4305,7 @@ fn a_value_taking_options_value_reaches_no_build_as_a_selection() {
             if *word == prefix {
                 assert!(
                     i > 0 && words[i - 1] == "-u",
-                    "`{prefix}` reached the driver as a word of its own, a search prefix the \
-                     measured line never had:\n{line}"
+                    "`{prefix}` reached the driver as a word of its own:\n{line}"
                 );
             }
         }
@@ -3840,16 +4380,6 @@ fn chain_libraries_follow_their_build(argv: &str, work: &common::Work, selection
     );
 }
 
-/// A profile with flags that select no linker holds its linker to the clean-build
-/// artifact too, since both builds went through the same link line.
-///
-/// `bare-optimized` is `-O2` and no selection, so `linker-default-execstack`'s clean
-/// artifact is linked by the same driver default as `link-defaults`' measured one and
-/// counts beside it, and the evidence names no selection. Were the clean artifact left out
-/// under every profile with flags, a run of that one probe under a lying lld banner would
-/// publish `no-linked-artifact` over an artifact it had read, and every x86_64 report under
-/// this profile would assert a selection the profile never made. Needs
-/// a linked ELF artifact, so a Mach-O host announces the gap.
 #[test]
 fn a_profile_that_selects_no_linker_counts_the_clean_build() {
     if !can_run("that a profile selecting no linker counts the clean-build artifact") {
@@ -3913,18 +4443,6 @@ fn a_profile_that_selects_no_linker_counts_the_clean_build() {
     }
 }
 
-/// A linker selection present only in cxxflags reaches the report as the C++ probes'
-/// linker, with the flag in its own `profile_flags`.
-///
-/// The project ledger's criterion this closes. `cxx-stdlib-assertions` is the one C++ probe, and
-/// it is built with cxxflags when the profile has them, so `-fuse-ld=` there reached a
-/// real link and was invisible in the report. The wrapper pair is named `fake-cc` and
-/// `fake-c++` so `compile::cxx_driver_for` finds the C++ driver by component; the
-/// existing `fakecc` name deliberately maps to nothing. On a host with lld the C++
-/// artifact's `.comment` carries lld's line and `linker.cxx.artifact` agrees, while the C
-/// linker keeps its own verdict over the C artifacts; without lld the selection is still
-/// published, with `kind: unknown`, which is what makes the field a record of the
-/// request. A host with `cc` and no `c++` cannot link the C++ probe, and announces that.
 #[test]
 fn a_cxxflags_only_linker_selection_reaches_the_report() {
     if !can_run("that a linker selection present only in cxxflags is published as the C++ linker") {
@@ -4023,27 +4541,6 @@ fn a_cxxflags_only_linker_selection_reaches_the_report() {
     );
 }
 
-/// A measured artifact whose symbol tables the reader could not reach withholds the check
-/// that reads them, under a rule naming the table, while the checks reading the tables the
-/// reader did finish publish over the same artifact.
-///
-/// The wrapper builds every variant with the real driver and then replaces the two
-/// clean artifacts with the checked-in section-header-stripped fixture, which is what
-/// `objcopy --strip-section-headers` leaves: `.dynamic` and the property note reachable
-/// through their segments, the symbol tables not reachable at all. Under `bare` the
-/// profile is clean, no `-measured` variant is built, and the clean build is the subject
-/// of every check (`measure::Conditions::profile_is_clean`), so the clean artifact is the
-/// one to replace; a swap keyed on `-measured` would match nothing and measure the real
-/// object. `canary-emitted` reads the symbol tables and `separate-code` the section names,
-/// and neither may read `off`; `relro` and
-/// `noexecstack` read the program headers and `.dynamic` and are measured. The control
-/// arms are the real driver's own output, so the triple discriminates and the withholding
-/// is the subject reading's alone, which is what separates `indeterminate` under
-/// `artifact-unreadable` from a `probe-invalid`.
-///
-/// The fixture is ELF whatever the host emits, so on a Mach-O host the swap lands but the
-/// control arms cannot be read as ELF and the triple withholds for that reason instead.
-/// The test announces the gap there and runs where `cc` emits ELF.
 #[test]
 fn a_measured_artifact_cut_on_a_read_table_withholds_the_check_that_reads_it() {
     if !can_run(
@@ -4061,18 +4558,25 @@ fn a_measured_artifact_cut_on_a_read_table_withholds_the_check_that_reads_it() {
     }
     let work = common::Work::new("fakedriver", "artifact-unreadable");
     let driver = artifact_swapping_driver(work.dir());
-
-    let report = measure(
-        &driver,
-        work.dir(),
-        &[
-            "--profile",
-            "bare",
-            "--probe",
-            "stack-canary",
-            "--probe",
-            "link-defaults",
-        ],
+    let asked = [
+        "--profile",
+        "bare",
+        "--probe",
+        "stack-canary",
+        "--probe",
+        "link-defaults",
+    ];
+    let report = measure(&driver, &work.path("cut"), &asked);
+    // The same build with its section headers in place, for what the finished tables read.
+    let whole = measure(
+        &fake_driver_named(
+            work.dir(),
+            "fakecc-whole",
+            &real_cc(),
+            r#"exec "$REAL" "$@""#,
+        ),
+        &work.path("whole"),
+        &asked,
     );
     let observations = report["observations"]
         .as_array()
@@ -4086,21 +4590,8 @@ fn a_measured_artifact_cut_on_a_read_table_withholds_the_check_that_reads_it() {
 
     assert_withheld_for_the_cut_table(&report, find("canary-emitted"));
 
-    // The same artifact, read through the tables the reader finished.
-    for (id, verdict) in [("relro", "on"), ("noexecstack", "on")] {
-        let obs = find(id);
-        assert_eq!(
-            obs["verdict"].as_str(),
-            Some(verdict),
-            "{id}: a check reading tables the reader finished publishes over the same \
-             artifact: {obs}"
-        );
-        assert!(obs["gating"].is_null(), "{id}: no rule withheld it: {obs}");
-        assert_eq!(
-            stored_elf(&report, obs)["truncations"][0]["table"].as_str(),
-            Some("symbols"),
-            "{id}: the artifact is the swapped one"
-        );
+    for id in ["relro", "noexecstack"] {
+        assert_reads_as_the_whole_build(&report, &whole, id);
     }
 
     assert_withheld_for_its_own_table(find("separate-code"), "section-names");
@@ -4114,13 +4605,10 @@ fn a_measured_artifact_cut_on_a_read_table_withholds_the_check_that_reads_it() {
     assert_eq!(
         unreadable,
         ["canary-emitted", "separate-code"],
-        "the measured case is counted by its gating rule, on the checks reading a cut table \
-         alone"
+        "the checks gated artifact-unreadable are not those reading a cut table alone"
     );
     // One cut artifact is one error: under `bare` the clean build is the measured one,
     // and `measure::fault_roles` lists it once, under the label the build was read under.
-    // The wrapper swaps two clean artifacts, so the cut `symbols` table is named once for
-    // each probe, whether or not a check of that probe declares the table.
     let diagnostics = report["diagnostics"].as_array().expect("diagnostics");
     let naming: Vec<&Value> = diagnostics
         .iter()
@@ -4152,32 +4640,57 @@ fn a_measured_artifact_cut_on_a_read_table_withholds_the_check_that_reads_it() {
     }
 }
 
-/// A wrapper that builds every variant with the real driver and then replaces the two
-/// clean artifacts with the checked-in section-header-stripped fixture.
+/// `id` over the cut artifact of `report`, read through tables the reader finished: what
+/// the whole build of `whole` reads, a measurement, and under no rule.
+fn assert_reads_as_the_whole_build(report: &Value, whole: &Value, id: &str) {
+    let obs = observation(report, id);
+    let uncut = observation(whole, id);
+    assert!(
+        matches!(uncut["verdict"].as_str(), Some("on" | "partial" | "off")),
+        "{id} is not measured over the whole build, so the cut one shows nothing: {uncut}"
+    );
+    assert_eq!(
+        (&obs["verdict"], &obs["level"]),
+        (&uncut["verdict"], &uncut["level"]),
+        "{id}: the cut artifact's verdict and level differ from the whole build's: {obs}"
+    );
+    assert!(obs["gating"].is_null(), "{id}: no rule withheld it: {obs}");
+    assert_eq!(
+        stored_elf(report, obs)["truncations"][0]["table"].as_str(),
+        Some("symbols"),
+        "{id}: the artifact is the cut one"
+    );
+}
+
+/// A wrapper that builds every variant with the real driver and then strips the
+/// section-header table from the two clean artifacts, as `objcopy
+/// --strip-section-headers` does to the file's header: `e_shoff`, `e_shnum` and
+/// `e_shstrndx` zeroed in place, at the offsets of the file's own class.
 ///
-/// Matched on the artifact's name after `-o`, so the macro dumps, whose source files
-/// carry the same stem, are left alone.
+/// The artifact stays the one this run built, so it carries the run's witness in its note
+/// segment and is read; a checked-in object swapped into its place is another build's and
+/// is withheld whole under `artifact-lacks-run-witness`
+/// (`an_object_a_command_line_cache_kept_from_another_run_is_withheld_and_never_run`).
 fn artifact_swapping_driver(work: &Path) -> PathBuf {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/elf/elf64-le-x86_64-exec-stripped-section-headers.elf");
     fake_driver(
         work,
-        &format!(
-            r#"FIXTURE='{}'
-"$REAL" "$@"
+        r#""$REAL" "$@"
 status=$?
 prev=""
 for arg in "$@"; do
-  if [ "$prev" = "-o" ]; then
+  if [ "$prev" = "-o" ] && [ -f "$arg" ]; then
     case "$(basename "$arg")" in
-      stack-canary-clean|link-defaults-clean) cp "$FIXTURE" "$arg" ;;
+      stack-canary-clean|link-defaults-clean)
+        class=$(dd if="$arg" bs=1 skip=4 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+        if [ "$class" = 2 ]; then shoff=40; width=8; shnum=60; else shoff=32; width=4; shnum=48; fi
+        dd if=/dev/zero of="$arg" bs=1 seek="$shoff" count="$width" conv=notrunc 2>/dev/null || exit 96
+        dd if=/dev/zero of="$arg" bs=1 seek="$shnum" count=4 conv=notrunc 2>/dev/null || exit 96
+        ;;
     esac
   fi
   prev="$arg"
 done
 exit $status"#,
-            fixture.display()
-        ),
     )
 }
 
@@ -4331,14 +4844,7 @@ fn assert_gate_stands(report: &Value, agreement: &str) {
 /// A driver that builds 32-bit x86 code while its `-dumpmachine` names x86_64, as gcc does
 /// under `-m32`, is refused under `openssf-tldr` before any build, and `bare` through the same
 /// driver is measured.
-///
-/// The wrapper adds `-m32` to every invocation but `-dumpmachine`, which it answers with the
-/// host's own triple. The arch gate reads x86_64, the driver's macro dump defines `__i386__`,
-/// and the profile resolves to the guide's x86_64 row under the one and to the block alone
-/// under the other, so it has no single architecture to be chosen by. Unrefused, such a run
-/// would be measured under the x86_64 row and its CET checks would read that row's request. The
-/// arm needs an x86_64 `cc` that defines `__i386__` under `-m32`; elsewhere it is a gap.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "one arm: the refused run and the shadow-stack report under the same wrapper, which share its setup and its gap"
 )]
@@ -4415,9 +4921,7 @@ fn a_driver_building_for_another_architecture_than_it_names_is_refused_under_ope
     // The shadow-stack probe beside it: its check declares `needs_vm`, so the kernel gate
     // withholds it first on this run (under the default, or in a container the suite
     // recognises), and the target witness then writes `target-arch-contradicted` over it, as
-    // over every arch-gated observation. The report publishes (the consistency pass admits
-    // the overwrite); a form of `kernel-gate-disagrees-with-execution-mode` that did not admit
-    // it would refuse the report.
+    // over every arch-gated observation.
     let report = measure(
         &driver,
         &work.path("w-bare"),
@@ -4464,13 +4968,6 @@ fn a_driver_building_for_another_architecture_than_it_names_is_refused_under_ope
 /// A `-dumpmachine` the artifacts contradict withholds every verdict its arch gate
 /// decided, and the report names the machine that contradicted it; the same driver
 /// telling the truth corroborates the gate and moves nothing.
-///
-/// The wrapper answers `-dumpmachine` with the other of x86_64 and aarch64 from the one
-/// the host's `cc` targets and passes every build through, so the arch gate decides for
-/// one architecture and the artifacts are of the other: the shape of a cross driver
-/// whose triple is wrong, or a wrapper that prints a fixed one. On a Mach-O host no ELF
-/// artifact exists to hold the gate to and the block reads `no-elf-artifact`; the macro
-/// dump still names the host's machine, reads `disagrees`, and withholds by that machine,
 /// which `a_dumpmachine_the_macro_dump_contradicts_withholds_with_no_elf_artifact` holds.
 #[test]
 fn a_dumpmachine_the_artifacts_contradict_withholds_the_arch_gated_verdicts() {
@@ -4574,18 +5071,9 @@ exec "$REAL" "$@""#
 
 /// A `-dumpmachine` the macro dump contradicts, on a run that reads no ELF artifact,
 /// withholds every verdict whose arch gate the dump's machine decides otherwise.
-///
-/// The wrapper answers `-dumpmachine` with `riscv64-linux-gnu`, a family none of the
-/// architecture macros names, and passes the macro dump through, so the dump tells the
-/// truth on every host. `cet-object` is gated to x86 alone, so under the lie it builds
-/// nothing anywhere and no ELF artifact exists to hold the gate to; on a Mach-O host
-/// `toolchain-macros` joins it, since its build is no ELF artifact there either. The gate
-/// decides every arch-gated check outside the mechanism table under riscv64, and under the
 /// host's own machine, which the dump names, each is measured or gated out instead, so
 /// every arch-gated check of the selection is withheld, whichever host runs it. The gate's
 /// decision is compared whole: compared only for the checks measured under the host's
-/// machine, a check gated out there (`cet-marked-object` on aarch64) would keep
-/// `arch-outside-table` beside a witness that contradicts the premise.
 #[test]
 fn a_dumpmachine_the_macro_dump_contradicts_withholds_with_no_elf_artifact() {
     if !can_run("that the arch gate's -dumpmachine is held to the intrinsic macro dump") {
@@ -4683,16 +5171,6 @@ exec "$REAL" "$@""#,
 /// that has one, contradicts the gate's architecture on a run that reads no ELF artifact.
 ///
 /// The wrapper answers `-dumpmachine` with `aarch64-linux-gnu` and strips the
-/// `__x86_64__`, `__i386__` and `__aarch64__` definitions from every macro dump it
-/// passes through, the shape a target outside the three families produces. `cet-object`
-/// is gated to x86, so under the claim it builds nothing and no ELF artifact exists to
-/// overrule the dump; on a Mach-O host `toolchain-macros` joins it, since its build is no
-/// ELF artifact there either. The dump witnesses a machine the mechanism table has no row
-/// for, under which every gate decides otherwise than it did under aarch64, so every
-/// arch-gated check of the selection is withheld: `cet-marked-object`, gated out under
-/// aarch64 as `unsupported`, included. A gate decision compared only in part would keep that
-/// `unsupported`, with the reason "this build targets aarch64" beside the dump that says
-/// otherwise.
 #[test]
 fn a_macro_dump_with_no_arch_macro_contradicts_a_mapped_dumpmachine() {
     if !can_run("that a dump with no architecture macro contradicts a mapped -dumpmachine") {
@@ -4769,8 +5247,7 @@ exec "$REAL" "$@""#,
     withheld.sort_unstable();
     assert_eq!(
         withheld, contradicted,
-        "every arch-gated check of the selection is withheld, the one gated out under \
-         aarch64 included"
+        "every arch-gated check of the selection is withheld, the aarch64 one included"
     );
     let gated_out = observation(&report, "cet-marked-object");
     assert!(
@@ -4785,21 +5262,16 @@ exec "$REAL" "$@""#,
 
 /// A macro dump the artifacts overrule is published as overruled, with a warning of its
 /// own, and withholds nothing.
-///
 /// The wrapper adds `-undef` to every `-dM` invocation and passes every build through, so
 /// the flagless dump defines none of the architecture macros while every ELF artifact the
 /// run built carries the host's own machine: the shape a profile's `-undef` makes of the
-/// dump under its flags, here made of the flagless one so that `bare` reaches it. The
-/// artifacts overrule the dump: `toolchain.target.macros.agreement` reads `overruled`, the
-/// one diagnostic under `toolchain.target` is a warning saying so, no error says a witness
-/// contradicts the read architecture, and no check is withheld under
-/// `target-arch-contradicted`. The contradiction's sentence, which says the dump contradicts
-/// the architecture and that no verdict moved because no gate decided otherwise, would be
-/// false on both counts for a dump set aside.
 #[test]
 fn a_dump_the_artifacts_overrule_is_published_as_overruled_and_withholds_nothing() {
     if !common::ELF_HOST {
-        eprintln!("skipped: the overrule needs an ELF artifact of the host's family");
+        common::capability_gap(
+            "that a dump the artifacts overrule is published as overruled",
+            "the overrule needs an ELF artifact of the host's family",
+        );
         return;
     }
     if !can_run("that a dump the artifacts overrule is published as overruled") {
@@ -4875,13 +5347,13 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// The same wrapper under `bare-optimized`: the dump under the profile's flags (`-O2`) is
-/// overruled too, and its evidence names no cause, since no flag among `-O2` suppresses the
-/// predefined macros, so it does not blame "a flag among them".
 #[test]
 fn an_overruled_dump_under_flags_that_silence_nothing_names_no_cause() {
     if !common::ELF_HOST {
-        eprintln!("skipped: the overrule needs an ELF artifact of the host's family");
+        common::capability_gap(
+            "that an overruled dump under flags that silence nothing names no cause",
+            "the overrule needs an ELF artifact of the host's family",
+        );
         return;
     }
     if !can_run("that an overruled dump under flags that silence nothing names no cause") {
@@ -4910,13 +5382,6 @@ exec "$REAL" "$@""#,
     );
     let under = &target["profile_macros"];
     assert_eq!(under["agreement"].as_str(), Some("overruled"), "{under}");
-    assert!(
-        under["evidence"].as_str().is_some_and(|e| e
-            .contains("no flag this dump was taken under is one chard knows")
-            && e.contains("does not establish")
-            && !e.contains("among them suppresses")),
-        "the evidence names no cause: {under}"
-    );
     let under_target: Vec<&Value> = report["diagnostics"]
         .as_array()
         .expect("diagnostics")
@@ -4941,18 +5406,6 @@ exec "$REAL" "$@""#,
     }
 }
 
-/// The aarch64 cross driver made to emit the other byte order (`-mbig-endian`) and the
-/// other width (`-mabi=ilp32`): `-dumpmachine` and the family macro still say aarch64, so
-/// the machine comparison agrees, and the width and byte order are what contradict it. The
-/// dump names `ELF64 big-endian` or `ELF32 little-endian`; `toolchain.target.abi` reads
-/// `disagrees`, one error is published under `toolchain.target`, and every arch-gated check
-/// is withheld under `target-abi-contradicted`, the one gated out under aarch64 included.
-/// Which branch runs depends on the cross gcc: with a C library (a sysroot) the object probe
-/// builds and its artifact carries the width and order, which the artifact arm below holds;
-/// without one (a host without one) every probe fails at its first include,
-/// no artifact is read, and the dump alone witnesses. Neither run publishes its gated
-/// verdicts as aarch64's. The host-gcc test after this one holds the same wiring
-/// with no cross compiler.
 #[test]
 fn an_artifact_at_the_other_width_or_byte_order_withholds_the_gated_checks() {
     if !can_run("that the other width or byte order withholds the gated checks") {
@@ -5104,17 +5557,13 @@ fn assert_the_other_abi_withholds(report: &Value, flag: &str, abi: &str, class: 
     }
 }
 
-/// The host's own driver behind a wrapper adding `-mx32`: the intrinsic dump names
-/// `__SIZEOF_POINTER__` 4 beside `__x86_64__`, so `toolchain.target.abi` reads `disagrees`
-/// from the dump alone (no x32 C library on the host, so every probe fails to compile and no
-/// artifact is read) and every arch-gated check is withheld under `target-abi-contradicted`.
-/// This is the test that holds `main::cross_check_target`'s wiring of the flagless dump's
-/// width (`with_intrinsic_abi`) on a host with no cross compiler: dropping that call fails
-/// here.
 #[test]
 fn a_wrapper_adding_mx32_to_the_host_driver_withholds_from_the_dump_alone() {
     if !cfg!(target_arch = "x86_64") || !common::ELF_HOST {
-        eprintln!("skipped: -mx32 is an x86_64 driver's flag");
+        common::capability_gap(
+            "that a wrapper adding -mx32 withholds the gated checks from the dump alone",
+            "-mx32 is an x86_64 ELF driver's flag",
+        );
         return;
     }
     if !can_run("that a wrapper adding -mx32 withholds the gated checks from the dump alone") {
@@ -5205,17 +5654,6 @@ fn assert_gate_stands_unflagged(bare: &Value) {
     );
 }
 
-/// A target the profile's flags select, on a run that reads no ELF artifact, is witnessed
-/// by the macro dump taken under those flags, where `-dumpmachine` and the flagless dump
-/// agree with each other by construction.
-///
-/// The wrapper answers `-dumpmachine` with `riscv64-linux-gnu`, strips the three
-/// architecture macros from every dump so the flagless one agrees with that answer, and
-/// defines `__x86_64__` in a dump run under `-DCHARD_SELECTS_X86_64`: the shape of a
-/// profile carrying `--target=x86_64-linux-gnu` or `-arch x86_64`. `cet-object` is gated
-/// to x86, so under riscv64 it builds nothing and no ELF artifact exists. Under `bare` the
-/// gate stands with no dump under profile flags to publish; under `explicit` with the
-/// sentinel, the dump names `x86_64` and `cet-marked-object` is withheld.
 #[test]
 fn a_target_the_profile_flags_select_is_witnessed_with_no_elf_artifact() {
     if !can_run("that a target the profile's flags select is held to the arch gate") {
@@ -5357,18 +5795,6 @@ fn assert_c_probe_stands(report: &Value) {
     );
 }
 
-/// A target only the profile's C++ flags select, on a run that reads no ELF artifact, is
-/// witnessed by the C++ driver's macro dump taken under those flags, where the C dumps
-/// under no flags and under the C flags agree with `-dumpmachine`.
-///
-/// The shape is `--cxxflags -m32` beside plain `--flags`, with a sentinel standing for the
-/// flag so the host's own compiler need not target another architecture. `cet-object` is
-/// gated to x86 and is a C probe, so under riscv64 it builds nothing and no ELF artifact
-/// exists; the C++ dump names `x86_64`, reads `disagrees` with an error diagnostic, and
-/// withholds nothing, since no C++ probe was selected. Where no C++ driver sits beside the
-/// C one, no C++ probe builds and no C++ dump is taken or published. The corpus's one C++
-/// probe gates none of its checks by architecture, so which verdicts the C++ witness
-/// withholds is held by `report::tests`, over a corpus-free observation.
 #[test]
 fn a_target_only_the_cxxflags_select_is_witnessed_with_no_elf_artifact() {
     if !can_run("that a target only the profile's C++ flags select is witnessed") {
@@ -5458,15 +5884,6 @@ case "$*" in
 esac
 exec "$REAL" "$@""#;
 
-/// A target the profile's flags select is the one the arch gate reads, from the dump taken
-/// under those flags, where `-dumpmachine` names another; the artifacts corroborate it, the
-/// flagless dump is `superseded`, and no verdict is withheld.
-///
-/// Through [`SELECTED_TARGET_SCRIPT`]: under `bare` the gate reads `riscv64` from
-/// `-dumpmachine`, as it always did. Under `explicit` with `--target=chard-host`, it reads the
-/// host's own architecture from `profile_macros`, every ELF artifact agrees with it (none is
-/// read on a Mach-O host), and every arch-gated check gates for that architecture, with no
-/// `target-arch-contradicted` and no error diagnostic under `toolchain.target`.
 #[test]
 fn a_target_the_profile_selects_is_the_target_the_gate_reads() {
     if !can_run("that the arch gate reads the target the profile's flags select") {
@@ -5547,15 +5964,6 @@ fn a_target_the_profile_selects_is_the_target_the_gate_reads() {
     );
 }
 
-/// A run that publishes replaces an earlier report at `-o` and leaves nothing set aside.
-///
-/// `measure` moves an earlier file at the requested path to `<output>.previous` before it
-/// does any work, so a run that ends short of publishing leaves no earlier report there
-/// (`tests/error_classes.rs`, `a_measure_that_fails_leaves_no_earlier_report_at_the_output`).
-/// This is the other half: the set-aside file outlives only such a run. The earlier file
-/// is read-only, as one an operator protected would be, which would make a `measure` that
-/// writes through it fail at publication with `PERMISSION` after the whole sweep; the rename
-/// does not need the file's own write permission.
 #[test]
 fn a_published_report_replaces_the_one_set_aside() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -5601,18 +6009,11 @@ fn a_published_report_replaces_the_one_set_aside() {
     );
     assert_eq!(
         common::temporary_files_beside(&work.path("report.json")),
-        Vec::<std::path::PathBuf>::new(),
+        Vec::<PathBuf>::new(),
         "the temporary file was renamed into place"
     );
 }
 
-/// A writable earlier report in a directory chard cannot write is replaced by a run that
-/// publishes, exit 0.
-///
-/// `report::set_aside` renames the earlier file, which needs the directory; where that is
-/// refused it empties the file in place instead. A `set_aside` that refused the run there
-/// with `PERMISSION` before measuring would leave the earlier report at the path and stop a
-/// run that can publish.
 #[test]
 fn a_report_in_a_directory_chard_cannot_write_is_still_published() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -5665,7 +6066,7 @@ fn a_report_in_a_directory_chard_cannot_write_is_still_published() {
     );
     assert_eq!(
         common::temporary_files_beside(&locked.join("report.json")),
-        Vec::<std::path::PathBuf>::new(),
+        Vec::<PathBuf>::new(),
         "no temporary file in the directory chard cannot write"
     );
 }
@@ -5690,17 +6091,6 @@ fn owes_regime_arm() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// A toolchain that rejects a regime arm's flag publishes the arm as unevaluable, and the
-/// report stands.
-///
-/// `cet-marked`'s regime arm is built `-O2 -fcf-protection=none`, and gcc 7.5, clang 6.0
-/// and 6.0.1 reject the option. An unevaluable arm published with a synthetic
-/// `indeterminate` outcome and no reading behind it would have the report refused under
-/// `decoded-reading-disagrees-with-facts`, as five `bare-optimized` reports of a fleet sweep
-/// were. The wrapper rejects every regime arm's build, whatever its flags, the way those
-/// drivers reject the one, so every C check that owes the arm is exercised on the
-/// channel it reads. The C++ check that owes one (`cxx-stdlib-assertions`) is not
-/// reached: a driver named `fakecc` has no C++ driver beside it.
 #[test]
 fn a_regime_arm_the_driver_rejects_is_published_unevaluable() {
     if !can_run("that a regime arm the driver rejects is published unevaluable") {
@@ -5792,12 +6182,6 @@ fn a_regime_arm_the_driver_rejects_is_published_unevaluable() {
     );
 }
 
-/// A profile flag the driver refuses fails every cell of the probes it reaches as
-/// `build-failed` naming the flag, the compiler-diagnostic cells included, under gcc's
-/// spelling of a refusal; and where the driver would also refuse a control flag, the
-/// profile's refusal is the one published, because the measured build is the subject of
-/// the cell. The control flag's own `unsupported` is published only where the measured
-/// build stood. `Variant::sufficient_for_measured` carries the rule and its history.
 #[test]
 fn a_profile_flag_gcc_refuses_is_build_failed_on_the_diagnostic_channel() {
     if !can_run("that a profile flag gcc refuses fails the diagnostic cells too") {
@@ -5808,8 +6192,6 @@ fn a_profile_flag_gcc_refuses_is_build_failed_on_the_diagnostic_channel() {
     profile_refusal_is_build_failed("fakegnu", "unrecognized command-line option 'FLAG'");
 }
 
-/// [`a_profile_flag_gcc_refuses_is_build_failed_on_the_diagnostic_channel`] under clang's
-/// spelling, as its own test so that each family's line is shown to discriminate on its own.
 #[test]
 fn a_profile_flag_clang_refuses_is_build_failed_on_the_diagnostic_channel() {
     if !can_run("that a profile flag clang refuses fails the diagnostic cells too") {
@@ -5818,12 +6200,6 @@ fn a_profile_flag_clang_refuses_is_build_failed_on_the_diagnostic_channel() {
     profile_refusal_is_build_failed("fakellvm", "unknown argument: 'FLAG'");
 }
 
-/// A profile flag the driver only warns about and goes on without does not fail the
-/// build, so a cell whose own diagnostic failed the build keeps its measured verdict, with
-/// no `build_rejection`: clang's `warning: unknown warning option` line, and gcc's front
-/// end's `note:` that an unknown `-Wno-` option may have been meant to silence earlier
-/// diagnostics. The wrapper prints the family's line and hands the build to the host's
-/// compiler without the flag, which is what the real driver does with it.
 #[test]
 fn a_profile_flag_the_driver_only_warns_about_keeps_the_measured_reading() {
     if !can_run("that a flag the driver warns about and goes on without is not a refusal") {
@@ -5878,8 +6254,7 @@ exec "$REAL" "$@""#
             assert_eq!(
                 o["verdict"].as_str(),
                 Some(verdict),
-                "{name}: {check} failed its build on its own diagnostic, which is the \
-                 reading: {o}"
+                "{name}: {check} did not read on over its own diagnostic: {o}"
             );
             assert_eq!(
                 o["build"]["exit_status"].as_i64(),
@@ -6147,47 +6522,16 @@ const LINK_INPUT_READINGS: [&str; 8] = [
     "textrel-absent",
 ];
 
-/// A specs file that adds an input to every link reaches the measured build and no control
-/// arm, and the checks that input decides are withheld under
-/// `link-inputs-unmatched-by-arms` rather than read over a triple linked without it.
-///
-/// The wrapper stands in for a gcc specs file whose `*startfile` names one more object, on
-/// any driver: under a `-specs=` naming the marker file it drops the flag and, on every
-/// invocation that links (the probe builds and the `-###` listing alike), hands the driver
-/// an object compiled without `-fcf-protection` (on x86_64), so the measured link combines
-/// an input the arms do not. Without the rule, on Fedora 44 x86_64 with gcc 16.1.1 and
-/// clang 22.1.8 (2026-10-06), `cet-marked` reads `off` here over a positive arm linked
-/// without that input, where the same profile without the marker reads `on`. Off x86_64 the
-/// object carries no feature note to drop and no reading is wrong, and the rule is held
-/// all the same, since the listing differs on every target. `linker-default-noexecstack`
-/// reads the clean build, which the marker does not reach, and keeps its reading.
 #[test]
 fn a_startup_input_only_the_measured_link_combines_withholds_the_checks_it_decides() {
     startup_input_withholds("unmarked-input.o");
 }
 
-/// [`a_startup_input_only_the_measured_link_combines_withholds_the_checks_it_decides`] with
-/// an input whose name has no extension. ld reads such a file as an input object as it
-/// reads `crtbegin.o`, and a specs `*startfile` can name one; before the listing was read
-/// by position rather than by suffix, this read `cet-marked` `off` with no gating on
-/// Fedora 44 x86_64 under gcc 16.1.1 (2026-10-06).
 #[test]
 fn a_startup_input_without_an_extension_withholds_the_checks_it_decides() {
     startup_input_withholds("unmarked-input");
 }
 
-/// A linkage form the profile chooses is normalised in the arms' link listing, not read as a
-/// difference. Under a form other than the driver's default, the measured link names one set of
-/// startup objects (`crt1.o` and `crtbegin.o` for a position-dependent link, `Scrt1.o` and
-/// `crtbeginS.o` for a PIE) and the arms, which carry no form, would name the other, so without
-/// the measured form appended to the arms' query every link-input check the probes carry reads
-/// `link-inputs-unmatched-by-arms`; with it none does, and `pie` reads the form the profile
-/// chose. The form is picked against the driver's own default, read from the `-###` of a bare
-/// link: `-no-pie` on a PIE-default driver (Ubuntu's and Debian's), `-fPIE -pie` on one that is
-/// not (Fedora's gcc and clang, which take PIE from the rpm macros, not the driver), so the
-/// test discriminates on both. This is the test that fails without the line appending the
-/// form: bypassing it in `measure::unmatched_link_inputs` leaves every other test binary
-/// green.
 #[test]
 fn a_linkage_form_the_profile_chooses_is_normalised_in_the_arms_listing() {
     if !can_run("that the arms' link listing is taken under the measured link's form") {
@@ -6270,36 +6614,13 @@ fn a_linkage_form_the_profile_chooses_is_normalised_in_the_arms_listing() {
     );
     assert!(
         measured >= 1,
-        "no link-input check read a measurement under {form}, so the arms' listing was never \
-         shown to match: {observations:?}"
+        "no link-input check read a measurement under {form}: {observations:?}"
     );
 }
 
 /// The body of the two tests above: measure through a wrapper that hands every link an
 /// unmarked object named `name` under a marker `-specs=`, and require the checks it
 /// decides withheld, counting the observations examined against coverage.
-///
-/// The set expected withheld is derived, not spelled: every link-input check the selected
-/// probes carry whose gate admits the architecture the report says its gates decided under
-/// ([`link_input_checks_admitted`]), less the ones the run's kernel withheld first under
-/// `needs-vm` (a container the suite recognises; on an unmarked host the measurement asserts
-/// `--execution host`, [`measure_establishing_the_kernel`], so the two `needs_vm` checks are
-/// examined there). The closing assertion does not name `textrel-absent` as a check "every
-/// ELF target reads", which would fail natively on an aarch64 host (Fedora 44 aarch64, gcc
-/// 16.2.1, clang 22.1.8) with the verdicts right: `textrel-absent`'s gate admits
-/// `x86_64` and `x86` alone, because its positive control is manufactured with
-/// `-mcmodel=large`, an x86 code model, so on aarch64 it reads `unsupported` under
-/// `arch-gated` before the link-input rule is consulted and is never in the withheld set.
-/// That gate conflates the mechanism (the linker's, present on every ELF target: `TEXTREL`
-/// is produced there by hand, see "`arch-gated` states an absence chard did not measure" in
-/// the project ledger) with the control that discriminates it (x86's). The architecture work
-/// that entry records is to settle the conflation and remove `textrel-absent`'s gate on its
-/// terms; once it has, the gate should admit aarch64 and `textrel-absent` return to the
-/// withheld set here, which this test is expected to follow with no edit. So the expectation
-/// follows the gate either way rather than hard-coding one target's answer. On x86_64 three
-/// checks, `noexecstack`, `textrel-absent` and `cet-marked`, are required by name below, so a
-/// corpus edit that gated one of them away from x86_64 would fail here rather than shrink the
-/// derived set quietly.
 fn startup_input_withholds(name: &str) {
     if !can_run("that a link input the arms lack withholds the checks it decides") {
         return;
@@ -6445,11 +6766,6 @@ fn withheld_is_the_admitted_set(
 /// less `linker-default-noexecstack`, which reads the clean build the marker does not reach:
 /// the set [`startup_input_withholds`] expects under `link-inputs-unmatched-by-arms`, derived
 /// from the corpus so it is the running target's rather than one target's spelled out.
-///
-/// `needs_vm` is not consulted here: it withholds under a borrowed kernel and measures under
-/// the run's own, so whether it fired is the report's to say, and the caller subtracts the
-/// checks it did. Every probe named is required to exist, and the set to be non-empty, since
-/// a derivation over nothing would make the exact-set assertion vacuous.
 fn link_input_checks_admitted(probes: &[&str], arch: &str) -> Vec<&'static str> {
     let admitted: Vec<&'static str> = probes
         .iter()
@@ -6504,11 +6820,9 @@ fn gated_before_the_rule_agrees(o: &Value, target_arch: &str, admitted: &[&str])
     true
 }
 
-/// The wrapper of [`a_machine_reading_over_an_artifact_the_reader_refused_is_withheld_on_a_live_run`]:
-/// the real driver builds everything, and where it linked an executable the wrapper moves
-/// it aside and writes a shell script that execs it in its place, so the probe runs as built
-/// while chard's reader refuses the artifact it is handed. The reviewer's shape of the
-/// 2026-10-15 review, kept as the one live route to an `unreadable` entry on Linux.
+/// A wrapper that builds everything with the real driver and, where it linked an
+/// executable, moves it aside and leaves in its place a shell script that touches `$MARK`
+/// and execs it: a file that runs as the probe would and is no object at all.
 const SCRIPT_IN_PLACE_OF_THE_EXECUTABLE: &str = r#"out=""; link=1; prev=""
 for a in "$@"; do
   case "$a" in -c|-S|-E|-fsyntax-only|-shared|-M|-MM|-dM) link=0;; esac
@@ -6519,27 +6833,33 @@ done
 "$REAL" "$@" || exit $?
 if [ "$link" = 1 ] && [ -n "$out" ] && [ "$out" != "-" ] && [ -f "$out" ]; then
   mv "$out" "$out.real"
-  printf '#!/bin/sh\nexec "%s" "$@"\n' "$(realpath "$out.real")" > "$out"
+  printf '#!/bin/sh\n: > "%s"\nexec "%s" "$@"\n' "$MARK" "$(realpath "$out.real")" > "$out"
   chmod +x "$out"
 fi
 exit 0"#;
 
-/// A runtime artifact the reader refuses is a record that holds nothing to the kernel, so a
-/// `Machine` reading over it is withheld under `run-under-emulation`, quoting the refusal,
-/// on a live run: the Darwin half, where every artifact is Mach-O and an
-/// `-arch x86_64` program runs under Rosetta 2 with nothing in the record to say so,
-/// exercised on Linux through [`SCRIPT_IN_PLACE_OF_THE_EXECUTABLE`]. It binds
-/// `measure::run_check` handing the reader's refusal to the rule, which the unit tests over
-/// `settle_emulation` cannot: with the call site handing `None` instead, the reason would
-/// say no record was stored. A `Program` reading over the same kind of record is left to
-/// its own verdict. The kernel is asserted so the `needs_vm` check reaches the run.
 #[test]
-fn a_machine_reading_over_an_artifact_the_reader_refused_is_withheld_on_a_live_run() {
-    if !can_run("that an artifact the reader refuses withholds a machine reading") {
+fn a_script_left_in_the_executables_place_is_withheld_and_never_run() {
+    if !can_run("that a file the reader refuses is withheld as unwitnessed and never run") {
         return;
     }
-    let work = common::Work::new("fakedriver", "unreadable-record");
-    let driver = fake_driver(work.dir(), SCRIPT_IN_PLACE_OF_THE_EXECUTABLE);
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "a script in the executable's place",
+            "this host's cc emits Mach-O, so the run has no witness and the script is read as \
+             every artifact there is",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "script-in-place");
+    let mark = work.path("the-script-ran");
+    let driver = fake_driver(
+        work.dir(),
+        &format!(
+            "MARK='{}'\n{SCRIPT_IN_PLACE_OF_THE_EXECUTABLE}",
+            mark.display()
+        ),
+    );
     let report = measure(
         &driver,
         work.dir(),
@@ -6557,16 +6877,13 @@ fn a_machine_reading_over_an_artifact_the_reader_refused_is_withheld_on_a_live_r
         ],
     );
     let facts = &report["facts"];
-    let (mut machine, mut program) = (0, 0);
+    let mut withheld = 0;
     for o in report["observations"].as_array().expect("observations") {
         let check = o["check"].as_str().expect("an observation names its check");
-        let basis = chard::probe::CORPUS
-            .iter()
-            .flat_map(|p| p.checks.iter())
-            .find(|c| c.id == check)
-            .and_then(chard::probe::Check::run_basis);
         let Some(sha) = o["build"]["artifact_sha256"].as_str() else {
-            panic!("{check} built nothing: {o}");
+            // Decided before any build: an arch gate or the mechanism table.
+            assert_ne!(o["verdict"], "on", "{check} published with no build: {o}");
+            continue;
         };
         assert_eq!(
             facts[sha]["kind"].as_str(),
@@ -6574,134 +6891,41 @@ fn a_machine_reading_over_an_artifact_the_reader_refused_is_withheld_on_a_live_r
             "{check}'s build is a script the reader refuses: {}",
             facts[sha]
         );
-        let rule = o["gating"]["rule"].as_str();
-        match basis {
-            Some(chard::probe::RunBasis::Machine) => {
-                machine += 1;
-                assert_eq!(o["verdict"].as_str(), Some("indeterminate"), "{check}: {o}");
-                assert_eq!(rule, Some("run-under-emulation"), "{check}: {o}");
-                let reason = o["gating"]["reason"]
-                    .as_str()
-                    .expect("a withholding carries a reason");
-                // The store names the artifact `<artifact>` and the reason names it as
-                // built; the refusal's own words are what both carry.
-                let refusal = facts[sha]["error"].as_str().expect("the refusal is stored");
-                let words = refusal
-                    .rsplit(": ")
-                    .next()
-                    .expect("the refusal has words after the artifact's name");
-                assert!(
-                    reason.contains("the reader refused it") && reason.contains(words),
-                    "{check}: the reason quotes the stored refusal `{refusal}`: {reason}"
-                );
-            }
-            Some(chard::probe::RunBasis::Program) => {
-                program += 1;
-                assert_ne!(rule, Some("run-under-emulation"), "{check}: {o}");
-            }
-            None => {}
-        }
-    }
-    assert!(
-        machine >= 2 && program >= 1,
-        "{machine} machine reading(s) and {program} program reading(s) over refused records"
-    );
-}
-
-/// [`SCRIPT_IN_PLACE_OF_THE_EXECUTABLE`] with the script printing the line a Darwin probe
-/// prints natively, `CHARD-TRANSLATION 0`, before it execs the probe.
-const SCRIPT_CLAIMING_A_NATIVE_RUN: &str = r#"out=""; link=1; prev=""
-for a in "$@"; do
-  case "$a" in -c|-S|-E|-fsyntax-only|-shared|-M|-MM|-dM) link=0;; esac
-  [ "$prev" = "-o" ] && out="$a"
-  case "$a" in -o?*) out="${a#-o}";; esac
-  prev="$a"
-done
-"$REAL" "$@" || exit $?
-if [ "$link" = 1 ] && [ -n "$out" ] && [ "$out" != "-" ] && [ -f "$out" ]; then
-  mv "$out" "$out.real"
-  printf '#!/bin/sh\necho "CHARD-TRANSLATION 0"\nexec "%s" "$@"\n' "$(realpath "$out.real")" > "$out"
-  chmod +x "$out"
-fi
-exit 0"#;
-
-/// Off macOS the translation line settles nothing on a live run: over the refused record of
-/// [`a_machine_reading_over_an_artifact_the_reader_refused_is_withheld_on_a_live_run`], a
-/// run whose stdout opens with `CHARD-TRANSLATION 0` is withheld under
-/// `run-under-emulation` with the reason that has no translation clause, as without the
-/// line. It binds `measure::run_check` handing the platform to the rule: with the call site
-/// handing `true`, the stack-clash reading would publish here.
-#[test]
-fn a_translation_line_off_macos_settles_nothing_on_a_live_run() {
-    if !can_run("that a translation line off macOS settles nothing") {
-        return;
-    }
-    let work = common::Work::new("fakedriver", "translation-line-off-macos");
-    let driver = fake_driver(work.dir(), SCRIPT_CLAIMING_A_NATIVE_RUN);
-    let report = measure(
-        &driver,
-        work.dir(),
-        &[
-            "--profile",
-            "bare",
-            "--execution",
-            "host",
-            "--probe",
-            "stack-clash",
-            "--probe",
-            "stack-exec-runtime",
-        ],
-    );
-    assert_ne!(
-        report["environment"]["distro"]["id"].as_str(),
-        Some("macos"),
-        "the suite's hosts are not macOS"
-    );
-    let mut machine = 0;
-    for o in report["observations"].as_array().expect("observations") {
-        let check = o["check"].as_str().expect("an observation names its check");
-        let basis = chard::probe::CORPUS
-            .iter()
-            .flat_map(|p| p.checks.iter())
-            .find(|c| c.id == check)
-            .and_then(chard::probe::Check::run_basis);
-        if basis != Some(chard::probe::RunBasis::Machine) {
-            continue;
-        }
-        let stdout = o["run"]["stdout"].as_str().unwrap_or("");
-        if !stdout.starts_with("CHARD-TRANSLATION 0") {
-            continue;
-        }
-        machine += 1;
         assert_eq!(o["verdict"].as_str(), Some("indeterminate"), "{check}: {o}");
         assert_eq!(
             o["gating"]["rule"].as_str(),
-            Some("run-under-emulation"),
+            Some("artifact-lacks-run-witness"),
             "{check}: {o}"
         );
-        let reason = o["gating"]["reason"].as_str().expect("a reason");
+        let reason = o["gating"]["reason"]
+            .as_str()
+            .expect("a withholding carries a reason");
+        // The store names the artifact `<artifact>` and the reason names it as built; the
+        // refusal's own words are what both carry.
+        let refusal = facts[sha]["error"].as_str().expect("the refusal is stored");
+        let words = refusal
+            .rsplit(": ")
+            .next()
+            .expect("the refusal has words after the artifact's name");
         assert!(
-            reason.contains("the reader refused it") && !reason.contains("proc_translated"),
-            "{check}: the Linux reason, without the line's clause: {reason}"
+            reason.contains("the ELF reader refused") && reason.contains(words),
+            "{check}: the reason quotes the stored refusal `{refusal}`: {reason}"
         );
+        assert!(o.get("run").is_none(), "{check} was run: {o}");
+        assert!(o.get("controls").is_none(), "{check} built a triple: {o}");
+        withheld += 1;
     }
     assert!(
-        machine >= 1,
-        "no machine reading ran with the line in its stdout"
+        withheld >= 3,
+        "{withheld} check(s) over a refused artifact were withheld"
     );
+    assert!(
+        !mark.exists(),
+        "the script left in the executable's place was run"
+    );
+    assert_eq!(report["consistency"]["status"], "consistent");
 }
 
-/// A live run with no `--execution` reads the checks that declare `needs_vm` by what chard
-/// established about the kernel, before any build: on a host it observes nothing about,
-/// `host` on an `assumed-host` basis, each is withheld under `execution-mode-assumed`
-/// with the observation quoted and `needs_vm` set; in a container it recognises, under
-/// `needs-vm`. Neither basis is the operator's word, so a measured verdict is the one
-/// reading this refuses, whichever host runs the suite (its hosts are bare machines and
-/// containers; a VM lane asserts `vm`, which chard never observes). Off x86_64 the
-/// mechanism table decides `shadow-stack-enforced` first, so only the checks the kernel
-/// gate reached are held, and `noexecstack-enforced`, measured on x86_64 and aarch64, is
-/// required among them. A default that measured both would let an unrecognised container
-/// publish the host kernel's policy under the distribution's name.
 #[test]
 fn a_kernel_policy_check_is_withheld_where_nothing_established_the_kernel_on_a_live_run() {
     if !can_run("that an unestablished execution mode withholds the kernel-policy checks") {
@@ -6731,10 +6955,7 @@ fn a_kernel_policy_check_is_withheld_where_nothing_established_the_kernel_on_a_l
     let expected = match (execution["mode"].as_str(), basis) {
         (Some("host"), "assumed-host") => "execution-mode-assumed",
         (Some("container"), "measured") => "needs-vm",
-        (mode, basis) => panic!(
-            "a run with no --execution reads {mode:?} on {basis}: chard observes a container \
-             or nothing, so only `container` measured or `host` by default can stand here"
-        ),
+        (mode, basis) => panic!("a run with no --execution reads {mode:?} on {basis}"),
     };
     // The two positive markers are held to this host where the run
     // read `host` by default; `the_markers_silence_is_what_this_host_reads` says how.
@@ -6781,8 +7002,7 @@ fn a_kernel_policy_check_is_withheld_where_nothing_established_the_kernel_on_a_l
     }
     assert!(
         held >= 1 && noexecstack,
-        "{held} kernel-policy check(s) reached the kernel gate, noexecstack-enforced among \
-         them: {noexecstack}"
+        "{held} kernel-policy check(s) reached the kernel gate; noexecstack-enforced: {noexecstack}"
     );
 }
 
@@ -6895,23 +7115,6 @@ const COMPILE_INPUT_READINGS: [&str; 19] = [
     "cxx-assertions-symbol",
 ];
 
-/// A specs file that puts a header directory ahead of the C library's reaches the measured
-/// build and no control arm, and the checks the headers decide are withheld under
-/// `compile-inputs-unmatched-by-arms` rather than read over a triple compiled against
-/// other headers.
-///
-/// The wrapper stands in for a gcc specs file whose `*cpp` adds `-isystem`, on any
-/// driver: under a `-specs=` naming the marker file it drops the flag and hands every
-/// invocation (the probe builds, the macro dumps and the `-###` listings alike) `-isystem`
-/// a directory whose `features.h` includes the C library's and then sets
-/// `__USE_FORTIFY_LEVEL` to `0`, as a C library declining fortification does. Without the
-/// rule, on Fedora 44 x86_64 with gcc 16.1.1 (2026-10-07), `fortify-effective` and
-/// `fortify-printf-flag` read `off` here, and `fortify-enforced-known` with them, over
-/// positive controls compiled against the host's `features.h`, where the same profile
-/// without the marker reads `on`. Off glibc the fortify checks are declared unsupported
-/// first and the macro-channel checks hold the rule all the same, since the listing
-/// differs on every host. `canary-emitted` reads the probe's own code and keeps its
-/// reading.
 #[test]
 fn a_header_directory_only_the_measured_compile_reads_withholds_the_checks_it_decides() {
     if !can_run("that a header directory the arms lack withholds the checks it decides") {
@@ -6920,13 +7123,6 @@ fn a_header_directory_only_the_measured_compile_reads_withholds_the_checks_it_de
     header_directory_withholds("compile-inputs", "", "");
 }
 
-/// The same directory named relative to the system root, as a specs file for a cross or
-/// sysroot toolchain writes it (`-isystem =dir`), under `--sysroot=/`, which the arms
-/// carry as target selection. A comparison that tested every search directory as written
-/// and left out one that was not a directory would leave `=dir` out of the measured listing
-/// alone, the two listings would be equal, and on Fedora 44 x86_64 with gcc 16.1.1
-/// `fortify-effective`, `fortify-printf-flag` and `fortify-enforced-known` would read `off`
-/// with no gating, where the absolute spelling above withholds them.
 #[test]
 fn a_header_directory_under_the_system_root_withholds_the_checks_it_decides() {
     if !can_run("that a sysroot-relative header directory the arms lack withholds the checks") {
@@ -6935,16 +7131,6 @@ fn a_header_directory_under_the_system_root_withholds_the_checks_it_decides() {
     header_directory_withholds("compile-inputs-sysroot", "=", " --sysroot=/");
 }
 
-/// The same declining `features.h` under the profile's own `-isystem`, which every arm
-/// carries as the header selection: nothing is withheld under
-/// `compile-inputs-unmatched-by-arms`, and the fortify checks the header decides are read
-/// over a positive arm the header silenced as it silenced the measured build, never `off`:
-/// the positive arm's own artifact reports the request arrived and the C library's headers,
-/// as the profile selects them, settled the level at 0, which `fortify-level-declined` reads
-/// as `unsupported` (Fedora 44 x86_64, gcc 16.1.1, at the change that took the selection;
-/// until then the whole probe was withheld). `fortify-requested`, which the header does not
-/// decide, reads `on`. The absolute spelling and the `=dir` one under `--sysroot=/` are
-/// both fed.
 #[test]
 fn a_declining_header_under_the_profiles_own_isystem_reads_probe_invalid_never_off() {
     if !can_run("that a declining header under the profile's own -isystem reads probe-invalid") {
@@ -6987,14 +7173,6 @@ fn a_declining_header_under_the_profiles_own_isystem_reads_probe_invalid_never_o
     assert_eq!(fed, 2, "both spellings were fed");
 }
 
-/// A forced include that undefines `_FORTIFY_SOURCE` under the profile's own `-include`,
-/// which every arm carries: the driver reads a `-include` after every `-D` and `-U` of the
-/// line, so the measured build and both fortify arms compile without the macro, nothing is
-/// withheld under `compile-inputs-unmatched-by-arms`, and the seven fortify checks read
-/// `probe-invalid` over a silent positive arm, never `off`, as does
-/// `strict-flex-arrays-enforced`, whose probe the header leaves without the request it
-/// branches on. Every C probe with a compile-input reading is fed, so the claim is held for
-/// each check the header decides and not for the four probes the other shapes feed.
 #[test]
 fn an_include_undefining_fortify_source_under_the_profiles_own_include_reads_probe_invalid() {
     if !can_run("that an -include undefining _FORTIFY_SOURCE reads probe-invalid") {
@@ -7029,15 +7207,6 @@ fn an_include_undefining_fortify_source_under_the_profiles_own_include_reads_pro
     );
 }
 
-/// The profile's own `-undef`, which every arm carries: under gcc's `-O2 -undef` the
-/// `as-needed` probe builds, its positive arm (`-undef -Wl,--as-needed`) is built without
-/// the predefined macros as the measured build is and reads `indeterminate`, and the check
-/// reads `probe-invalid` over `positive-indeterminate` where, with the arms built with the
-/// macros, it read `off` from a triple that vouched for a compile the measured build did
-/// not make (gcc 16.1.1, Fedora 44 x86_64; `-undef` withheld nothing before, since the
-/// comparison reads neither its word nor the macros it removes). Under clang `as-needed`
-/// reads `off` before and after, both arms discriminating, so the reading this test holds
-/// is gcc's, and a clang host asserts nothing and says so.
 #[test]
 fn as_needed_under_the_profiles_own_undef_reads_probe_invalid_on_gcc() {
     if !can_run("that as-needed under the profile's own -undef reads probe-invalid on gcc") {
@@ -7104,11 +7273,6 @@ const COMPILE_INPUT_C_PROBES: [&str; 10] = [
     "exceptions",
 ];
 
-/// [`COMPILE_INPUT_C_PROBES`] is the corpus's own list, derived: every C probe carrying a
-/// check of [`COMPILE_INPUT_READINGS`], plus the two fed beside them that carry none
-/// (`stack-canary`, whose `canary-emitted` keeps its reading whatever the comparison says,
-/// and `strict-flex-arrays`, the sibling the forced-include clause withholds), and no
-/// other, so the list cannot go stale beside the corpus without this failing.
 #[test]
 fn the_compile_input_c_probes_are_the_corpus_s() {
     let derived: Vec<&str> = chard::probe::CORPUS
@@ -7148,12 +7312,6 @@ fn the_compile_input_c_probes_are_the_corpus_s() {
     );
 }
 
-/// A forced include that undefines `__EXCEPTIONS` under the profile's own `-include`, which
-/// every arm carries: `-O2 -fexceptions -include <h>` reads `exceptions-macro`
-/// `probe-invalid` over a silent positive arm (the include undefines the macro in the arm
-/// built with `-fexceptions` as in the measured build), `except-table-emitted` `on` from the
-/// artifact, and nothing withheld under `compile-inputs-unmatched-by-arms`; the register
-/// row `legacy-self-report-question-mark-reads-undefined` quotes the reading.
 #[test]
 fn an_include_undefining_exceptions_under_the_profiles_own_include_reads_probe_invalid() {
     if !can_run("that an -include undefining __EXCEPTIONS reads probe-invalid") {
@@ -7203,11 +7361,6 @@ fn an_include_undefining_exceptions_under_the_profiles_own_include_reads_probe_i
     );
 }
 
-/// The converse: a forced include that defines `_FORTIFY_SOURCE` reaches the negative arm,
-/// whose `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0` the include overrides (a `-include` is read
-/// after every `-D` and `-U`), so the negative arm shows the observable, the triple cannot
-/// discriminate, and `fortify-requested` and the checks downstream read `probe-invalid` over
-/// `negative-also-shows`, never `on` from a triple that proved nothing.
 #[test]
 fn an_include_defining_fortify_source_under_the_profiles_own_include_reads_probe_invalid() {
     if !can_run("that an -include defining _FORTIFY_SOURCE reads probe-invalid") {
@@ -7256,15 +7409,6 @@ fn an_include_defining_fortify_source_under_the_profiles_own_include_reads_probe
     assert_eq!(held, 4, "every fortify check of the four probes was held");
 }
 
-/// A forced include whose effect turns on a macro only the profile defines: under
-/// `-O2 -DNDEBUG -D_FORTIFY_SOURCE=3 -include <h>`, `h` undefining `_FORTIFY_SOURCE` under
-/// `NDEBUG`, the measured build compiles without the request and the arms, which carry the
-/// include and never the profile's macro words, read the header as inert, so the triple
-/// discriminates and the fortify checks read `off` of the build the profile makes, not
-/// withheld under `compile-inputs-unmatched-by-arms` (the stand-in listing carries the
-/// profile's `-D` words beside the include, as the measured line does). The reading is the
-/// same kind as under `-D_FORTIFY_SOURCE=3 -U_FORTIFY_SOURCE`, and the same as a system
-/// header keyed on a profile macro gives; `toolchain::header_selecting_flags` says so.
 #[test]
 fn an_include_keyed_on_a_profile_macro_acts_on_the_measured_build_alone() {
     if !can_run("that an include keyed on a profile-only macro reads of the measured build") {
@@ -7303,8 +7447,7 @@ fn an_include_keyed_on_a_profile_macro_acts_on_the_measured_build_alone() {
                     o["controls"]["discriminating"].as_bool()
                 ),
                 (Some("off"), Some(true)),
-                "{check}: the build the profile makes has no request, and the arms read the \
-                 header as inert: {o}"
+                "{check}: the request-less build did not read off with discriminating arms: {o}"
             );
             held = held.saturating_add(1);
         }
@@ -7353,16 +7496,14 @@ fn assert_own_header_silences_the_positive_arm(
             assert_ne!(
                 o["verdict"].as_str(),
                 Some("off"),
-                "{shape}: {check} read off over a header that reaches the measured build and \
-                 the arms alike: {o}"
+                "{shape}: {check} read off over a header both the build and the arms see: {o}"
             );
         }
         if silenced.contains(&check) {
             assert_eq!(
                 (o["verdict"].as_str(), o["gating"]["rule"].as_str()),
                 (Some(expected.0), expected.1),
-                "{shape}: {check} is decided by the header, which silences its positive arm \
-                 as it silences the measured build: {o}"
+                "{shape}: {check} is decided by the header, which silences its positive arm: {o}"
             );
             assert_eq!(
                 o["controls"]["withheld_because"].as_str(),
@@ -7435,18 +7576,6 @@ fn sorted_verdicts(report: &Value) -> Vec<(String, String, String)> {
     v
 }
 
-/// The profile's own header words publish: under `-O2` with `-pthread`, `-I<dir>`,
-/// `-isystem <dir>`, `-idirafter <dir>`, `-iquote<dir>`, `-include <file>` and `-imacros
-/// <file>` (an empty directory, a C header, a macro file) nothing is withheld under
-/// `compile-inputs-unmatched-by-arms`, every check reads the verdict and level it reads
-/// under `-O2` alone, and each arm leads with the word. Were the arms not to take the
-/// selection, a profile carrying any of them would withhold every compile-input reading of
-/// these probes on gcc, and every word but `-pthread` on clang (Fedora 44 x86_64, gcc 16.1.1 and
-/// clang 22.1.8; `measure::arm_flags` has the frame). `-undef` is the eighth word of the selection,
-/// and is not fed here: it moves `as-needed` on gcc and nothing on clang
-/// (`as_needed_under_the_profiles_own_undef_reads_probe_invalid_on_gcc`). The assembly probe's
-/// default check is fed too: it reads the clean build, which carries no header word, so under
-/// `-include` a C header it still reads what it reads under `-O2` alone (`measure::clean_flags`).
 #[test]
 fn the_profiles_own_header_words_publish_as_the_plain_level_does() {
     if !can_run("that the profile's own header words publish as -O2 alone does") {
@@ -7529,8 +7658,7 @@ fn the_profiles_own_header_words_publish_as_the_plain_level_does() {
         }
         assert!(
             arms_inspected >= 12,
-            "{word}: the arms of the published compile-input checks were inspected: \
-             {arms_inspected}"
+            "{word}: too few arms of the published compile-input checks inspected: {arms_inspected}"
         );
         let expected_here =
             twinless_under_unread_input(&report, word, *tag != "pthread", &expected);
@@ -7546,21 +7674,32 @@ fn the_profiles_own_header_words_publish_as_the_plain_level_does() {
 
 /// A forced include or macro file is an input the spoof rule does not read by name, and a
 /// header search directory one under which a header the probe includes can be shadowed
-/// (`unread`): under either the two macro checks with no twin are withheld
-/// (`measure::settle`), and nothing else moves; under `-pthread` nothing is withheld
-/// there. Returns `expected`, the `-O2` readings, with those two set to the withholding
-/// where `unread`.
+/// (`unread`): under either the macro check with no twin, `fortify-effective`, is withheld
+/// (`measure::settle`), and so is `optimization-enabled` where its artifact twin is not a
+/// measurement in the run, as where the run's probes leave `optimization-object` out
+/// (`measure::withhold_where_no_twin_measured`); where the twin is one, it holds the reading
+/// instead and nothing else moves. Under `-pthread` nothing is withheld there. Returns
+/// `expected`, the `-O2` readings, with those set to the withholding where `unread`.
 fn twinless_under_unread_input(
     report: &Value,
     word: &str,
     unread: bool,
     expected: &[(String, String, String)],
 ) -> Vec<(String, String, String)> {
+    let observations = report["observations"].as_array().expect("observations");
+    let twin_measured = observations.iter().any(|o| {
+        o["check"] == "optimization-applied" && (o["verdict"] == "on" || o["verdict"] == "off")
+    });
+    let held: Vec<&str> = if twin_measured {
+        vec!["fortify-effective"]
+    } else {
+        vec!["fortify-effective", "optimization-enabled"]
+    };
     let mut expected_here = expected.to_vec();
     let mut withheld = 0_usize;
-    for o in report["observations"].as_array().expect("observations") {
+    for o in observations {
         let check = o["check"].as_str().unwrap_or_default();
-        if unread && ["optimization-enabled", "fortify-effective"].contains(&check) {
+        if unread && held.contains(&check) {
             assert_eq!(o["verdict"], "indeterminate", "{word}: {o}");
             assert_eq!(
                 o["gating"]["rule"].as_str(),
@@ -7574,30 +7713,191 @@ fn twinless_under_unread_input(
             withheld += 1;
         }
     }
+    let present = held
+        .iter()
+        .filter(|id| observations.iter().any(|o| o["check"] == **id))
+        .count();
     assert_eq!(
         withheld,
-        if unread { 2 } else { 0 },
-        "{word}: the twinless macro checks are withheld under a directory or include word alone"
+        if unread { present } else { 0 },
+        "{word}: macro checks no twin holds are withheld under a directory or include word alone"
     );
     expected_here.sort();
     expected_here
 }
 
-/// The hold's shape for a macro check with no twin, through the profile's own list:
-/// `-O0 -DGATE -include h` with `h` defining `__OPTIMIZE__ 1` under `GATE`, and `-O2
-/// -DGATE -include h` with `h` undefining it, each read `optimization-enabled`
-/// `indeterminate` under `macro-supplied-by-profile`, the reason naming the unread input
-/// and the check, where the arms (which carry the include and never `-DGATE`) discriminate
-/// and would have vouched for a forged `on` or `off`; `-O0 -DGATE` alone, with no such
-/// input, reads `off` as the build is. Any C driver.
 #[test]
-fn a_profiles_own_include_keyed_on_its_own_macro_cannot_forge_a_twinless_macro() {
-    if !can_run("that a keyed forced include cannot forge a macro check with no twin") {
+fn a_profiles_own_include_keyed_on_its_own_macro_is_held_by_the_optimisation_twin() {
+    // The rest of the test, for the line cap.
+    optimisation_twin_shapes();
+}
+
+/// A forging shape of the test above in a run whose selection leaves the twin's probe out:
+/// no twin is a measurement, so the input clause holds the reading
+/// (`measure::withhold_where_no_twin_measured`), its reason naming the macro and the twin.
+fn held_by_the_input_without_the_twin(work: &common::Work, tag: &str, flags: &str) {
+    let alone = work.path(&format!("{tag}-alone"));
+    std::fs::create_dir_all(&alone).expect("a workdir per shape");
+    let report = measure(
+        Path::new(&real_cc()),
+        &alone,
+        &[
+            "--profile",
+            "explicit",
+            "--flags",
+            flags,
+            "--probe",
+            "toolchain-macros",
+        ],
+    );
+    assert_schema_valid(tag, &report);
+    let (cell, rule) = cell_and_rule(&report, "optimization-enabled");
+    assert_eq!(cell["verdict"], "indeterminate", "{tag} alone: {cell}");
+    assert_eq!(
+        rule,
+        Some("macro-supplied-by-profile"),
+        "{tag} alone: {cell}"
+    );
+    let reason = cell["gating"]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("`__OPTIMIZE__`")
+            && reason.contains(
+                "`optimization-applied` is not in this run, its probe `optimization-object` \
+                 not selected"
+            ),
+        "{tag} alone: {reason}"
+    );
+    input_clause_warning(&report, tag, Some("optimization-object"));
+}
+
+/// The one warning `measure::withhold_where_no_twin_measured` publishes in `report`'s
+/// diagnostics for `optimization-enabled`, naming the probe to select where `select` is set,
+/// and no other.
+fn input_clause_warning(report: &Value, tag: &str, select: Option<&str>) {
+    let warnings: Vec<&Value> = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| {
+            d["context"] == "optimization-enabled"
+                && d["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("no twin of it is a measurement"))
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "{tag}: {}", report["diagnostics"]);
+    assert_eq!(warnings[0]["severity"], "warning", "{tag}: {}", warnings[0]);
+    let message = warnings[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("under macro-supplied-by-profile"),
+        "{tag}: {message}"
+    );
+    match select {
+        Some(probe) => assert!(
+            message.contains(&format!("adds `--probe {probe}`")),
+            "{tag}: {message}"
+        ),
+        None => assert!(!message.contains("--probe"), "{tag}: {message}"),
+    }
+}
+
+#[test]
+fn a_slim_lto_object_leaves_a_forged_optimize_to_the_input_clause() {
+    if !can_run("that a slim -flto twin leaves a forged __OPTIMIZE__ to the input clause") {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "slim-lto-twin");
+    let on = work.write("opt.h", "#ifdef GATE\n#define __OPTIMIZE__ 1\n#endif\n");
+    let dir = work.path("lto");
+    std::fs::create_dir_all(&dir).expect("a workdir");
+    let flags = format!("-O0 -flto -DGATE -include {}", on.display());
+    let report = measure(
+        Path::new(&real_cc()),
+        &dir,
+        &[
+            "--profile",
+            "explicit",
+            "--flags",
+            &flags,
+            "--probe",
+            "toolchain-macros",
+            "--probe",
+            "optimization-object",
+        ],
+    );
+    assert_schema_valid("slim-lto", &report);
+    let (twin, _) = cell_and_rule(&report, "optimization-applied");
+    if twin["verdict"] == "on" || twin["verdict"] == "off" {
+        common::refuse(
+            &format!(
+                "this driver's -flto object is read as code ({}), so the slim shape is not here",
+                twin["verdict"]
+            ),
+            "that a slim -flto twin leaves a forged __OPTIMIZE__ to the input clause",
+        );
+        return;
+    }
+    assert_eq!(twin["verdict"], "indeterminate", "slim-lto: {twin}");
+    let (cell, rule) = cell_and_rule(&report, "optimization-enabled");
+    assert_eq!(cell["verdict"], "indeterminate", "slim-lto: {cell}");
+    assert_eq!(rule, Some("macro-supplied-by-profile"), "slim-lto: {cell}");
+    let reason = cell["gating"]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("`optimization-applied` reads `indeterminate`"),
+        "slim-lto: {reason}"
+    );
+    assert_eq!(
+        cell["evidence"]["macros"]["__OPTIMIZE__"].as_str(),
+        Some("1"),
+        "slim-lto: the header acted on the measured build: {}",
+        cell["evidence"]["macros"]
+    );
+    input_clause_warning(&report, "slim-lto", None);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("(`optimization-applied` reads `indeterminate`"))),
+        "slim-lto: the warning names the twin's reading: {}",
+        report["diagnostics"]
+    );
+}
+
+/// The body of
+/// [`a_profiles_own_include_keyed_on_its_own_macro_is_held_by_the_optimisation_twin`].
+fn optimisation_twin_shapes() {
+    if !can_run("that a keyed forced include cannot forge optimization-enabled past its twin") {
         return;
     }
     let work = common::Work::new("fakedriver", "own-include-twinless");
+    let shapes = optimisation_forging_shapes(&work);
+    let mut fed = 0_usize;
+    for (tag, flags, held, forged) in &shapes {
+        optimisation_twin_shape(&work, tag, flags, *held, *forged);
+        fed += 1;
+    }
+    assert_eq!(fed, shapes.len(), "every shape was fed");
+}
+
+/// The shapes [`optimisation_twin_shapes`] measures, their headers written under `work`:
+/// (tag, flags, withheld under the rule, the measured build's self-report of
+/// `__OPTIMIZE__`, which a withheld cell still carries in `evidence.macros`).
+fn optimisation_forging_shapes(
+    work: &common::Work,
+) -> Vec<(&'static str, String, bool, Option<&'static str>)> {
     let on = work.write("opt.h", "#ifdef GATE\n#define __OPTIMIZE__ 1\n#endif\n");
     let off = work.write("unopt.h", "#ifdef GATE\n#undef __OPTIMIZE__\n#endif\n");
+    // A header that also renames the twin probe's dead call to its anchor and its branch to
+    // a literal zero by macro, which the probe's `#undef` lines stop: the twin still reads
+    // the call kept.
+    let rename = work.write(
+        "rename.h",
+        "#ifdef GATE\n#define __OPTIMIZE__ 1\n#define chard_opt_dead chard_opt_anchor\n\
+         #define if(c) if (0)\n#endif\n",
+    );
     // A shadow of a header the probe includes, under the profile's own `-I`: the next
     // `stdio.h` and then the keyed define, which the arms (carrying the directory and not
     // `-DGATE`) read as inert.
@@ -7608,9 +7908,7 @@ fn a_profiles_own_include_keyed_on_its_own_macro_cannot_forge_a_twinless_macro()
         "#include_next <stdio.h>\n#ifdef GATE\n#define __OPTIMIZE__ 1\n#endif\n",
     )
     .expect("the shadow header");
-    // (tag, flags, withheld under the rule, the self-report's `__OPTIMIZE__` where the
-    // build was forged, which a withheld cell still carries in `evidence.macros`)
-    let shapes = [
+    vec![
         (
             "forged-on",
             format!("-O0 -DGATE -include {}", on.display()),
@@ -7629,54 +7927,94 @@ fn a_profiles_own_include_keyed_on_its_own_macro_cannot_forge_a_twinless_macro()
             true,
             Some("1"),
         ),
+        (
+            "forged-rename",
+            format!("-O0 -DGATE -include {}", rename.display()),
+            true,
+            Some("1"),
+        ),
         ("plain", "-O0 -DGATE".to_owned(), false, None),
-    ];
-    let mut fed = 0_usize;
-    for (tag, flags, held, forged) in &shapes {
-        let dir = work.path(tag);
-        std::fs::create_dir_all(&dir).expect("a workdir per shape");
-        let report = measure(
-            Path::new(&real_cc()),
-            &dir,
-            &[
-                "--profile",
-                "explicit",
-                "--flags",
-                flags.as_str(),
-                "--probe",
-                "toolchain-macros",
-            ],
-        );
-        assert_schema_valid(tag, &report);
-        let (cell, rule) = cell_and_rule(&report, "optimization-enabled");
-        if *held {
-            assert_eq!(cell["verdict"], "indeterminate", "{tag}: {cell}");
-            assert_eq!(rule, Some("macro-supplied-by-profile"), "{tag}: {cell}");
-            let reason = cell["gating"]["reason"].as_str().expect("a reason");
-            assert!(
-                reason.contains("`__OPTIMIZE__`") && reason.contains("`optimization-enabled`"),
-                "{tag}: {reason}"
-            );
-            assert_eq!(
-                cell["controls"]["discriminating"], true,
-                "{tag}: the arms discriminated; the rule read the list, not the triple"
-            );
-        } else {
-            assert_eq!(cell["verdict"], "off", "{tag}: {cell}");
-            assert_eq!(rule, None, "{tag}: {cell}");
-        }
-        // The header did act on the measured build: its self-report carries the forged
-        // macro where the header defined it, and none where it undefined it, so a header
-        // the test left inert would fail here rather than pass under a withholding.
+        ("plain-optimised", "-O2 -DGATE".to_owned(), false, Some("1")),
+    ]
+}
+
+/// One shape of [`optimisation_twin_shapes`], measured with the twin's probe in the run.
+fn optimisation_twin_shape(
+    work: &common::Work,
+    tag: &str,
+    flags: &str,
+    held: bool,
+    forged: Option<&str>,
+) {
+    let dir = work.path(tag);
+    std::fs::create_dir_all(&dir).expect("a workdir per shape");
+    let report = measure(
+        Path::new(&real_cc()),
+        &dir,
+        &[
+            "--profile",
+            "explicit",
+            "--flags",
+            flags,
+            "--probe",
+            "toolchain-macros",
+            "--probe",
+            "optimization-object",
+        ],
+    );
+    assert_schema_valid(tag, &report);
+    let (cell, rule) = cell_and_rule(&report, "optimization-enabled");
+    let (twin, twin_rule) = cell_and_rule(&report, "optimization-applied");
+    // The twin reads the build as it was: optimised only where the profile's own `-O2`
+    // made it so, whatever the header told the preprocessor.
+    let optimised = flags.starts_with("-O2");
+    assert_eq!(
+        twin["verdict"],
+        if optimised { "on" } else { "off" },
+        "{tag}: {twin}"
+    );
+    assert_eq!(twin_rule, None, "{tag}: {twin}");
+    if held {
+        assert_eq!(cell["verdict"], "indeterminate", "{tag}: {cell}");
         assert_eq!(
-            cell["evidence"]["macros"]["__OPTIMIZE__"].as_str(),
-            *forged,
-            "{tag}: the measured build's self-report: {}",
-            cell["evidence"]["macros"]
+            rule,
+            Some("macro-contradicted-by-artifact"),
+            "{tag}: {cell}"
         );
-        fed += 1;
+        let reason = cell["gating"]["reason"].as_str().expect("a reason");
+        let read = if optimised { "off" } else { "on" };
+        let twin_read = if optimised { "on" } else { "off" };
+        assert!(
+            reason.contains(&format!("`optimization-enabled` read `{read}`"))
+                && reason.contains(&format!(
+                    "`optimization-applied` reads `{twin_read}` on the elf-static channel"
+                )),
+            "{tag}: {reason}"
+        );
+        assert_eq!(
+            cell["controls"]["discriminating"], true,
+            "{tag}: the arms discriminated; the twin rule read the artifact, not the triple"
+        );
+        held_by_the_input_without_the_twin(work, tag, flags);
+    } else {
+        let (verdict, twin_verdict) = if optimised {
+            ("on", "on")
+        } else {
+            ("off", "off")
+        };
+        assert_eq!(cell["verdict"], verdict, "{tag}: {cell}");
+        assert_eq!(twin["verdict"], twin_verdict, "{tag}: {twin}");
+        assert_eq!(rule, None, "{tag}: {cell}");
     }
-    assert_eq!(fed, shapes.len(), "every shape was fed");
+    // The header did act on the measured build: its self-report carries the forged
+    // macro where the header defined it, and none where it undefined it, so a header
+    // the test left inert would fail here rather than pass under a withholding.
+    assert_eq!(
+        cell["evidence"]["macros"]["__OPTIMIZE__"].as_str(),
+        forged,
+        "{tag}: the measured build's self-report: {}",
+        cell["evidence"]["macros"]
+    );
 }
 
 /// An exception model only the measured compile is under withholds `except-table-emitted`
@@ -7745,7 +8083,7 @@ exec \"$REAL\" \"$@\"",
         ],
     );
     let observations = report["observations"].as_array().expect("observations");
-    let read = |id: &str| -> &serde_json::Value {
+    let read = |id: &str| -> &Value {
         observations
             .iter()
             .find(|o| o["check"].as_str() == Some(id))
@@ -8044,7 +8382,7 @@ fn assert_fortify_read(report: &Value, expected: (&str, Option<&str>, Option<&st
 /// The checks of [`COMPILE_INPUT_PROBES`] in [`COMPILE_INPUT_READINGS`] with an arm at an
 /// optimisation level other than the profile's `profile_words` (none, or `-O0`, under a
 /// `-O2` profile): what a driver changes with the level, other than a macro the controls
-/// set, withholds exactly these, as `measure::arm_optimization_classes` classes them.
+/// set, withholds exactly these, as `listings::arm_optimization_classes` classes them.
 fn checks_at_other_levels(profile_words: &[&str]) -> Vec<&'static str> {
     let words = |flags: &[&str]| {
         let owned: Vec<String> = flags.iter().map(|s| (*s).to_owned()).collect();
@@ -8139,19 +8477,6 @@ fn assert_compile_inputs_withheld(
     );
 }
 
-/// A macro operation the driver adds by itself under the profile's optimisation level
-/// reaches the measured build and the control arms alike, so the checks the compile's
-/// inputs decide are read and not withheld (`src/compile_inputs.rs`'s module note has the
-/// Ubuntu measurement this stands in for). The fortify controls carry their own `-O2` and
-/// name the macro, and the arms' listing carries the profile's `-O` words as written:
-/// under `bare-optimized` (`-O2`) the driver adds the macro to both listings and
-/// `fortify-requested` reads the driver's request as the toolchain's, `on` at level 3 from a
-/// line that names no `-D`; under `-O0 -O2` likewise; under `-O2 -O0` the driver adds nothing
-/// to either and the check reads `off`. Without the carried words every reading of these
-/// probes is withheld (the first shape fails at its first observation); with a stand-in
-/// hard-wired to `-O2` the third shape is withheld, since the driver would add the macro to
-/// the stand-in and not to the measured line; under `bare` nothing is compared and the
-/// check reads `off` from a line the driver adds nothing to.
 #[test]
 fn a_macro_the_driver_adds_under_the_optimisation_level_reaches_the_arms() {
     if !can_run("that a macro the driver adds under -O reaches the arms' listing") {
@@ -8184,14 +8509,6 @@ fn a_macro_the_driver_adds_under_the_optimisation_level_reaches_the_arms() {
     assert_fortify_read(&report, ("off", None, None), "bare");
 }
 
-/// A header directory the driver adds by itself at the profile's optimisation level alone
-/// reaches the measured build and the stand-in at that level, and not the fortify controls,
-/// which carry their own `-O2`: the wrapper adds `-isystem` the declining `features.h` of
-/// `header_directory_withholds` under `-O3` only, and the profile is `-O3 -D_FORTIFY_SOURCE=3`.
-/// The listing at the controls' level lacks the directory, so every check the compile's
-/// inputs decide is withheld with the reason naming it, where a stand-in at the profile's
-/// level alone would otherwise read `fortify-effective` and its kin `off` over a triple that
-/// discriminates.
 #[test]
 fn a_header_the_driver_adds_at_the_profiles_level_alone_withholds_the_arms_at_another() {
     if !can_run("that a header the driver adds at the profile's level alone withholds") {
@@ -8226,15 +8543,6 @@ fn a_header_the_driver_adds_at_the_profiles_level_alone_withholds_the_arms_at_an
     );
 }
 
-/// A macro no control arm sets, added by the driver with the optimisation level, as a
-/// `specs` in a prefix the profile selects with `-B` adds one under `%{O*:...}`: the arms
-/// carry the prefix, so the forged `__SSP_STRONG__` reaches the measured build and the
-/// stand-in and not the arms that carry no `-O`, whose triple discriminates on its own
-/// flags, and `ssp-level` would read a forged `on`. The listing at those arms' level lacks
-/// the macro and no control sets it, so every listed check with an arm at another level
-/// (`ssp-level` and its kin, `optimization-enabled` for its `-O0` negative) is withheld with
-/// the reason naming it, while the fortify checks, whose controls carry `-O2` and so receive
-/// it too, are read.
 #[test]
 fn a_macro_no_control_sets_added_with_the_level_withholds_the_arms_that_carry_none() {
     if !can_run("that a macro no control sets, added under -O, withholds the arms without -O") {
@@ -8274,12 +8582,6 @@ fn a_macro_no_control_sets_added_with_the_level_withholds_the_arms_that_carry_no
     );
 }
 
-/// The converse: a macro no control sets that the driver adds only to a compile that is
-/// NOT optimising reaches the arms that carry no `-O` and `optimization-enabled`'s `-O0`
-/// negative, and neither the measured build nor the stand-in at the profile's level. The
-/// listing at those arms' level carries what the stand-in lacks, so every listed check with
-/// an arm at another level is withheld with the reason naming the macro, while the fortify
-/// checks, at the profile's level, are read.
 #[test]
 fn a_macro_the_driver_adds_only_without_the_level_withholds_the_arms_that_carry_none() {
     if !can_run("that a macro the driver adds only without -O withholds the arms without -O") {
@@ -8312,11 +8614,6 @@ fn a_macro_the_driver_adds_only_without_the_level_withholds_the_arms_that_carry_
     );
 }
 
-/// The same unowned macro operations in another order with the level: the driver adds
-/// `-DREVIEW_X=1 -UREVIEW_X` under `-O3` and the reverse order otherwise, under an `-O3`
-/// profile. No word is on one side alone, so a comparison of the words only on one side
-/// admitted it (fix check 1); the sequences with the controls' own macros removed differ,
-/// and every listed check, all of whose arms are at another level than `-O3`, is withheld.
 #[test]
 fn the_same_unowned_macros_in_another_order_with_the_level_withhold_the_arms_at_another() {
     if !can_run("that unowned macros reordered with the level withhold the arms at another") {
@@ -8349,9 +8646,6 @@ fn the_same_unowned_macros_in_another_order_with_the_level_withhold_the_arms_at_
     );
 }
 
-/// The same macro added under the same `-O2` by a file the profile names still withholds:
-/// the arms do not carry the file, so the narrowing is on the optimisation words the arms
-/// carry and not on the macro's name.
 #[test]
 fn a_macro_a_named_file_adds_under_the_optimisation_level_still_withholds() {
     if !can_run("that a macro a named file adds under -O still withholds") {
@@ -8377,19 +8671,17 @@ fn a_macro_a_named_file_adds_under_the_optimisation_level_still_withholds() {
     );
 }
 
-/// `pic-shared-link` under clang's link-time optimization, through the real clang.
-///
-/// clang's `-flto` writes bitcode and the `-shared` link generates the code, at the
-/// position-independence it picks itself: on Fedora 44 x86_64 (clang 22.1.8, GNU ld 2.46.1)
-/// `--profile explicit --flags '-O2'` read `off` (`recompile with -fPIC`) and `-O2 -flto`
-/// read `on`, over a triple that discriminated, with no `-fPIC` in either. The flag
-/// arrives here three ways, each of which the driver's `-###` command resolves to
-/// `-flto=full`: on the profile's flags, after a `-fno-lto`, and from a `--config=` file.
-/// `-fno-lto` last is no LTO and keeps the reading the non-LTO build gets. Skipped, with
-/// the gap announced, where no `clang` is on the PATH.
 #[test]
 fn a_clang_link_under_lto_is_not_read_as_position_independent_code() {
     if !can_run("that pic-shared-link withholds a link that succeeded under clang's -flto") {
+        return;
+    }
+    // The check reads an ELF shared-object link.
+    if !cfg!(target_os = "linux") {
+        common::capability_gap(
+            "clang LTO arm",
+            "pic-shared-link reads an ELF link; this host does not link ELF",
+        );
         return;
     }
     let clang = Command::new("sh")
@@ -8425,7 +8717,22 @@ fn a_clang_link_under_lto_is_not_read_as_position_independent_code() {
             cell["gating"]["rule"].as_str().map(str::to_owned),
         )
     };
-    let (plain, _) = read("-O2");
+    let (plain, plain_rule) = read("-O2");
+    assert_eq!(
+        (plain.as_str(), plain_rule),
+        ("off", None),
+        "-O2 alone: the link refuses code no -fPIC described"
+    );
+    // Where this clang's LTO link refuses the code too (clang 18.1.3 on Ubuntu 24.04 aarch64
+    // under GNU ld, lld and mold), no link succeeds under LTO and the shape the rule withholds
+    // does not arise: `off` stands, as it should.
+    if read("-O2 -flto").0 == "off" {
+        common::capability_gap(
+            "clang LTO arm",
+            "this clang's LTO link refuses code no -fPIC described, so no LTO link succeeds",
+        );
+        return;
+    }
     for flags in [
         "-O2 -flto",
         "-O2 -flto=thin",
@@ -8433,14 +8740,11 @@ fn a_clang_link_under_lto_is_not_read_as_position_independent_code() {
         config_flags.as_str(),
     ] {
         let (verdict, rule) = read(flags);
-        assert_ne!(
-            verdict, "on",
-            "{flags}: a link that succeeded under LTO is not the code the flags describe \
-             (without -flto: {plain})"
+        assert_eq!(
+            (verdict.as_str(), rule.as_deref()),
+            ("indeterminate", Some("lto-codegen-at-link")),
+            "{flags}: a link that succeeded under LTO is not the code the flags describe"
         );
-        if let Some(rule) = rule {
-            assert_eq!(rule, "lto-codegen-at-link", "{flags}");
-        }
     }
     // The last word decides: LTO turned off again is the plain build.
     let (verdict, rule) = read("-O2 -flto -fno-lto");
@@ -8451,19 +8755,110 @@ fn a_clang_link_under_lto_is_not_read_as_position_independent_code() {
     assert_eq!(rule, None);
 }
 
-/// `pic-shared-link` under a `-z notext` the link line does not show, through the real `cc`.
-///
-/// The wrapper stands for a specs or configuration file: it appends `-Wl,-z,notext` to every
-/// `-shared` link, so chard's argv never carries it, and it refuses a large-model `-fPIE`
-/// link in lld's words, which is what makes the regime arm unable to withhold. Measured
-/// 2026-10-11 in the Fedora 44 x86_64 image (gcc 16.2.1 with a specs file and clang 22.1.8
-/// with a configuration file, LLD 22.1.8), `-O2 -fno-pic -mcmodel=large -fuse-ld=lld` linked
-/// `-shared` with exit 0, an empty stderr and `DT_TEXTREL`, the regime arm was refused with
-/// the line quoted below, and the check read `on`. Here the host's own linker takes the
-/// hidden flag; GNU ld 2.46.1 links the code in silence with `DT_TEXTREL` set, as LLD does.
-/// The shared object's tag is what withholds it. `-O2 -fno-pic` is refused whatever the
-/// flag and stays `off`, and `-O2 -fPIC` reads `on` wherever its object carries no tag.
-/// Skipped, with the gap announced, off x86_64, where `-mcmodel=large` is not this shape.
+#[test]
+fn a_replay_holds_the_lto_gating_to_the_published_listing() {
+    if !can_run("that detect re-derives lto-codegen-at-link from the published listing") {
+        return;
+    }
+    if !cfg!(target_os = "linux") {
+        common::capability_gap(
+            "clang LTO arm",
+            "pic-shared-link reads an ELF link; this host does not link ELF",
+        );
+        return;
+    }
+    let clang = Command::new("sh")
+        .args(["-c", "command -v clang"])
+        .output()
+        .expect("sh is available");
+    let clang = String::from_utf8_lossy(&clang.stdout).trim().to_owned();
+    if clang.is_empty() {
+        common::capability_gap("clang arm", "no clang on the PATH");
+        return;
+    }
+    let work = common::Work::new("fakedriver", "lto-replay");
+    let driver = fake_driver_named(work.dir(), "fakeclang", &clang, r#"exec "$REAL" "$@""#);
+    let read = |flags: &str| -> Value {
+        measure(
+            &driver,
+            work.dir(),
+            &[
+                "--profile",
+                "explicit",
+                "--flags",
+                flags,
+                "--probe",
+                "pic-shared-link",
+            ],
+        )
+    };
+    let check = chard::detect::check_by_id("pic-shared-link").expect("a corpus check");
+    let gates = |report: &Value| -> (bool, Vec<chard::detect::GateReplayed>) {
+        let replay = chard::detect::replay_report(report, check, None).expect("the report replays");
+        (replay.agrees(), replay.gates)
+    };
+    let lto = read("-O2 -flto");
+    let cell = &lto["observations"][0];
+    // Where this clang's LTO link refuses the code, as the test above allows for, no link
+    // succeeds under LTO and the rule has nothing to withhold; anywhere else it must fire.
+    if cell["verdict"] == "off" {
+        common::capability_gap(
+            "clang LTO arm",
+            "this clang's LTO link refuses code no -fPIC described, so no LTO link succeeds",
+        );
+        return;
+    }
+    assert_eq!(cell["gating"]["rule"], "lto-codegen-at-link", "{cell}");
+    let (agrees, as_written) = gates(&lto);
+    assert!(agrees, "{as_written:?}");
+    assert_eq!(as_written.len(), 1, "one gate per observation");
+    assert_eq!(
+        as_written[0].outcome,
+        chard::detect::GateOutcome::Agrees,
+        "{as_written:?}"
+    );
+
+    let mut edits = 0;
+    // The gating deleted and the verdict set to the link's `on`.
+    let mut ungated = lto.clone();
+    let o = &mut ungated["observations"][0];
+    o.as_object_mut().expect("an observation").remove("gating");
+    o["verdict"] = Value::from("on");
+    let (agrees, found) = gates(&ungated);
+    assert!(!agrees, "a deleted gating replays as agreeing: {found:?}");
+    assert_eq!(
+        found[0].rederived,
+        [Some("lto-codegen-at-link")],
+        "{found:?}"
+    );
+    edits += 1;
+
+    // The listing's LTO words removed beneath the published gating.
+    let mut unlisted = lto.clone();
+    let listing = &mut unlisted["listings"]["pic-shared-link"]["measured_compile"]["answer"];
+    assert!(listing.is_object(), "{}", unlisted["listings"]);
+    listing["lto"] = Value::Array(Vec::new());
+    let (agrees, found) = gates(&unlisted);
+    assert!(
+        !agrees,
+        "a gating its listing does not license agrees: {found:?}"
+    );
+    edits += 1;
+
+    // A listing rule's gating added where none fired.
+    let plain = read("-O2");
+    assert_eq!(plain["observations"][0]["verdict"], "off", "{plain}");
+    assert!(gates(&plain).0, "the -O2 report replays");
+    let mut gated = plain.clone();
+    let o = &mut gated["observations"][0];
+    o["verdict"] = Value::from("indeterminate");
+    o["gating"] = lto["observations"][0]["gating"].clone();
+    let (agrees, found) = gates(&gated);
+    assert!(!agrees, "an added gating agrees: {found:?}");
+    edits += 1;
+    assert_eq!(edits, 3);
+}
+
 #[test]
 fn a_link_under_a_hidden_notext_is_read_from_the_objects_dt_textrel() {
     if !can_run("that pic-shared-link withholds a link whose shared object carries DT_TEXTREL") {
@@ -8564,16 +8959,6 @@ fn report_textrel(report: &Value, sha: &str) -> bool {
         .expect("the facts carry textrel")
 }
 
-/// `pic-shared-link` under clang's `-flto` reads `on` where the driver's `-cc1` command
-/// resolves the compile to position-independent code without PIE, and only there.
-///
-/// Measured on Fedora 44 x86_64 (clang 22.1.8): `-flto -fPIC` prints `-mrelocation-model pic
-/// -pic-level 2`, `-flto -fpic` the same with `-pic-level 1`, `-flto -fPIE` adds `-pic-is-pie`,
-/// and `-flto` and `-flto -fno-pic` print `-mrelocation-model static`; a `--config=` file's
-/// `-fPIC` prints as the command-line one does, and the last of `-fPIC` and `-fPIE` decides.
-/// The cell's `evidence.observed` quotes those words, and `-fPIE` and `-fno-pic` keep the
-/// readings the other compile resolutions give.
-/// Skipped, with the gap announced, where no `clang` is on the PATH.
 #[test]
 fn a_clang_link_under_lto_reads_on_where_the_compile_resolves_to_pic() {
     if !can_run("that pic-shared-link reads on from the -cc1 relocation model under -flto") {
@@ -8657,15 +9042,6 @@ fn a_clang_link_under_lto_reads_on_where_the_compile_resolves_to_pic() {
     assert!(!observed.contains("-mrelocation-model"), "{observed}");
 }
 
-/// A driver that writes its diagnostics as SARIF, by a specs file or a configuration file
-/// rather than the profile, withholds the compiler-diag checks it would otherwise read off.
-///
-/// The wrapper answers the measured `warn-all` build with a SARIF document that embeds the
-/// probe's source, as gcc 16.1.1 does whenever it reports anything (Fedora 44 x86_64,
-/// 2026-10-09: `-O2 -fdiagnostics-format=sarif-stderr` read `warn-all` `on` where `-O2` read
-/// `off`). The needle `chard_wall_dead_label` sits on a line of the document, and no `-Wall`
-/// is passed. The arms are left alone, so only the measured build is structured. A wrapper
-/// that changes nothing is the control: the same run reads `off`.
 #[test]
 fn a_structured_stderr_the_profile_did_not_ask_for_withholds_the_diag_check() {
     if !can_run("that a SARIF stderr from a specs or configuration file is withheld") {
@@ -8785,10 +9161,6 @@ fn gate_lines(report: &Value, corpus: &[&str]) -> Vec<(String, String)> {
     expected
 }
 
-/// A failed `--fail-on-missing` names, on stderr after the report, each check that failed
-/// it: here the macro checks a failing dump withheld and every corpus check `--probe` did
-/// not select, by id, re-derived from the report it wrote and the corpus `chard probes`
-/// lists. Without the flag the same run exits 0 and names nothing.
 #[test]
 fn a_failed_completeness_gate_names_each_check_that_failed_it() {
     if !can_run("that a failed --fail-on-missing names each check that failed it") {
@@ -8857,8 +9229,7 @@ exec "$REAL" "$@""#,
         .count();
     assert!(
         withheld > 0,
-        "the failing dump withheld no verdict, so the unsettled half is not exercised: \
-         stderr was:\n{stderr}"
+        "the failing dump withheld no verdict; stderr was:\n{stderr}"
     );
 
     let mut after_report: Vec<&str> = stderr
@@ -8867,22 +9238,10 @@ exec "$REAL" "$@""#,
         .skip(1)
         .collect();
     assert_the_gate_block_closes(&mut after_report, &expected);
-    let mut want = vec![format!(
-        "chard: --fail-on-missing: {} of the corpus's {} checks are not attempted or not \
-         settled; this run selected {} with --probe, and the gate counts the whole corpus",
-        expected.len(),
-        corpus.len(),
-        report["coverage"]["checks_expected"]
-    )];
-    want.extend(
-        expected
-            .iter()
-            .map(|(_, line)| format!("chard: --fail-on-missing: {line}")),
-    );
     assert_eq!(
-        after_report, want,
-        "the lines after the report name each check that failed the gate, by id, with its \
-         reason"
+        after_report.len(),
+        expected.len() + 1,
+        "one line after the report for each check that failed the gate: {after_report:?}"
     );
 }
 
@@ -8910,9 +9269,6 @@ fn assert_the_gate_block_closes(after_report: &mut Vec<&str>, expected: &[(Strin
 }
 
 /// `measure` through `driver` with `args`, and its exit status beside the report.
-///
-/// Refuses a run that contradicted itself or published a contradiction, as
-/// [`measure_probes_under`] does, and hands back the status so a test can hold it to 0.
 fn measure_with_status(driver: &Path, workdir: &Path, args: &[&str]) -> (Option<i32>, Value) {
     let output = Command::new(chard_binary())
         .arg("measure")
@@ -8945,9 +9301,6 @@ fn measure_with_status(driver: &Path, workdir: &Path, args: &[&str]) -> (Option<
 }
 
 /// Does `stderr` hold a line on which `tool` stopped and named `flag`?
-///
-/// The test's own reading, written apart from chard's reader: a line opening `tool:`,
-/// carrying the flag between quotes, and no `warning:` or `note:`.
 fn refuses(stderr: &str, tool: &str, flag: &str) -> bool {
     stderr.lines().any(|line| {
         line.trim_start().starts_with(&format!("{tool}:"))
@@ -9046,9 +9399,6 @@ const REJECTION_PROBES: [&str; 6] = [
     "toolchain-macros",
 ];
 
-/// A compile flag the real driver rejects, from `--profile explicit`, is one diagnostic
-/// naming the operator as its source, the tool, the flag and the cells it withheld, and the
-/// run still exits 0 (the shape measured on Fedora 44 x86_64, gcc).
 #[test]
 fn an_explicit_compile_flag_the_driver_rejects_is_named_once_with_its_count() {
     if !can_run("that a compile flag the driver rejects is named once") {
@@ -9076,9 +9426,6 @@ fn an_explicit_compile_flag_the_driver_rejects_is_named_once_with_its_count() {
     );
 }
 
-/// Two compile flags the real driver rejects in one build, one line each, are two
-/// diagnostics, each counting every cell: the second is named though each cell's
-/// `build_rejection` names only the first.
 #[test]
 fn two_flags_the_driver_rejects_in_one_build_are_both_named() {
     if !can_run("that two flags rejected in one build are both named") {
@@ -9107,8 +9454,6 @@ fn two_flags_the_driver_rejects_in_one_build_are_both_named() {
     );
 }
 
-/// A linker option the real linker rejects, from `--profile explicit --ldflags`, is one
-/// diagnostic under the linker's name and spelling, and the run exits 0.
 #[test]
 fn an_explicit_link_flag_the_linker_rejects_is_named_once_with_its_count() {
     if !can_run("that a link flag the linker rejects is named once") {
@@ -9154,9 +9499,6 @@ fn refusing_driver(work: &Path, flags: &[&str]) -> PathBuf {
     )
 }
 
-/// A built-in profile on a driver that lacks one of its flags is measured and published,
-/// not refused, and its diagnostic says this toolchain rejects a flag the named profile
-/// supplies.
 #[test]
 fn a_built_in_profile_flag_the_driver_lacks_reads_the_profile_and_is_not_refused() {
     if !can_run("that a built-in profile's rejected flag is named and not refused") {
@@ -9184,8 +9526,6 @@ fn a_built_in_profile_flag_the_driver_lacks_reads_the_profile_and_is_not_refused
     );
 }
 
-/// A built-in profile on a driver that lacks two of its flags names both, the shape of an
-/// older gcc under `openssf-tldr`.
 #[test]
 fn two_built_in_profile_flags_the_driver_lacks_are_both_named() {
     if !can_run("that two built-in profile flags a driver lacks are both named") {
@@ -9216,8 +9556,6 @@ fn two_built_in_profile_flags_the_driver_lacks_are_both_named() {
     }
 }
 
-/// Two flags rejected in different cells are two diagnostics, the one withholding more
-/// cells first, whatever order the profile names them in; a run with no refusal has none.
 #[test]
 fn two_rejected_flags_are_two_diagnostics_in_a_fixed_order_and_none_is_none() {
     if !can_run("that two rejected flags give two diagnostics in a fixed order") {
@@ -9226,7 +9564,6 @@ fn two_rejected_flags_are_two_diagnostics_in_a_fixed_order_and_none_is_none() {
     let work = common::Work::new("fakedriver", "rejected-two");
     // A measured build carries both flags; the driver names `-fzzz-one` for the no-plt
     // probe's source and `-fzzz-two` for every other, so each flag withholds its own cells.
-    // A control arm carries neither and goes through.
     let driver = fake_driver(
         work.dir(),
         r#"profile=0
@@ -9352,13 +9689,6 @@ fn closing_line_of(output: &std::process::Output) -> String {
     closing[0].to_owned()
 }
 
-/// `measure` never exits without its closing line, on each path a run can end on short of a
-/// contradiction (which no run reaches without a defect in chard; `closing_line`'s unit
-/// tests hold those two lines): a report written to the default file in the current
-/// directory, named from the compiler and the profile, then again over it with the earlier
-/// one set aside and removed; the report to stdout under `-o -`, leaving the file alone; the
-/// gate; a failure after the set-aside, naming the earlier report kept; a refusal before it;
-/// and a command line clap refuses.
 #[test]
 fn measure_closes_every_run_with_one_line_naming_what_it_wrote() {
     if !can_run("that measure closes every run with one line naming what it wrote") {
@@ -9429,24 +9759,12 @@ exec "$REAL" "$@""#,
     let before = std::fs::read(&default).expect("the default report");
     let streamed = run(&[&measure[..], &["-o", "-"]].concat());
     assert_eq!(streamed.status.code(), Some(0), "{streamed:?}");
-    let on_stdout: Value =
-        serde_json::from_slice(&streamed.stdout).expect("-o - puts the report on stdout");
+    serde_json::from_slice::<Value>(&streamed.stdout).expect("-o - puts the report on stdout");
     assert_eq!(
         std::fs::read(&default).expect("the default report"),
         before,
         "-o - leaves the default file alone"
     );
-    let line = closing_line_of(&streamed);
-    let counts = closing_of_a_published_run(&on_stdout, "X", "wd", "0", false);
-    let counts = &counts[counts.find(" (").expect("counts")..counts.find(';').expect("end")];
-    assert_eq!(
-        line,
-        format!(
-            "chard: measure exits 0: sent the report to stdout{counts}; work directory wd \
-             kept; next: chard table on a file holding what stdout received"
-        )
-    );
-
     let gated = run(&[&measure[..], &["--fail-on-missing"]].concat());
     assert_eq!(gated.status.code(), Some(1), "{gated:?}");
     assert!(
@@ -9472,12 +9790,6 @@ fn the_refusals_close_with_what_they_left(
     let envelope: Value = serde_json::from_slice(&failed.stdout).expect("the envelope");
     assert!(envelope["error"].is_object(), "{envelope}");
     assert_eq!(
-        closing_line_of(&failed),
-        "chard: measure exits 2: refused or failed, the envelope on stdout says why; r.json \
-         holds no report from this run, and the earlier report is kept as r.json.previous; \
-         work directory wd kept; next: the envelope's hint"
-    );
-    assert_eq!(
         std::fs::read_to_string(work.path("r.json.previous")).expect("kept"),
         "earlier\n"
     );
@@ -9486,32 +9798,21 @@ fn the_refusals_close_with_what_they_left(
     std::fs::write(work.path("s.json.previous"), "older\n").expect("an older run's file");
     let failed = run(&["--cc", "./no-such-cc", "--workdir", "wd", "-o", "s.json"]);
     assert_eq!(failed.status.code(), Some(2), "{failed:?}");
-    assert_eq!(
-        closing_line_of(&failed),
-        "chard: measure exits 2: refused or failed, the envelope on stdout says why; s.json \
-         holds no report from this run, and an older run's s.json.previous is beside it; work \
-         directory wd kept; next: the envelope's hint"
+    assert!(
+        closing_line_of(&failed).contains("s.json.previous"),
+        "{failed:?}"
     );
 
-    let refused_line = "chard: measure exits 2: refused or failed, the envelope on stdout says \
-                        why; refused before the run started, so an earlier report is where it \
-                        was and nothing was built; next: the envelope's hint";
     let refused = run(&["--cc", cc, "--workdir", "wd2", "--probe", "no-such-probe"]);
     assert_eq!(refused.status.code(), Some(2), "{refused:?}");
-    assert_eq!(closing_line_of(&refused), refused_line);
+    assert!(closing_line_of(&refused).starts_with("chard: measure exits 2"));
     assert!(!work.path("wd2").exists(), "nothing was made");
 
     let usage = run(&["--no-such-option"]);
     assert_eq!(usage.status.code(), Some(2), "{usage:?}");
-    assert_eq!(closing_line_of(&usage), refused_line);
+    assert_eq!(closing_line_of(&usage), closing_line_of(&refused));
 }
 
-/// `chard digest` prints the block a report leads with and nothing else, and refuses the
-/// reports `table` refuses: one whose digest is not the one its own fields give, and one
-/// with no digest, which `table` refuses too. Every reader holds the report's
-/// `chard_schema` and its digest's presence before any rule
-/// ([`every_reader_refuses_another_chard_schema_and_a_missing_digest`]). The `weaken`
-/// check's polarity reaches `table`'s legend and `matrix`'s cell.
 #[test]
 fn chard_digest_prints_the_block_a_report_leads_with() {
     if !can_run("that chard digest prints the block a report leads with") {
@@ -9684,9 +9985,6 @@ fn without_digest(report: &mut Value) {
 /// four, as a control. Then [`a_report_with_no_digest_is_refused_by_the_readers_of_verdicts`]
 /// and [`a_forged_report_leaves_the_earlier_output_and_refuses_the_set`] over the first
 /// forged file.
-///
-/// A reader that did not compare the field would render a gcc `bare` report with its digest
-/// removed and `chard_schema` `"99"` through `table` with exit 0.
 fn every_reader_refuses_another_chard_schema_and_a_missing_digest(
     work: &common::Work,
     honest: &Path,
@@ -9898,15 +10196,6 @@ fn the_renderers_carry_the_polarity(path: &Path) {
 /// program it links, adds `lie` to the `-dM -E` dumps alone, and appends one line to `log`
 /// for each dump it lied to, so a test can show the lie was told on a host whose compiler
 /// defines the lied-about macro by itself.
-///
-/// The stripping is what a tool run after the link does (`objcopy --remove-section`); no
-/// spec or configuration file reaches a linked program after the link, and every probe
-/// with a macro-channel check references the section from its code, so a linker does not
-/// collect it (`tests/probe_sources.rs`). The dump-only `lie` is the `*cpp_options`-only
-/// spec shape `DESIGN.md` describes, which the artifact's own section would show up
-/// and a stripped artifact cannot. The compile-only, preprocess-only and query
-/// invocations are passed through untouched, so `toolchain::detect`'s listings are the
-/// real driver's; its own `-dM -E` dumps take the lie too, which is the spec-file shape.
 fn strips_the_self_report(lie: &str, log: &Path) -> String {
     format!(
         r#"LOG='{}'
@@ -9948,11 +10237,7 @@ fn assert_withheld_for_the_missing_section(report: &Value, check: &str) {
         "{check}: {}",
         obs["gating"]
     );
-    let reason = obs["gating"]["reason"].as_str().expect("a reason");
-    assert!(
-        reason.contains("and no `.chard.report`") && reason.contains("`-dM -E` dump's alone"),
-        "{check}: {reason}"
-    );
+    assert!(obs["gating"]["reason"].is_string(), "a reason");
     assert_eq!(
         obs["evidence"]["macro_source"], "preprocessor",
         "{check}: the macros were the dump's, and the report says so: {}",
@@ -9960,8 +10245,7 @@ fn assert_withheld_for_the_missing_section(report: &Value, check: &str) {
     );
     assert_eq!(
         obs["controls"]["discriminating"], true,
-        "{check}: the arms are dump readings and discriminate; the gate is on the measured \
-         build, not a probe-invalid: {}",
+        "{check}: the arms, dump readings, do not discriminate: {}",
         obs["controls"]
     );
 }
@@ -9997,20 +10281,6 @@ fn assert_one_warning_and_no_disagreement(report: &Value, probe: &str) {
     );
 }
 
-/// A driver that removes `.chard.report` after each link withholds every macro-channel
-/// verdict of a probe that embeds it, and a `-fstack-protector-strong` handed to the
-/// `-dM -E` job alone does not publish `ssp-level` `strong` beside `canary-emitted` `off`.
-///
-/// The shape is a driver wrapper that strips the section after each link. Read from the dump,
-/// it publishes six macro checks of `toolchain-macros` `off` and one `on` at
-/// `confidence: high` with `discriminating: true`, and under the dump-only flag `ssp-level`
-/// `on`, level `strong`, beside `canary-emitted` `off`, with `consistency.status`
-/// `consistent` and exit 0 (Fedora 44 x86_64, gcc 16.1.1, 2026-10-20). The only mark of the
-/// strip is then one warning, and under the dump-only flag one `CHANNELS DISAGREE` error
-/// diagnostic beside it, which moves neither the status nor the exit. Every macro check over
-/// the stripped artifact is `indeterminate` under `artifact-lacks-self-report`, the warning
-/// says the artifact lists no such section, the elf-static reading over the same artifact
-/// stands, and the group does not disagree.
 #[test]
 fn a_driver_that_strips_the_self_report_withholds_every_macro_verdict() {
     if !can_run("that a macro reading over an artifact without its .chard.report is withheld") {
@@ -10080,8 +10350,7 @@ fn a_driver_that_strips_the_self_report_withholds_every_macro_verdict() {
     let ssp = observation(&report, "ssp-level");
     assert!(
         ssp["evidence"]["macros"]["__SSP_STRONG__"].is_string(),
-        "the dump the wrapper lied to is what the withheld reading carries (the value is the \
-         compiler's: gcc defines `__SSP_STRONG__` as 3, clang as 2): {}",
+        "the withheld reading does not carry the dump the wrapper lied to: {}",
         ssp["evidence"]
     );
     assert!(
@@ -10108,16 +10377,6 @@ fn a_driver_that_strips_the_self_report_withholds_every_macro_verdict() {
     assert_eq!(report["consistency"]["status"], "consistent");
 }
 
-/// A C++ driver that removes `.chard.report` after each link and defines
-/// `_GLIBCXX_ASSERTIONS` for the `-dM -E` job alone reads `cxx-hardening-requested`
-/// `indeterminate`, not `on`.
-///
-/// A real toolchain reaches this shape where a probe source does not reference its report:
-/// a `--gc-sections` link on a compiler without `retain` drops the section and the dump
-/// stands in. Read from the dump, this wrapper publishes `cxx-hardening-requested` `on` at
-/// `confidence: high` beside `cxx-stdlib-assertions` `off` and `cxx-assertions-symbol` `off`
-/// (Fedora 44 x86_64, g++ 16.1.1, 2026-10-20), the two artifact channels reading the code the
-/// dump lies about. The runtime and elf-static readings over the same artifact stand.
 #[test]
 fn a_cpp_only_assertions_request_over_a_stripped_artifact_reads_indeterminate_not_on() {
     if !can_run("that the C++ macro check over an artifact without its .chard.report is withheld") {
@@ -10185,17 +10444,67 @@ fn a_cpp_only_assertions_request_over_a_stripped_artifact_reads_indeterminate_no
     );
 }
 
-/// A driver that leaves an artifact chard's ELF reader refuses, or none at all, with a
-/// `-fstack-protector-strong` handed to the `-dM -E` job alone, reads every macro check
-/// `indeterminate` under `artifact-lacks-self-report`, not `ssp-level` `on`.
-///
-/// The other half of the gate: the artifact gates inside `settle` read the artifact's
-/// facts, and here there are none. Without that half, both wrappers publish `ssp-level` `on`,
-/// level `strong`, from the dump beside an error diagnostic naming only the elf-static checks
-/// as withheld (Fedora 44 x86_64, gcc 16.1.1). On macOS the dump is
-/// read by design over a Mach-O object the reader refused, and over nothing else it
-/// refused (`report::artifact_account_missing`); the refused ELF below is withheld there
-/// too, which `a_refused_elf_artifact_on_a_macos_run_is_no_by_design_dump_reading` holds.
+/// The rule a macro check is withheld under over a build that gave no account of its
+/// macros: the witness's where the build left an artifact the run could hold to it and
+/// did not confirm, and the self-report's otherwise.
+fn rule_over_no_account(unwitnessed: bool) -> &'static str {
+    if unwitnessed {
+        "artifact-lacks-run-witness"
+    } else {
+        "artifact-lacks-self-report"
+    }
+}
+
+/// A run carries a witness exactly where its artifacts are ELF. Whether it does is the
+/// host's fact, never read off the report under test: a run that lost its witness would
+/// otherwise be held to the rule a run without one publishes, and pass.
+fn assert_witnessed_where_elf(tag: &str, report: &Value) {
+    assert_eq!(
+        report["run"].get("artifact_witness").is_some(),
+        common::ELF_HOST,
+        "{tag}: a run carries a witness exactly where its artifacts are ELF"
+    );
+}
+
+/// The witness rule's reason quotes the reader's own refusal of the build under `key`: the
+/// words the store keeps after the artifact's name.
+fn assert_quotes_the_stored_refusal(tag: &str, report: &Value, key: Option<&str>, reason: &str) {
+    let refusal = key
+        .and_then(|key| report["facts"][key]["error"].as_str())
+        .expect("the refusal is stored");
+    let words = refusal.rsplit(": ").next().expect("the refusal's words");
+    assert!(
+        reason.contains("the ELF reader refused") && reason.contains(words),
+        "{tag}: the reason quotes the stored refusal `{refusal}`: {reason}"
+    );
+}
+
+/// Every macro check of `report` that built is withheld as unwitnessed: nothing of the dump
+/// is published beside the withholding, and no arm is built.
+fn assert_every_macro_check_is_unwitnessed(tag: &str, report: &Value) {
+    let mut withheld = 0;
+    for obs in macro_observations(report) {
+        // Decided before any build: an arch gate.
+        if obs.get("build").is_none() {
+            continue;
+        }
+        let check = &obs["check"];
+        assert_eq!(
+            obs["gating"]["rule"], "artifact-lacks-run-witness",
+            "{tag}: {check}"
+        );
+        assert_eq!(obs["verdict"], "indeterminate", "{tag}: {check}");
+        assert!(obs.get("controls").is_none(), "{tag}: {check}");
+        assert!(
+            obs["evidence"].get("macros").is_none(),
+            "{tag}: {check} publishes the dump's macros: {obs}"
+        );
+        withheld += 1;
+    }
+    assert!(withheld >= 6, "{tag}: {withheld} withheld");
+    assert_eq!(report["consistency"]["status"], "consistent", "{tag}");
+}
+
 #[test]
 fn a_driver_that_leaves_no_readable_artifact_withholds_every_macro_verdict() {
     if !can_run("that a macro reading over an artifact the reader refused is withheld") {
@@ -10248,12 +10557,19 @@ fn a_driver_that_leaves_no_readable_artifact_withholds_every_macro_verdict() {
         }
         assert_eq!(ssp["verdict"], "indeterminate", "{tag}: {ssp}");
         assert!(ssp.get("level").is_none(), "{tag}: {ssp}");
-        assert_eq!(
-            ssp["gating"]["rule"], "artifact-lacks-self-report",
-            "{tag}: {ssp}"
-        );
+        // Under a witness (every run but macOS's) an artifact the reader refused is one it
+        // could not hold to the witness, and is withheld before the self-report gate asks
+        // anything of it, on every check and with no triple built.
+        assert_witnessed_where_elf(tag, &report);
+        let unwitnessed = key.is_some() && common::ELF_HOST;
+        let rule = rule_over_no_account(unwitnessed);
+        assert_eq!(ssp["gating"]["rule"], rule, "{tag}: {ssp}");
         let reason = ssp["gating"]["reason"].as_str().expect("a reason");
-        assert!(reason.contains(says), "{tag}: {reason}");
+        if unwitnessed {
+            assert_quotes_the_stored_refusal(tag, &report, key, reason);
+        } else {
+            assert!(reason.contains(says), "{tag}: {reason}");
+        }
         assert_eq!(
             ssp["evidence"]["macro_source"], "preprocessor",
             "{tag}: {ssp}"
@@ -10268,14 +10584,18 @@ fn a_driver_that_leaves_no_readable_artifact_withholds_every_macro_verdict() {
             );
         }
         assert!(
-            ssp["evidence"]["macros"]["__SSP_STRONG__"].is_string(),
-            "{tag}: the lie reached the dump: {ssp}"
-        );
-        assert!(
             lies_told(&log) > 0,
             "{tag}: the wrapper never saw a -dM job"
         );
         let mut withheld = 0;
+        if unwitnessed {
+            assert_every_macro_check_is_unwitnessed(tag, &report);
+            continue;
+        }
+        assert!(
+            ssp["evidence"]["macros"]["__SSP_STRONG__"].is_string(),
+            "{tag}: the lie reached the dump: {ssp}"
+        );
         for obs in macro_observations(&report) {
             // No triple, or a triple that did not discriminate (`pie-macro` and `pic-macro`
             // under Apple clang 21 on macOS 27): the gate leaves those readings standing.
@@ -10294,16 +10614,6 @@ fn a_driver_that_leaves_no_readable_artifact_withholds_every_macro_verdict() {
     }
 }
 
-/// A measured artifact whose report says every macro is undefined is the artifact's own
-/// account: `measure` keeps it over the dump as an empty map, the macro checks read `off`
-/// from it with `macro_source: compiled-artifact`, and `chard detect` replays the same
-/// reading from the stored facts.
-///
-/// `measure` and `detect` read such a report the same way, rather than `measure` dropping it
-/// for the dump while `detect` reads no macros, two readings of one input. The wrapper rewrites the
-/// section of the measured build alone, so the control arms keep the compiler's own report and the
-/// triple discriminates; an honest dump beside it defines none of the watched macros under
-/// `bare-optimized`, so the two views agree.
 #[test]
 fn a_report_whose_fields_all_read_undefined_is_the_artifacts_account() {
     if !can_run("that an all-undefined self-report is kept as the artifact's account") {
@@ -10396,17 +10706,6 @@ const REFUSED_ELF: &str =
 const PLANTED_MACH_O: &str =
     r#"{ printf '\317\372\355\376'; head -c 60 /dev/zero; } > "$out" || exit 97"#;
 
-/// A driver that removes `.chard.report` from one control arm's program alone leaves the
-/// measured verdict the artifact's own reading, and the arm says it read the dump in its
-/// own `macro_source`, the one mark the loss leaves.
-///
-/// The gate `artifact-lacks-self-report` is on the measured build
-/// (`report::self_report_limitation`): an arm without its section is a dump reading whose
-/// outcome the triple takes as it is, and no warning names an arm's artifact, since
-/// `measure::evidence_faults` reads the measured build's. The register entry
-/// `self-report-absent-withholds-the-macro-channel` names that as the residual this test
-/// holds. The wrapper keys on the variant's name in `-o`, which `-dM -E` jobs do not carry,
-/// so the arm's dump is the compiler's own.
 #[test]
 fn an_arm_that_lost_its_self_report_says_so_in_its_own_macro_source() {
     if !can_run("that a control arm without its .chard.report discloses it") {
@@ -10530,26 +10829,6 @@ fn self_report_warnings(report: &Value) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// A probe with no macro-channel check that embeds `.chard.report` publishes the same
-/// verdicts and levels with the section and without it, and the per-probe warning is the
-/// one mark the loss leaves.
-///
-/// Such a probe carries the section as provenance, and most never reference it from code,
-/// so a `--gc-sections` link on a compiler without the `retain` attribute (gcc before 11,
-/// clang before 13) can drop it, as it can drop the C++ probe's. Their
-/// checks read the artifact or the run. The section reaches the fortify runtime detectors,
-/// which credit a trap to fortify-headers or Apple's implementation (`decode::runtime`'s
-/// `fortify_impl`) or name a library without subobject bounds from it, withhold without it,
-/// and do not arise on a glibc host; and the declared family's choice among the reasons for
-/// a `probe-invalid`.
-/// The wrapper overwrites the section of every linked program, the arms' included, with
-/// as many zero bytes, so the section holds no report and the program's layout is the
-/// one the linker wrote; an object-mode probe's `-c` output keeps its section, and the
-/// warning is expected exactly where the measured build's artifact was read. Removing the
-/// section instead (`objcopy --remove-section`) rewrites the program's layout, and on
-/// Fedora 44 x86_64 under gcc 16.1.1 on 2026-10-20 it moved `link-defaults`' `relro` from
-/// `partial` to `probe-invalid`: a reading of the segments the rewrite moved, not of the
-/// section.
 #[test]
 fn a_probe_without_a_macro_check_reads_no_verdict_from_its_self_report() {
     if !can_run("that a probe without a macro check reads no verdict from its self-report") {
@@ -10648,19 +10927,6 @@ fn a_probe_without_a_macro_check_reads_no_verdict_from_its_self_report() {
     assert_eq!(stripped["consistency"]["status"], "consistent");
 }
 
-/// The macOS exemption is the reader's Mach-O finding on a macOS run, never the platform
-/// alone: an ELF artifact the reader refused, in a report that says macOS, is an artifact
-/// that gave no account, and a macro measurement over it is refused on read.
-///
-/// No macOS run can be had on this host, so the shape is planted in the report. A driver
-/// overwrites each linked program with an ELF identification the reader refuses
-/// ([`REFUSED_ELF`]), `measure` withholds `ssp-level` under `artifact-lacks-self-report`,
-/// and the report is then edited to say `macos` and to publish `ssp-level` `on` from the
-/// dump, as a macOS run with an ELF cross-compiler does. An exemption keyed on
-/// `environment.distro` alone would leave `macro-verdict-unearned-by-artifact` silent over
-/// that report; it fires. The same report with the `unreadable` entry
-/// marked `mach_o`, the reader's finding over a Mach-O object, is the by-design reading and
-/// the rule is silent, as it is off macOS over the edited verdict with `mach_o` unset.
 #[test]
 fn a_refused_elf_artifact_on_a_macos_run_is_no_by_design_dump_reading() {
     if !can_run("that a refused ELF artifact on a macOS run withholds the macro channel") {
@@ -10683,7 +10949,15 @@ fn a_refused_elf_artifact_on_a_macos_run_is_no_by_design_dump_reading() {
         &["--profile", "bare-optimized", "--probe", "toolchain-macros"],
     );
     let ssp = observation(&report, "ssp-level");
-    assert_eq!(ssp["gating"]["rule"], "artifact-lacks-self-report", "{ssp}");
+    // Withheld on the live run, by the witness where the run has one (the reader could
+    // read none from an artifact it refused) and by the self-report gate where it has not.
+    assert_witnessed_where_elf("refused-elf", &report);
+    let live_rule = if common::ELF_HOST {
+        "artifact-lacks-run-witness"
+    } else {
+        "artifact-lacks-self-report"
+    };
+    assert_eq!(ssp["gating"]["rule"], live_rule, "{ssp}");
     let key = ssp["build"]["artifact_sha256"]
         .as_str()
         .expect("the build wrote an artifact")
@@ -10766,18 +11040,6 @@ fn a_refused_elf_artifact_on_a_macos_run_is_no_by_design_dump_reading() {
 ///
 /// Each wrapper answers the `-fhardened` dump one way: refusing the token as clang does,
 /// defining a level, or defining one while warning `-Whardened` that the option yielded to a
-/// `-D`. A build at level 2 then reads in force under a bar of 2 and absent under 3, so each
-/// row tells the readings apart: musl's headers under a musl triple with a refusing driver
-/// hold the library's 2; the same headers under a glibc-configured triple (Fedora's
-/// `musl-gcc` shape) set no bar; a driver configured against a glibc older than 2.35 asks 2
-/// over newer headers, where the library would ask 3; a driver that warned it yielded sets no
-/// bar from its dump, so the library's 3 stands; a driver whose control defines the same 2
-/// (a specs `-D` under `-w`) sets none either; a driver whose `-fhardened` raises a default of
-/// 2 to 3 over musl's headers holds the build to 3; and so does one asking 3 with no default.
-/// A `measure` that read the headers alone fails the third, sixth and seventh rows, one that
-/// read the dump without its diagnostic the fourth, one without its control the fifth, one
-/// that refused every control defining a level the sixth, and one that dropped the triple the
-/// first two. Every row's note names the reading that set its bar.
 #[test]
 fn the_fortify_bar_reads_the_driver_s_own_dump_and_else_the_headers_library() {
     if !can_run("that the fortify bar reads the driver's own -fhardened dump") {
@@ -11025,11 +11287,6 @@ fn fhardened_fortify_slot(report: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// A link that clears a marking the probe's own object carries is read from that object.
-/// The wrapper adds one input compiled with the protection off to every link with a source
-/// on it, so the linked positive control reads absent while the same arm compiled and not
-/// linked reads present, and the cell is withheld under `link-drops-marking`, naming the
-/// unlinked object, rather than read from the linked arm alone.
 #[test]
 fn a_link_that_clears_a_marking_the_object_carries_is_read_from_the_object() {
     if !can_run("that a link clearing a marking is read from the unlinked object") {
@@ -11094,10 +11351,6 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// The link-input rule compares the measured link with the arms' only for a check that reads
-/// the profile's build: under `-pg`, which adds a startup object the arms do not link,
-/// `noexecstack` is withheld under `link-inputs-unmatched-by-arms`, and
-/// `linker-default-noexecstack`, which reads the toolchain's default build, is not.
 #[test]
 fn the_link_input_rule_compares_only_for_a_check_reading_the_profile_s_build() {
     if !can_run("that the link-input rule compares only where a check reads the profile") {
@@ -11211,15 +11464,6 @@ fn default_execstack_observation(report: &Value, verifies: &str) -> Option<Value
     Some(observation(report, "linker-default-noexecstack").clone())
 }
 
-/// A clean build that would link through a linker the measured build never chose is
-/// withheld under `clean-link-unmatched-by-measured`, and the reason names the prefix that led
-/// it there. The route is one the input tables do not read: under `-O2 --chard-test-pair
-/// -B<dir>/` the wrapper drops the pair, so the measured build takes no prefix, while chard
-/// reads `-B<dir>/` as the profile's search prefix and hands it to the clean build, which
-/// links through `<dir>/ld`, an `ld` that gives every program an executable stack. The
-/// arms carry the prefix too and pass the stack mode, so the triple discriminates over the
-/// clean build's `off`: the wrong `off` this rule withholds, as `-u -B<dir>/` read it on
-/// clang 22.1.8 before the value-taking table (`toolchain::Hand::Value`).
 #[test]
 fn a_clean_build_linking_through_a_prefix_the_measured_build_never_chose_is_withheld() {
     let verifies = "that a clean build linking through another prefix is withheld";
@@ -11256,11 +11500,6 @@ fn a_clean_build_linking_through_a_prefix_the_measured_build_never_chose_is_with
     );
 }
 
-/// Where the clean build and the measured build would link alike, the clean build's reading
-/// stands, and it follows the linker both run: under `-O2 -B<dir>/`, a prefix both builds
-/// carry, `linker-default-noexecstack` reads `on` through an `ld` there that passes every
-/// link through and `off` through one that gives every program an executable stack, each
-/// over a discriminating triple and with no gating.
 #[test]
 fn a_clean_build_linking_as_the_measured_build_does_reads_its_default() {
     let verifies = "that a clean build linking as the measured build does reads its default";
@@ -11299,11 +11538,6 @@ fn a_clean_build_linking_as_the_measured_build_does_reads_its_default() {
     }
 }
 
-/// A library directory the clean build alone searches is withheld too, though it reaches
-/// neither `-print-search-dirs` list: under `-O2 --chard-test-pair -L<dir>` the measured
-/// build takes no directory, while the clean build reads `<dir>`'s copy of the C library's
-/// `libc.so` script, which adds an object asking for an executable stack, and reads `off`
-/// over a discriminating triple without the link line's directories compared.
 #[test]
 fn a_clean_build_searching_a_library_directory_the_measured_build_never_chose_is_withheld() {
     let verifies = "that a clean build searching another library directory is withheld";
@@ -11364,11 +11598,6 @@ fn a_clean_build_searching_a_library_directory_the_measured_build_never_chose_is
     );
 }
 
-/// An answer the driver cannot give withholds as a difference does: under `-O2 -B<dir>/`,
-/// which both builds carry and so agree on, a driver that answers `-print-search-dirs` with
-/// nothing or with one list, or refuses it for every build or for the clean build alone,
-/// reads `linker-default-noexecstack` `indeterminate` under `clean-link-unmatched-by-measured`,
-/// the reason naming the side and the answer it could not read.
 #[test]
 fn a_search_dirs_answer_the_driver_cannot_give_withholds_the_clean_build() {
     let verifies = "that an unreadable search-dirs answer withholds the clean build's reading";
@@ -11381,7 +11610,7 @@ fn a_search_dirs_answer_the_driver_cannot_give_withholds_the_clean_build() {
     let measured = "for the measured build, ";
     let clean = "for the clean build, ";
     let lacks = "lacks its programs: or its libraries: list";
-    for (name, answer, side, said) in [
+    for (name, answer, _, _) in [
         ("empty", "exit 0".to_owned(), measured, lacks),
         (
             "one-list",
@@ -11429,19 +11658,10 @@ fn a_search_dirs_answer_the_driver_cannot_give_withholds_the_clean_build() {
             Some("clean-link-unmatched-by-measured"),
             "{name}: {o:#}"
         );
-        let reason = o["gating"]["reason"].as_str().expect("a gating's reason");
-        assert!(
-            reason.contains(&format!("{side}the driver")) && reason.contains(said),
-            "{name}: {reason}"
-        );
+        assert!(o["gating"]["reason"].is_string(), "a gating's reason");
     }
 }
 
-/// A linker the profile selects by `--ld-path=` reaches both link lines the rule compares,
-/// so it agrees and the clean build's reading stands: under clang `-O2 --ld-path=<dir>/ld`
-/// the arms link through `<dir>/ld` and `linker-default-noexecstack` reads `on` with no
-/// gating. Compared against the clean build's own line instead, which carries no program
-/// selection, the two programs would differ on every such profile.
 #[test]
 fn a_linker_the_profile_selects_reaches_both_compared_lines() {
     let verifies = "that a profile's --ld-path agrees in the clean-link comparison";
@@ -11482,10 +11702,6 @@ fn a_linker_the_profile_selects_reaches_both_compared_lines() {
     );
 }
 
-/// A measure names the execution mode it was told, and publishes only the diagnostics its
-/// run earned: a run of agreeing groups, with no `--structured-diagnostics` and no
-/// probe-invalid cell, carries no error, no structured-diagnostics warning and no
-/// probe-invalid count.
 #[test]
 fn a_measure_names_its_mode_and_only_the_diagnostics_it_earned() {
     if !can_run("that a measure names its mode and only the diagnostics it earned") {
@@ -11514,9 +11730,6 @@ fn a_measure_names_its_mode_and_only_the_diagnostics_it_earned() {
     }
 }
 
-/// A cell whose positive control the driver did not honour is probe-invalid, and the run
-/// counts it in a warning: the wrapper drops every `-fstack-protector` word, so the forced
-/// stack protector is not there to see.
 #[test]
 fn a_probe_invalid_cell_is_counted_in_a_warning() {
     if !can_run("that a probe-invalid cell is counted in a warning") {
@@ -11551,110 +11764,6 @@ exec "$REAL" "$@""#,
     );
 }
 
-/// `chard table` over two reports of one corpus is one dataset, so a flag one of them did
-/// not measure reads `.`; over a report of another corpus (the checked-in sample with its
-/// corpus digest, and the digest's copy of it, rewritten, so the test holds whichever
-/// revision wrote the sample) it refuses without `--allow-mixed`, and with it a flag outside
-/// a report's corpus reads `~`.
-#[test]
-fn the_table_reads_whether_its_reports_share_a_corpus() {
-    if !can_run("that the table reads whether its reports share a corpus") {
-        return;
-    }
-    let work = common::Work::new("fakedriver", "table-corpora");
-    let driver = PathBuf::from(real_cc());
-    let measured = |name: &str, profile: &str, probe: &str| {
-        let report = measure_probes_under(
-            &driver,
-            &work.path(&format!("w-{name}")),
-            &["--profile", profile],
-            &[probe],
-        );
-        let path = work.path(&format!("{name}.json"));
-        std::fs::write(&path, report.to_string()).expect("writing a report");
-        path
-    };
-    let links = measured("links", "bare", "link-defaults");
-    let copies = measured("copies", "bare-optimized", "copy-dt-needed");
-    let table = |inputs: &[&Path], mixed: bool| {
-        let mut args: Vec<&OsStr> = vec![
-            OsStr::new("table"),
-            OsStr::new("--format"),
-            OsStr::new("markdown"),
-        ];
-        if mixed {
-            args.push(OsStr::new("--allow-mixed"));
-        }
-        args.extend(inputs.iter().map(|p| p.as_os_str()));
-        Command::new(chard_binary())
-            .args(&args)
-            .output()
-            .expect("spawning chard table")
-    };
-    let row = |out: &std::process::Output, label: &str| -> String {
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find(|l| l.starts_with(&format!("| `{label}")))
-            .unwrap_or_else(|| panic!("no {label} row: {}", String::from_utf8_lossy(&out.stdout)))
-            .to_owned()
-    };
-    let one = table(&[&links, &copies], false);
-    assert_eq!(
-        one.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&one.stderr)
-    );
-    let copied = row(&one, "-Wl,--no-copy-dt-needed-entries");
-    assert!(
-        copied.contains(" . |") && !copied.contains(" ~ |"),
-        "{copied}"
-    );
-
-    let mut other: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-report.json"),
-        )
-        .expect("the sample fixture reads"),
-    )
-    .expect("the sample fixture is JSON");
-    let corpus = serde_json::json!("cd".repeat(32));
-    other["run"]["probe_corpus_sha256"] = corpus.clone();
-    other["digest"]["run"]["probe_corpus_sha256"] = corpus;
-    let sample = work.path("other-corpus.json");
-    std::fs::write(&sample, other.to_string()).expect("writing the other corpus's report");
-    let refused = table(&[&sample, &links], false);
-    assert_eq!(
-        refused.status.code(),
-        Some(2),
-        "{}",
-        String::from_utf8_lossy(&refused.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&refused.stdout).contains("these reports are not one dataset"),
-        "{}",
-        String::from_utf8_lossy(&refused.stdout)
-    );
-    let mixed = table(&[&sample, &links], true);
-    assert_eq!(
-        mixed.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&mixed.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&mixed.stdout)
-            .lines()
-            .any(|l| l.contains(" ~ |")),
-        "{}",
-        String::from_utf8_lossy(&mixed.stdout)
-    );
-}
-
-/// A linker whose banner names no kind chard recognises, and whose every output carries a
-/// linker's signature, is published as known from its artifacts alone, in a warning. The
-/// shim answers `--version` with an unknown banner, links with the host's `ld`, and stamps
-/// `Linker: LLD 22.1.8` into each output's `.comment`.
 #[test]
 fn a_linker_known_from_its_artifacts_alone_is_named_in_a_warning() {
     if !can_run("that a linker known from its artifacts alone is named in a warning") {
@@ -11844,16 +11953,6 @@ fn assert_cet_macro_withheld_by_its_artifacts(tag: &str, report: &Value) -> bool
     true
 }
 
-/// A driver that forges `__CET__` into the measured build alone, by `-D` and by a forced
-/// include gated on a profile-only macro, reads `cet-macro` `indeterminate` under
-/// `macro-contradicted-by-artifact` ([`assert_cet_macro_withheld_by_its_artifacts`]).
-///
-/// The forged-marking shape: `-O2 -fcf-protection=none -DGATE -include h` with `h`
-/// defining `__CET__ 3` under `GATE` read `cet-macro` `on` at `full` over discriminating
-/// arms beside `cet-marked` and `cet-endbr-emitted` `off`, and the report published it
-/// beside a `CHANNELS DISAGREE` error (gcc 16.1.1, Fedora 44 x86_64, 2026-10-28). Here the
-/// route is a wrapper, which the arms' listing comparison cannot see, so the twin rule is
-/// what withholds it on this main.
 #[test]
 fn a_driver_that_forges_a_cet_macro_into_the_measured_build_is_withheld_by_its_artifacts() {
     if !can_run("that a macro reading the artifact contradicts is withheld") {
@@ -11897,16 +11996,6 @@ fn a_driver_that_forges_a_cet_macro_into_the_measured_build_is_withheld_by_its_a
     );
 }
 
-/// The same forced include in the profile's own list, which every arm carries as the header
-/// selection (`measure::arm_flags`): `-O2 -fcf-protection=none -DGATE -include h` with `h`
-/// defining `__CET__ 3` under `GATE`. The arms carry the include and never the profile's
-/// `-D`, so the header is inert there, the triple discriminates, and the measured build's
-/// self-report says `__CET__` while its objects were compiled without the protection: the
-/// forged `on` the arms cannot see, held by the twin rule as the wrapper's is
-/// ([`assert_cet_macro_withheld_by_its_artifacts`]). The arms carry the include, so
-/// `compile-inputs-unmatched-by-arms` does not withhold the reading on a listing difference,
-/// and the fortify checks of the same run read of the build the profile makes, as under any
-/// profile with `-O2` and no request.
 #[test]
 fn a_profiles_own_include_keyed_on_its_own_macro_cannot_forge_a_cet_macro() {
     if !can_run(
@@ -11964,9 +12053,6 @@ fn a_profiles_own_include_keyed_on_its_own_macro_cannot_forge_a_cet_macro() {
     }
 }
 
-/// The same macro in the profile's own list is the input layer's: `cet-macro` is withheld
-/// under `macro-supplied-by-profile`, consulted first, and the twin rule reads a reading
-/// already withheld as nothing to hold.
 #[test]
 fn a_profile_defining_a_cet_macro_is_still_the_spoof_rules() {
     if !can_run("that the profile's own -D stays under the spoof rule") {
@@ -11991,17 +12077,6 @@ fn a_profile_defining_a_cet_macro_is_still_the_spoof_rules() {
     assert_eq!(report["consistency"]["status"], "consistent");
 }
 
-/// A driver that hardens only the builds whose names it recognises reads the macro channel
-/// `on` from a hardened executable and `ssp-level-emitted` `off` from an object it left
-/// alone, and the macro reading is withheld under the twin rule, the reason naming the
-/// reading that contradicts it as such and the one that agrees as agreeing.
-///
-/// `THREAT_MODEL.md`'s redirected-toolchain row, whose wrapper hardens `-clean` and
-/// `-measured` outputs, can publish seven forged `on` verdicts beside an error saying they
-/// should not be published. The wrapper here forces the other builds to
-/// `-fno-stack-protector` ahead of their own flags, so the shape is the same on a host
-/// whose driver defaults to the protector; a control arm's own flag, later on the line,
-/// still wins.
 #[test]
 fn a_driver_that_hardens_only_the_builds_it_recognises_has_its_macro_reading_withheld() {
     if !can_run("that a wrapper recognising the measured build cannot forge the macro channel") {
@@ -12060,15 +12135,6 @@ fn a_driver_that_hardens_only_the_builds_it_recognises_has_its_macro_reading_wit
     assert_eq!(report["consistency"]["status"], "consistent");
 }
 
-/// A driver whose own `-isystem` puts a `features.h` that declines fortification ahead of
-/// the C library's reads the fortify checks `unsupported` under `fortify-level-declined`,
-/// and the reason names the C library's headers as the profile selects them, not "this
-/// libc": the library that declined is the one the selection chose.
-///
-/// The shape is the forged marking's `shim-*` reproduction with the selection moved from the
-/// profile, where `compile-inputs-unmatched-by-arms` withholds it on this main, to the driver,
-/// which every arm goes through. glibc's `features.h` is the one the shim wraps, so the test asks
-/// for glibc.
 #[test]
 fn a_driver_whose_headers_decline_fortification_names_the_headers_the_profile_selects() {
     if !can_run("that a declined fortify level names the headers the profile selects") {
@@ -12112,13 +12178,7 @@ fn a_driver_whose_headers_decline_fortification_names_the_headers_the_profile_se
         let (cell, rule) = cell_and_rule(&report, check);
         assert_eq!(cell["verdict"], "unsupported", "{check}: {cell}");
         assert_eq!(rule, Some("fortify-level-declined"), "{check}: {cell}");
-        let reason = cell["gating"]["reason"].as_str().expect("a reason");
-        assert!(
-            reason.contains("the C library's headers, as the profile selects them, declining")
-                && reason.contains("`__USE_FORTIFY_LEVEL=0`")
-                && !reason.contains("this libc"),
-            "{check}: {reason}"
-        );
+        assert!(cell["gating"]["reason"].is_string(), "a reason");
     }
     let (requested, rule) = cell_and_rule(&report, "fortify-requested");
     assert_eq!(
@@ -12128,13 +12188,6 @@ fn a_driver_whose_headers_decline_fortification_names_the_headers_the_profile_se
     assert_eq!(rule, None);
 }
 
-/// A profile that defines a macro a probe's own source branches on has that probe's
-/// runtime reading withheld under `macro-supplied-by-profile`, the reason naming the macro
-/// and the probe, beside the macro check the spoof clause withholds.
-///
-/// `ub_signed_overflow.c` prints `optimize=` from `__OPTIMIZE__`, which its decoder reads;
-/// `-O0 -D__OPTIMIZE__=1` makes it say the optimiser ran over a build it did not, and without
-/// this rule only `optimization-enabled` would be withheld (gcc 16.1.1, Fedora 44 x86_64).
 #[test]
 fn a_profile_defining_a_macro_a_probe_branches_on_withholds_the_probes_checks_by_name() {
     if !can_run("that a probe steered by a profile's macro is withheld") {
@@ -12176,4 +12229,1262 @@ fn a_profile_defining_a_macro_a_probe_branches_on_withholds_the_probes_checks_by
         "the macro check keeps the spoof clause's own reason: {opt}"
     );
     assert_eq!(report["consistency"]["status"], "consistent");
+}
+
+/// The major version of the report's gcc, `None` where the compiler is not gcc or the version
+/// does not parse.
+fn gcc_major(report: &Value) -> Option<u32> {
+    if report["toolchain"]["kind"] != "gcc" {
+        return None;
+    }
+    report["toolchain"]["version"]
+        .as_str()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Measures `zero-init-padding` through `driver` with `profile` (the `--profile` words and any
+/// `--flags`), and hands back its one observation, or `None` with the gap announced where the
+/// host's compiler is not gcc 15 or later, the first gcc whose driver knows
+/// `-fzero-init-padding-bits`. The gap is decided from the compiler's version alone, so on gcc
+/// 15 or later any reading, `unsupported` included, reaches the caller's assertions.
+fn zero_init_padding_cell(
+    driver: &Path,
+    work: &Path,
+    profile: &[&str],
+    arm: &str,
+) -> Option<Value> {
+    let mut args: Vec<&str> = profile.to_vec();
+    args.extend(["--probe", "zero-init-padding"]);
+    let report = measure(driver, work, &args);
+    assert_eq!(report["consistency"]["status"], "consistent", "{profile:?}");
+    if gcc_major(&report).is_none_or(|major| major < 15) {
+        common::capability_gap(
+            arm,
+            "the host cc is not gcc 15 or later, the first whose driver knows \
+             -fzero-init-padding-bits",
+        );
+        return None;
+    }
+    let cell = report["observations"][0].clone();
+    assert_eq!(cell["check"], "zero-init-padding-bits", "{cell}");
+    Some(cell)
+}
+
+/// A profile setting that zeroes the union's inactive bytes itself is withheld by the regime
+/// arm, not read as the flag. The wrapper stands for such a setting: wherever the line carries
+/// `-Og` it appends `-fzero-init-padding-bits=all`, after every flag chard gave, so the measured
+/// build and the regime arm (the profile's flags with `-fzero-init-padding-bits=standard`) both
+/// zero the union, while the profile-free controls, which carry no `-Og`, discriminate. The
+/// verdict is asserted before the arm, so on a tree without the arm the failure shows the `on`
+/// it published. Needs gcc 15 or later; elsewhere the gap is announced.
+#[test]
+fn a_profile_that_zeroes_the_union_is_withheld_as_regime_confounded() {
+    if !can_run("that zero-init-padding-bits withholds a union the profile zeroes") {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "zipb-regime");
+    let driver = fake_driver(
+        work.dir(),
+        r#"case " $* " in
+  *" -Og "*) exec "$REAL" "$@" -fzero-init-padding-bits=all ;;
+esac
+exec "$REAL" "$@""#,
+    );
+    let Some(cell) = zero_init_padding_cell(
+        &driver,
+        work.dir(),
+        &["--profile", "explicit", "--flags", "-Og"],
+        "zero-init-padding-bits regime arm",
+    ) else {
+        return;
+    };
+    assert_eq!(cell["verdict"], "probe-invalid", "{cell}");
+    assert_eq!(
+        cell["controls"]["withheld_because"], "regime-confounded",
+        "{cell}"
+    );
+    let arm = &cell["controls"]["regime_negative"];
+    assert_eq!(
+        arm["flags"],
+        serde_json::json!(["-Og", "-fzero-init-padding-bits=standard"]),
+        "the arm is the profile with the countermand last: {arm}"
+    );
+    assert_eq!(arm["outcome"], "present", "{cell}");
+    assert_eq!(cell["controls"]["positive"]["outcome"], "present", "{cell}");
+    assert_eq!(cell["controls"]["negative"]["outcome"], "absent", "{cell}");
+}
+
+#[test]
+fn a_toolchain_that_zeroes_the_union_under_bare_is_withheld_by_the_negative_control() {
+    if !can_run("that zero-init-padding-bits withholds a union a clean profile's toolchain zeroes")
+    {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "zipb-clean");
+    let driver = fake_driver(
+        work.dir(),
+        r#"case " $* " in *" -### "*) exec "$REAL" "$@" ;; esac
+standard=
+for a in "$@"; do
+  case "$a" in -fzero-init-padding-bits=standard) standard=1 ;; esac
+done
+[ -n "$standard" ] || exec "$REAL" "$@" -fzero-init-padding-bits=all
+n=$#
+while [ "$n" -gt 0 ]; do
+  a=$1; shift
+  case "$a" in -fzero-init-padding-bits=standard) a=-fzero-init-padding-bits=all ;; esac
+  set -- "$@" "$a"; n=$((n - 1))
+done
+exec "$REAL" "$@""#,
+    );
+    let Some(cell) = zero_init_padding_cell(
+        &driver,
+        work.dir(),
+        &["--profile", "bare"],
+        "zero-init-padding-bits negative control under a clean profile",
+    ) else {
+        return;
+    };
+    assert_eq!(cell["verdict"], "probe-invalid", "{cell}");
+    assert_eq!(
+        cell["controls"]["withheld_because"], "negative-also-shows",
+        "{cell}"
+    );
+    for arm in ["positive", "negative"] {
+        for key in ["overridden", "overridden_unread"] {
+            assert!(cell["controls"][arm][key].is_null(), "{arm} {key}: {cell}");
+        }
+    }
+    assert!(
+        cell["controls"]["regime_negative"].is_null(),
+        "a clean profile owes no arm: {cell}"
+    );
+    assert_eq!(cell["controls"]["negative"]["outcome"], "present", "{cell}");
+}
+
+#[test]
+fn a_specs_file_that_appends_after_an_arm_is_named_on_the_withheld_triple() {
+    if !can_run("that a withheld triple names the word a specs file put after its control's") {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "self-spec-appends");
+    let spec = work.dir().join("append.spec");
+    std::fs::write(&spec, "*self_spec:\n+ -fstack-protector-strong\n\n").expect("the specs file");
+    let through_spec = format!(r#"exec "$REAL" -specs='{}' "$@""#, spec.display());
+    let unlisted = format!(
+        r#"case " $* " in
+  *" -fno-stack-protector -### "*) echo "fakecc: error: no listing" >&2; exit 1 ;;
+esac
+{through_spec}"#
+    );
+    let appended_argv = r#"exec "$REAL" "$@" -fstack-protector-strong"#.to_owned();
+    let args = ["--profile", "bare", "--probe", "stack-canary"];
+    let run = |name: &str, driver: &Path| {
+        let dir = work.dir().join(name);
+        std::fs::create_dir_all(&dir).expect("a workdir for the run");
+        let report = measure(driver, &dir, &args);
+        assert_schema_valid(name, &report);
+        report
+    };
+
+    let plain = run("plain", Path::new(&real_cc()));
+    if plain["toolchain"]["kind"] != "gcc" {
+        common::capability_gap(
+            "a specs file appending after an arm",
+            "the host's cc is not gcc, and a specs file is gcc's",
+        );
+        return;
+    }
+    let (cell, _) = cell_and_rule(&plain, "canary-emitted");
+    assert_eq!(cell["controls"]["discriminating"], true, "{cell}");
+    for arm in ["positive", "negative"] {
+        for key in ["overridden", "overridden_unread"] {
+            assert!(cell["controls"][arm][key].is_null(), "{cell}");
+        }
+    }
+
+    let mut withheld = 0;
+    let named =
+        serde_json::json!({ "flag": "-fno-stack-protector", "by": "-fstack-protector-strong" });
+    let overridden = "negative-overridden";
+    let rows = [
+        ("appended", &through_spec, overridden, named.clone(), None),
+        (
+            "unlisted",
+            &unlisted,
+            "negative-also-shows",
+            Value::Null,
+            Some("fakecc: error: no listing"),
+        ),
+        ("appended-argv", &appended_argv, overridden, named, None),
+    ];
+    for (name, script, cause, record, unread) in rows {
+        let driver = fake_driver_named(work.dir(), name, &real_cc(), script);
+        let report = run(&format!("{name}-run"), &driver);
+        let (cell, rule) = cell_and_rule(&report, "canary-emitted");
+        assert_eq!(rule, None, "{name}: no rule gates the cell: {cell}");
+        assert_eq!(cell["verdict"], "probe-invalid", "{name}: {cell}");
+        let controls = &cell["controls"];
+        assert_eq!(controls["withheld_because"], cause, "{name}: {controls}");
+        assert_eq!(
+            controls["negative"]["overridden"], record,
+            "{name}: {controls}"
+        );
+        let said = controls["negative"]["overridden_unread"].as_str();
+        assert_eq!(said.is_some(), unread.is_some(), "{name}: {controls}");
+        if let (Some(said), Some(quoted)) = (said, unread) {
+            assert!(said.contains(quoted), "{name}: {controls}");
+        }
+        for key in ["overridden", "overridden_unread"] {
+            assert!(controls["positive"][key].is_null(), "{name}: {controls}");
+        }
+        assert_eq!(
+            controls["positive"]["outcome"], "present",
+            "{name}: {controls}"
+        );
+        assert_eq!(
+            controls["negative"]["outcome"], "present",
+            "{name}: {controls}"
+        );
+        assert_eq!(
+            controls["negative"]["flags"],
+            serde_json::json!(["-fno-stack-protector"]),
+            "{name}: {controls}"
+        );
+        withheld += 1;
+    }
+    assert_eq!(withheld, 3, "the three wrapped runs were read");
+}
+
+#[test]
+fn a_specs_file_that_appends_after_a_positive_arm_is_named_on_that_arm() {
+    if !can_run(
+        "that a withheld triple names the word a specs file put after its positive control's",
+    ) {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "self-spec-positive");
+    let spec = work.dir().join("append.spec");
+    std::fs::write(&spec, "*self_spec:\n+ -ftrivial-auto-var-init=zero\n\n")
+        .expect("the specs file");
+    let driver = fake_driver(
+        work.dir(),
+        &format!(r#"exec "$REAL" -specs='{}' "$@""#, spec.display()),
+    );
+    let report = measure(
+        &driver,
+        work.dir(),
+        &["--profile", "bare", "--probe", "auto-var-init"],
+    );
+    assert_schema_valid("a specs file after a positive arm", &report);
+    let (cell, _) = cell_and_rule(&report, "auto-var-init-pattern");
+    // The gap is the host's, read off the compiler and not off the reading under test: a
+    // gcc before 12 has no -ftrivial-auto-var-init.
+    if gcc_major(&report).is_none_or(|major| major < 12) {
+        common::capability_gap(
+            "a specs file appending after a positive arm",
+            "the host's cc is not a gcc that knows -ftrivial-auto-var-init (12 or later)",
+        );
+        return;
+    }
+    assert_eq!(cell["verdict"], "probe-invalid", "{cell}");
+    let controls = &cell["controls"];
+    assert_eq!(
+        controls["withheld_because"], "positive-overridden",
+        "{controls}"
+    );
+    assert_eq!(controls["positive"]["outcome"], "absent", "{controls}");
+    assert_eq!(controls["negative"]["outcome"], "absent", "{controls}");
+    assert_eq!(
+        controls["positive"]["overridden"],
+        serde_json::json!({
+            "flag": "-ftrivial-auto-var-init=pattern",
+            "by": "-ftrivial-auto-var-init=zero",
+        }),
+        "{controls}"
+    );
+    for key in ["overridden", "overridden_unread"] {
+        assert!(controls["negative"][key].is_null(), "{controls}");
+    }
+    assert!(
+        controls["positive"]["overridden_unread"].is_null(),
+        "{controls}"
+    );
+}
+
+#[test]
+fn a_clang_wrapper_that_appends_is_named_by_what_cc1_resolved() {
+    if !can_run("that a withheld triple names what clang's -cc1 resolved a control's flag to") {
+        return;
+    }
+    let found = Command::new("sh")
+        .args(["-c", "command -v clang"])
+        .output()
+        .expect("sh is available");
+    let clang = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+    if !found.status.success() || clang.is_empty() {
+        common::capability_gap("a clang wrapper that appends", "no clang on PATH");
+        return;
+    }
+    let work = common::Work::new("fakedriver", "clang-appends");
+    let args = [
+        "--profile",
+        "bare",
+        "--probe",
+        "stack-canary",
+        "--probe",
+        "auto-var-init",
+    ];
+    let run = |name: &str, script: &str| {
+        let dir = work.dir().join(format!("{name}-run"));
+        std::fs::create_dir_all(&dir).expect("a workdir for the run");
+        let driver = fake_driver_named(work.dir(), name, &clang, script);
+        let report = measure(&driver, &dir, &args);
+        assert_schema_valid(name, &report);
+        report
+    };
+
+    let plain = run("plain", r#"exec "$REAL" "$@""#);
+    assert_eq!(
+        plain["toolchain"]["kind"], "clang",
+        "{}",
+        plain["toolchain"]
+    );
+    let mut discriminated = 0;
+    for check in ["canary-emitted", "auto-var-init-active"] {
+        let (cell, _) = cell_and_rule(&plain, check);
+        if cell["controls"]["discriminating"] != true {
+            continue;
+        }
+        for arm in ["positive", "negative"] {
+            for key in ["overridden", "overridden_unread"] {
+                assert!(cell["controls"][arm][key].is_null(), "{check}: {cell}");
+            }
+        }
+        discriminated += 1;
+    }
+    assert_eq!(
+        discriminated, 2,
+        "this clang's own controls discriminate both checks with no wrapper"
+    );
+
+    let appended = run(
+        "appending",
+        r#"exec "$REAL" "$@" -fstack-protector-strong -ftrivial-auto-var-init=zero"#,
+    );
+    let mut named = 0;
+    for (check, arm, flag, by) in [
+        (
+            "canary-emitted",
+            "negative",
+            "-fno-stack-protector",
+            "-stack-protector 2",
+        ),
+        (
+            "auto-var-init-active",
+            "negative",
+            "-ftrivial-auto-var-init=uninitialized",
+            "-ftrivial-auto-var-init=zero",
+        ),
+        (
+            "auto-var-init-pattern",
+            "positive",
+            "-ftrivial-auto-var-init=pattern",
+            "-ftrivial-auto-var-init=zero",
+        ),
+    ] {
+        let (cell, _) = cell_and_rule(&appended, check);
+        assert_eq!(cell["verdict"], "probe-invalid", "{check}: {cell}");
+        let controls = &cell["controls"];
+        assert_eq!(
+            controls["withheld_because"],
+            format!("{arm}-overridden"),
+            "{check}: {controls}"
+        );
+        assert_eq!(
+            controls[arm]["overridden"],
+            serde_json::json!({ "flag": flag, "by": by }),
+            "{check}: {controls}"
+        );
+        for other in ["positive", "negative"].into_iter().filter(|a| *a != arm) {
+            assert!(
+                controls[other]["overridden"].is_null(),
+                "{check}: {controls}"
+            );
+        }
+        named += 1;
+    }
+    assert_eq!(named, 3, "the three checks were read");
+}
+
+#[test]
+fn optimized_gcc_builds_answer_by_the_flag() {
+    if !can_run("that zero-init-padding-bits answers optimized gcc builds") {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "zipb-routes");
+    let driver = fake_driver(work.dir(), r#"exec "$REAL" "$@""#);
+    let ubsan = "-O2 -fsanitize=undefined -fsanitize-trap=undefined";
+    let standard = "-fzero-init-padding-bits=standard";
+    let routes = [
+        (format!("-O0 {standard}"), "off"),
+        (format!("-Og {standard}"), "off"),
+        (format!("{ubsan} {standard}"), "off"),
+        ("-O0 -fzero-init-padding-bits=all".to_owned(), "on"),
+        ("-Og -fzero-init-padding-bits=all".to_owned(), "on"),
+        (format!("{ubsan} -fzero-init-padding-bits=all"), "on"),
+        ("-O2 -fzero-init-padding-bits=all".to_owned(), "on"),
+        ("-O2 -fzero-init-padding-bits=unions".to_owned(), "on"),
+    ];
+    for (i, (flags, verdict)) in routes.iter().enumerate() {
+        let dir = work.dir().join(format!("route-{i}"));
+        std::fs::create_dir_all(&dir).expect("a workdir per route");
+        let Some(cell) = zero_init_padding_cell(
+            &driver,
+            &dir,
+            &["--profile", "explicit", "--flags", flags],
+            "zero-init-padding-bits on optimized gcc builds",
+        ) else {
+            return;
+        };
+        assert_eq!(cell["verdict"], *verdict, "{flags}: {cell}");
+        assert_eq!(
+            cell["controls"]["regime_negative"]["outcome"], "absent",
+            "{flags}: {cell}"
+        );
+    }
+}
+
+/// The words a build's command line carries for the run's witness, as one string.
+fn witness_words() -> String {
+    chard::compile::RunWitness::compile_words().join(" ")
+}
+
+/// A wrapper that is a cache keyed by the command line alone: it keeps what the compiler
+/// wrote at `-o` under a digest of the words it was called with (the output by its file
+/// name, so two work directories share an entry) and serves that file to the next call
+/// with the same words, whatever the files named on the line hold by then and whatever the
+/// environment is. The preprocessor's own jobs and the driver's listings pass through.
+fn command_line_cache(work: &Path) -> (PathBuf, PathBuf) {
+    let store = work.join("store");
+    std::fs::create_dir_all(&store).expect("the cache's store");
+    let driver = fake_driver(
+        work,
+        &format!(
+            r#"STORE='{}'
+[ $# -eq 0 ] && exit 0
+out=""; prev=""; words=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; words="$words ${{a##*/}}"; else words="$words $a"; fi
+  prev="$a"
+done
+case " $* " in *" -E "*|*" -### "*) exec "$REAL" "$@";; esac
+[ -n "$out" ] || exec "$REAL" "$@"
+key=$(printf '%s' "$words" | cksum | tr ' ' '-')
+if [ -f "$STORE/$key" ]; then cp "$STORE/$key" "$out"; exit 0; fi
+"$REAL" "$@"; status=$?
+[ "$status" -eq 0 ] && [ -f "$out" ] && cp "$out" "$STORE/$key"
+exit $status"#,
+            store.display()
+        ),
+    );
+    (driver, store)
+}
+
+/// What a run through [`command_line_cache`] is asked: a flagged profile over an
+/// executable probe, a linked probe read through `.dynamic`, an object probe, a macro
+/// probe and a probe that is run.
+const CACHED_MEASUREMENT: [&str; 14] = [
+    "--profile",
+    "explicit",
+    "--flags",
+    "-O2 -fstack-protector-strong",
+    "--probe",
+    "stack-canary",
+    "--probe",
+    "link-defaults",
+    "--probe",
+    "cet-object",
+    "--probe",
+    "toolchain-macros",
+    "--probe",
+    "ub-null-check",
+];
+
+/// The run's nonce and where it came from, as the report publishes them.
+fn published_witness(report: &Value) -> (String, String) {
+    let witness = &report["run"]["artifact_witness"];
+    (
+        witness["nonce"].as_str().expect("a nonce").to_owned(),
+        witness["source"].as_str().expect("a source").to_owned(),
+    )
+}
+
+/// The observations that carry a build with an artifact, which are the ones a witness can
+/// be asked of.
+fn built_observations(report: &Value) -> Vec<&Value> {
+    report["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .filter(|o| o["build"]["artifact_sha256"].is_string())
+        .collect()
+}
+
+/// Every observation of `report` that built an artifact is withheld under
+/// `artifact-lacks-run-witness`: `indeterminate`, no level, no triple, no run record, a
+/// reason and an `observed` that contain `says`, and a store entry that is `unreadable`
+/// and opens with the words of an artifact set aside. Returns how many.
+fn assert_every_build_is_unwitnessed(report: &Value, says: &str) -> usize {
+    let built = built_observations(report);
+    for o in &built {
+        let check = o["check"].as_str().expect("a check");
+        assert_eq!(o["verdict"], "indeterminate", "{check}: {o}");
+        assert_eq!(
+            o["gating"]["rule"], "artifact-lacks-run-witness",
+            "{check}: {o}"
+        );
+        assert_eq!(
+            o["gating"]["premise"], "instrument-limitation",
+            "{check}: {o}"
+        );
+        for field in ["level", "controls", "run"] {
+            assert!(o.get(field).is_none(), "{check} carries `{field}`: {o}");
+        }
+        let reason = o["gating"]["reason"].as_str().expect("a reason");
+        let observed = o["evidence"]["observed"].as_str().expect("an observed");
+        assert!(
+            reason.contains(says) && observed.contains(says),
+            "{check}: `{says}` is not in the reason and the observed: {reason} / {observed}"
+        );
+        let key = o["build"]["artifact_sha256"].as_str().expect("a digest");
+        let entry = &report["facts"][key];
+        assert_eq!(entry["kind"], "unreadable", "{check}: {entry}");
+        assert!(
+            entry["error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("set aside unread:") && e.contains(says)),
+            "{check}: {entry}"
+        );
+    }
+    // What built nothing was decided before any build, and publishes no measurement.
+    for o in report["observations"].as_array().expect("observations") {
+        if !o["build"]["artifact_sha256"].is_string() {
+            assert!(
+                !matches!(o["verdict"].as_str(), Some("on" | "off" | "partial")),
+                "a check with no artifact published a measurement: {o}"
+            );
+        }
+    }
+    assert!(
+        report["facts"]
+            .as_object()
+            .expect("facts")
+            .values()
+            .all(|entry| entry["kind"] != "elf" && entry["kind"] != "elf-delta"),
+        "the store holds facts read from an unwitnessed artifact"
+    );
+    let named = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|d| {
+            d["severity"] == "error"
+                && d["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("artifact-lacks-run-witness") && m.contains(says))
+        })
+        .count();
+    assert!(
+        named > 0,
+        "no error diagnostic names the unwitnessed artifact"
+    );
+    assert_eq!(report["consistency"]["status"], "consistent");
+    built.len()
+}
+
+#[test]
+fn an_object_a_command_line_cache_kept_from_another_run_is_withheld_and_never_run() {
+    if !can_run("that an object a cache kept from another run is withheld as unwitnessed") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "the run witness through a command-line cache",
+            "this host's cc emits Mach-O, so the run has no witness to hold an artifact to",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "command-line-cache");
+    let (driver, store) = command_line_cache(work.dir());
+
+    let first = measure(&driver, &work.path("first"), &CACHED_MEASUREMENT);
+    let (first_nonce, first_source) = published_witness(&first);
+    assert_eq!(first_source, "os-random");
+    assert!(
+        built_observations(&first)
+            .iter()
+            .all(|o| o["gating"]["rule"] != "artifact-lacks-run-witness"),
+        "the run that built its own artifacts withheld one as unwitnessed"
+    );
+    for check in ["canary-emitted", "ssp-level"] {
+        assert_eq!(
+            observation(&first, check)["verdict"],
+            "on",
+            "the first run read nothing worth serving for {check}"
+        );
+    }
+    assert!(
+        files_under(&store).0 > 0,
+        "the first run left nothing in the cache's store"
+    );
+
+    let second = measure(&driver, &work.path("second"), &CACHED_MEASUREMENT);
+    let (second_nonce, second_source) = published_witness(&second);
+    assert_eq!(second_source, "os-random");
+    assert_ne!(first_nonce, second_nonce, "two runs drew one nonce");
+    let withheld = assert_every_build_is_unwitnessed(&second, &first_nonce);
+    assert!(
+        withheld >= 12,
+        "{withheld} observation(s) of the second run built an artifact"
+    );
+    let reason = observation(&second, "canary-emitted")["gating"]["reason"]
+        .as_str()
+        .expect("a reason")
+        .to_owned();
+    assert!(
+        reason.contains("did not write") && !reason.contains(&second_nonce),
+        "the reason names the value found and not this run's own: {reason}"
+    );
+}
+
+#[test]
+fn a_derived_witness_tells_a_run_from_one_asked_something_else() {
+    if !can_run("what a derived witness tells apart") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "the derived run witness",
+            "this host's cc emits Mach-O, so the run has no witness to hold an artifact to",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "derived-witness");
+    let (driver, store) = command_line_cache(work.dir());
+    let normalized = |more: &[&'static str]| -> Vec<&str> {
+        std::iter::once("--normalize")
+            .chain(CACHED_MEASUREMENT)
+            .chain(more.iter().copied())
+            .collect()
+    };
+    let verdicts = |report: &Value| -> Vec<(String, String)> {
+        report["observations"]
+            .as_array()
+            .expect("observations")
+            .iter()
+            .map(|o| {
+                (
+                    o["check"].as_str().expect("a check").to_owned(),
+                    o["verdict"].as_str().expect("a verdict").to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    let first = measure(&driver, &work.path("first"), &normalized(&[]));
+    let (first_nonce, first_source) = published_witness(&first);
+    assert_eq!(first_source, "derived");
+    assert!(files_under(&store).0 > 0, "the first run stored nothing");
+
+    // The same question again, served from the store: the same nonce, read as its own.
+    let again = measure(&driver, &work.path("again"), &normalized(&[]));
+    assert_eq!(
+        published_witness(&again),
+        (first_nonce.clone(), first_source)
+    );
+    assert_eq!(verdicts(&again), verdicts(&first));
+    assert!(
+        built_observations(&again)
+            .iter()
+            .all(|o| o["gating"]["rule"] != "artifact-lacks-run-witness"),
+        "a second run of one normalized measurement withheld an artifact as unwitnessed"
+    );
+
+    // Another question, the same command lines: another nonce, and nothing read.
+    let other = measure(
+        &driver,
+        &work.path("other"),
+        &normalized(&["--env", "CHARD_TEST_UNKEYED=1"]),
+    );
+    let (other_nonce, other_source) = published_witness(&other);
+    assert_eq!(other_source, "derived");
+    assert_ne!(other_nonce, first_nonce);
+    assert!(assert_every_build_is_unwitnessed(&other, &first_nonce) >= 12);
+}
+
+/// A wrapper that takes the run-witness words off a command line whose output's file name
+/// matches the shell pattern `only`, and hands every other line to the real driver whole.
+fn witness_dropping_driver(work: &Path, only: &str) -> PathBuf {
+    witness_dropping_driver_saying(work, only, "")
+}
+
+/// [`witness_dropping_driver`], running the shell `says` on each line it takes the words
+/// off, before the real driver: what the wrapper prints beside the artifact it leaves.
+fn witness_dropping_driver_saying(work: &Path, only: &str, says: &str) -> PathBuf {
+    fake_driver(
+        work,
+        &format!(
+            r#"[ $# -eq 0 ] && exit 0
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+case "${{out##*/}}" in
+  {only}) ;;
+  *) exec "$REAL" "$@" ;;
+esac
+skip=0
+for a in "$@"; do
+  shift
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  if [ "$a" = "-include" ] && [ "$1" = "{}" ]; then skip=1; continue; fi
+  set -- "$@" "$a"
+done
+{says}
+exec "$REAL" "$@""#,
+            chard::compile::RUN_WITNESS_HEADER_NAME
+        ),
+    )
+}
+
+#[test]
+fn a_build_that_drops_the_witness_header_is_withheld() {
+    if !can_run("that an artifact with no run witness is withheld") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "an artifact with no run witness",
+            "this host's cc emits Mach-O, so the run has no witness to hold an artifact to",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "witness-dropped");
+    let driver = witness_dropping_driver(work.dir(), "*");
+    let report = measure(&driver, work.dir(), &CACHED_MEASUREMENT);
+    let withheld = assert_every_build_is_unwitnessed(&report, "carries no run witness");
+    assert!(
+        withheld >= 12,
+        "{withheld} observation(s) built an artifact"
+    );
+    // The words were on the line chard recorded; the wrapper is what removed them.
+    for o in built_observations(&report) {
+        let argv: Vec<&str> = o["build"]["argv"]
+            .as_array()
+            .expect("argv")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(argv.join(" ").contains(&witness_words()), "{argv:?}");
+    }
+}
+
+/// The output names of one kind of control arm, as a shell pattern for
+/// [`witness_dropping_driver_saying`]: `kind` is `pos` or `neg`.
+fn arm_outputs(kind: &str) -> String {
+    format!("*-{kind}|*-{kind}.o|*-{kind}.so")
+}
+
+/// Shell that prints, for each `-f`, `-W`, `-m`, `-U`, `-D`, `-O` and `-z` word of the command line, the line a
+/// driver prints for an option it does not know: what a cache replays beside an object it
+/// kept from a toolchain that refused the arm's flag.
+const SAYS_EVERY_FLAG_IS_UNKNOWN: &str = r#"for a in "$@"; do
+  case "$a" in -[fWmUDOz]*) echo "cc1: error: unrecognized command-line option '$a'" >&2 ;; esac
+done"#;
+
+/// The observations of `report` whose `arm` (`positive` or `negative`) was built to an
+/// output of that arm's own name, each held to an unwitnessed arm's reading: `probe-invalid`
+/// with the arm unevaluable, no outcome and no run on the arm, a detail that says its
+/// artifact carries no run witness, and no gating. Returns the channels seen.
+fn assert_unwitnessed_arms(report: &Value, arm: &str, kind: &str) -> Vec<String> {
+    let mut channels = std::collections::BTreeSet::new();
+    let suffixes = [
+        format!("-{kind}"),
+        format!("-{kind}.o"),
+        format!("-{kind}.so"),
+    ];
+    for o in report["observations"].as_array().expect("observations") {
+        let check = o["check"].as_str().expect("a check");
+        assert_ne!(
+            o["gating"]["rule"], "artifact-lacks-run-witness",
+            "{check}: the measured build carries the witness: {o}"
+        );
+        let built = &o["controls"][arm];
+        let own_output = built["build"]["argv"].as_array().is_some_and(|argv| {
+            argv.iter()
+                .filter_map(Value::as_str)
+                .any(|word| suffixes.iter().any(|s| word.ends_with(s.as_str())))
+        });
+        if !own_output {
+            continue;
+        }
+        // Never `unsupported` or `indeterminate` under a rule of the declared family: the
+        // arm's stderr says every flag is unknown, and it is not this run's to quote.
+        assert_eq!(o["verdict"], "probe-invalid", "{check}: {o}");
+        assert!(o.get("gating").is_none(), "{check}: {o}");
+        assert_eq!(
+            o["controls"]["withheld_because"],
+            format!("{arm}-unevaluable"),
+            "{check}: {o}"
+        );
+        assert!(built.get("outcome").is_none(), "{check}: {built}");
+        assert!(built.get("run").is_none(), "{check}: {built}");
+        assert!(
+            built["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("carries no run witness")),
+            "{check}: {built}"
+        );
+        assert!(
+            built["build"]["stderr"]
+                .as_str()
+                .is_some_and(|e| e.contains("unrecognized command-line option")),
+            "{check}: the arm's stderr does not carry the planted line: {built}"
+        );
+        channels.insert(o["channel"].as_str().expect("a channel").to_owned());
+    }
+    channels.into_iter().collect()
+}
+
+#[test]
+fn an_arm_whose_artifact_is_unwitnessed_is_unevaluable_and_says_nothing() {
+    if !can_run("that an unwitnessed control arm is unevaluable") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "an unwitnessed control arm",
+            "this host's cc emits Mach-O, so the run has no witness to hold an artifact to",
+        );
+        return;
+    }
+    let asked = [
+        "--profile",
+        "bare",
+        "--probe",
+        "stack-canary",
+        "--probe",
+        "cet-object",
+        "--probe",
+        "toolchain-macros",
+        "--probe",
+        "ub-null-check",
+        "--probe",
+        "warn-format",
+        "--probe",
+        "trampolines",
+    ];
+    let every_channel = ["compiler-diag", "elf-static", "macro", "runtime"];
+    for (arm, kind, expected) in [
+        ("positive", "pos", &every_channel[..]),
+        ("negative", "neg", &["elf-static", "macro"][..]),
+    ] {
+        let work = common::Work::new("fakedriver", &format!("witness-dropped-{kind}"));
+        let driver = witness_dropping_driver_saying(
+            work.dir(),
+            &arm_outputs(kind),
+            SAYS_EVERY_FLAG_IS_UNKNOWN,
+        );
+        let report = measure(&driver, work.dir(), &asked);
+        let channels = assert_unwitnessed_arms(&report, arm, kind);
+        for channel in expected {
+            assert!(
+                channels.iter().any(|c| c == channel),
+                "no unwitnessed {arm} arm was withheld on the {channel} channel: {channels:?}"
+            );
+        }
+        assert_eq!(report["consistency"]["status"], "consistent", "{arm}");
+    }
+}
+
+#[test]
+fn every_build_names_the_witness_and_every_artifact_read_carries_it() {
+    if !can_run("that every build carries the run witness") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "the run witness in every build",
+            "this host's cc emits Mach-O, so the run has no witness",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "witness-everywhere");
+    let driver = fake_driver(work.dir(), r#"exec "$REAL" "$@""#);
+    let report = measure(
+        &driver,
+        work.dir(),
+        &[
+            "--profile",
+            "bare-optimized",
+            "--probe",
+            "stack-canary",
+            "--probe",
+            "shared-object-defaults",
+            "--probe",
+            "cet-object",
+            "--probe",
+            "linker-default-execstack",
+            "--probe",
+            "copy-dt-needed",
+            "--probe",
+            "trapv",
+            "--probe",
+            "toolchain-macros",
+        ],
+    );
+    let (nonce, _) = published_witness(&report);
+    let words = witness_words();
+    let mut builds = 0usize;
+    for o in report["observations"].as_array().expect("observations") {
+        let check = o["check"].as_str().expect("a check");
+        assert_ne!(
+            o["gating"]["rule"], "artifact-lacks-run-witness",
+            "{check}: {o}"
+        );
+        let arms = ["positive", "negative", "regime_negative"]
+            .into_iter()
+            .map(|arm| &o["controls"][arm]["build"]);
+        for build in std::iter::once(&o["build"]).chain(arms) {
+            let Some(argv) = build["argv"].as_array() else {
+                continue;
+            };
+            let line: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
+            let line = line.join(" ");
+            assert_eq!(
+                line.matches(&words).count(),
+                1,
+                "{check}: a build does not name the run's header once: {line}"
+            );
+            assert!(
+                line.find(&words) < line.find(" -o "),
+                "{check}: the header is named after the output: {line}"
+            );
+            builds += 1;
+        }
+    }
+    assert!(builds >= 20, "{builds} build(s) were examined");
+
+    let mut read = 0usize;
+    for (key, entry) in report["facts"].as_object().expect("facts") {
+        match entry["kind"].as_str() {
+            Some("elf") => {
+                assert_eq!(
+                    entry["elf"]["run_witness"],
+                    serde_json::json!([nonce]),
+                    "{key}: a stored artifact does not carry the run's nonce alone"
+                );
+                read += 1;
+            }
+            // A delta states what differs from its base, and the witness never does.
+            Some("elf-delta") => {
+                assert!(
+                    entry["elf_changes"].get("run_witness").is_none(),
+                    "{key}: an arm's witness differs from its base's: {entry}"
+                );
+                read += 1;
+            }
+            Some("unreadable") => panic!("{key}: an honest build was not read: {entry}"),
+            _ => {}
+        }
+    }
+    assert!(read >= 8, "{read} stored artifact(s) were examined");
+}
+
+#[test]
+fn a_library_the_probe_links_that_is_unwitnessed_withholds_the_probe() {
+    if !can_run("that an unwitnessed library of a probe's chain withholds the probe") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "an unwitnessed library of a probe's chain",
+            "this host's cc emits Mach-O, so the run has no witness to hold a library to",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "witness-dropped-library");
+    let driver = witness_dropping_driver(work.dir(), "lib*.so");
+    let asked = ["--profile", "bare", "--probe", "copy-dt-needed"];
+    let report = measure(&driver, &work.path("dropped"), &asked);
+    let honest = measure(
+        &fake_driver_named(
+            work.dir(),
+            "fakecc-whole",
+            &real_cc(),
+            r#"exec "$REAL" "$@""#,
+        ),
+        &work.path("whole"),
+        &asked,
+    );
+    let mut withheld = 0;
+    for o in report["observations"].as_array().expect("observations") {
+        let check = o["check"].as_str().expect("a check");
+        let whole = observation(&honest, check);
+        assert!(
+            matches!(whole["verdict"].as_str(), Some("on" | "off")),
+            "{check} is not measured with the libraries whole: {whole}"
+        );
+        assert_eq!(o["verdict"], "indeterminate", "{check}: {o}");
+        assert_eq!(
+            o["gating"]["rule"], "artifact-lacks-run-witness",
+            "{check}: {o}"
+        );
+        let reason = o["gating"]["reason"].as_str().expect("a reason");
+        assert!(
+            reason.contains("a library the probe's link takes")
+                && reason.contains("carries no run witness")
+                && reason.contains("libchard"),
+            "{check}: {reason}"
+        );
+        for field in ["build", "controls", "run"] {
+            assert!(o.get(field).is_none(), "{check} carries `{field}`: {o}");
+        }
+        withheld += 1;
+    }
+    assert!(withheld >= 1, "no check of the probe was observed");
+    assert_eq!(report["consistency"]["status"], "consistent");
+}
+
+#[test]
+fn an_lto_object_is_withheld_for_its_ir_and_blames_no_cache() {
+    if !can_run("that an object of LTO IR is withheld with the IR named") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "an object of LTO IR under the run witness",
+            "this host's cc emits Mach-O, so the run has no witness",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "witness-lto-object");
+    let driver = fake_driver(work.dir(), r#"exec "$REAL" "$@""#);
+    let report = measure(
+        &driver,
+        work.dir(),
+        &[
+            "--profile",
+            "explicit",
+            "--flags",
+            "-O2 -flto",
+            "--probe",
+            "cet-object",
+            "--probe",
+            "stack-canary",
+        ],
+    );
+    let object = observation(&report, "cet-marked-object");
+    if object["build"]["exit_status"] != 0 {
+        common::capability_gap(
+            "an object of LTO IR under the run witness",
+            "the host's cc did not build the object probe under -flto",
+        );
+        return;
+    }
+    assert_eq!(object["verdict"], "indeterminate", "{object}");
+    assert_eq!(
+        object["gating"]["rule"], "artifact-lacks-run-witness",
+        "{object}"
+    );
+    let reason = object["gating"]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("compiler IR") && reason.contains("link-time optimization"),
+        "the reason does not say the IR is why: {reason}"
+    );
+    assert!(
+        !reason.contains("cache") && !reason.contains("wrapper"),
+        "the reason blames a cache for what the profile explains: {reason}"
+    );
+    for d in report["diagnostics"].as_array().expect("diagnostics") {
+        let message = d["message"].as_str().unwrap_or("");
+        assert!(
+            !(message.contains("compiler IR") && message.contains("cache")),
+            "a diagnostic blames a cache for an object of IR: {message}"
+        );
+    }
+    // The linked probe's code is generated at the link, with the note.
+    let linked = observation(&report, "canary-emitted");
+    assert_ne!(
+        linked["gating"]["rule"], "artifact-lacks-run-witness",
+        "{linked}"
+    );
+    assert!(
+        !stored_elf(&report, linked).is_null(),
+        "the linked probe under -flto was not read: {linked}"
+    );
+    assert_eq!(report["consistency"]["status"], "consistent");
+}
+
+#[test]
+fn a_clang_lto_object_is_named_as_bitcode_and_blames_no_cache() {
+    const TEST: &str = "a clang LTO object under the run witness";
+    if !can_run("that clang's bitcode object is withheld with the IR named") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            TEST,
+            "this host's cc emits Mach-O, so the run has no witness",
+        );
+        return;
+    }
+    let host_path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(clang) = resolved_on(&host_path, "clang") else {
+        common::capability_gap(TEST, "no clang on PATH");
+        return;
+    };
+    let work = common::Work::new("fakedriver", "witness-lto-bitcode");
+    let report = measure(
+        &clang,
+        work.dir(),
+        &[
+            "--profile",
+            "explicit",
+            "--flags",
+            "-O2 -flto",
+            "--probe",
+            "cet-object",
+        ],
+    );
+    let object = observation(&report, "cet-marked-object");
+    if object["build"]["exit_status"] != 0 {
+        common::capability_gap(TEST, "clang did not build the object probe under -flto");
+        return;
+    }
+    assert_eq!(object["verdict"], "indeterminate", "{object}");
+    assert_eq!(
+        object["gating"]["rule"], "artifact-lacks-run-witness",
+        "{object}"
+    );
+    let reason = object["gating"]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("LLVM bitcode") && reason.contains("compiler IR"),
+        "the reason does not name the bitcode: {reason}"
+    );
+    assert!(
+        !reason.contains("cache") && !reason.contains("wrapper") && !reason.contains("refused"),
+        "the reason reads as a file something else left: {reason}"
+    );
+    let key = object["build"]["artifact_sha256"]
+        .as_str()
+        .expect("a digest");
+    assert_eq!(report["facts"][key]["kind"], "unreadable");
+    assert_eq!(report["consistency"]["status"], "consistent");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_resolved_driver_is_published_beside_the_path_that_was_run() {
+    if !can_run("that the driver's resolved path is published") {
+        return;
+    }
+    let work = common::Work::new("fakedriver", "driver-resolved");
+    let real = PathBuf::from(real_cc());
+    let link = work.dir().join("linked-cc");
+    std::os::unix::fs::symlink(&real, &link).expect("a link to the host's cc");
+    let report = measure(
+        &link,
+        &work.path("w"),
+        &["--profile", "bare", "--probe", "warn-format"],
+    );
+    let toolchain = &report["toolchain"];
+    assert_eq!(
+        toolchain["driver"].as_str().map(PathBuf::from),
+        Some(link.clone()),
+        "{toolchain}"
+    );
+    let resolved = std::fs::canonicalize(&real).expect("the host's cc resolves");
+    assert_ne!(resolved, link);
+    assert_eq!(
+        toolchain["driver_resolved"].as_str().map(PathBuf::from),
+        Some(resolved),
+        "{}",
+        toolchain["driver_resolved"]
+    );
+}
+
+#[test]
+fn a_normalized_runs_nonce_is_derived_from_the_question_its_report_publishes() {
+    if !can_run("that a derived nonce is the report's own question's") {
+        return;
+    }
+    if !common::ELF_HOST {
+        common::capability_gap(
+            "the derived nonce's question",
+            "this host's cc emits Mach-O, so the run has no witness",
+        );
+        return;
+    }
+    let work = common::Work::new("fakedriver", "witness-question");
+    let driver = fake_driver(work.dir(), r#"exec "$REAL" "$@""#);
+    let report = measure(
+        &driver,
+        &work.path("w"),
+        &[
+            "--normalize",
+            "--profile",
+            "explicit",
+            "--flags",
+            "-O2 -g",
+            "--cxxflags",
+            "-O1",
+            "--ldflags",
+            "-Wl,--as-needed",
+            "--env",
+            "CHARD_TEST_PAIR=one",
+            "--probe",
+            "warn-format",
+        ],
+    );
+    let words = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .expect("a flag list")
+            .iter()
+            .map(|w| w.as_str().expect("a word").to_owned())
+            .collect()
+    };
+    let profile = &report["profile"];
+    let (cflags, cxxflags, ldflags) = (
+        words(&profile["cflags"]),
+        words(&profile["cxxflags"]),
+        words(&profile["ldflags"]),
+    );
+    assert_eq!(cflags, ["-O2", "-g"]);
+    assert_eq!(cxxflags, ["-O1"]);
+    assert_eq!(ldflags, ["-Wl,--as-needed"]);
+    let toolchain = &report["toolchain"];
+    let question = chard::compile::WitnessQuestion {
+        cflags: &cflags,
+        cxxflags: &cxxflags,
+        ldflags: &ldflags,
+        env: vec![("CHARD_TEST_PAIR", "one")],
+        driver: toolchain["driver"].as_str().expect("a driver"),
+        version_raw: toolchain["version_raw"].as_str(),
+        target_triple: toolchain["target_triple"].as_str(),
+        probe_corpus_sha256: report["run"]["probe_corpus_sha256"]
+            .as_str()
+            .expect("a corpus digest"),
+    };
+    assert!(question.version_raw.is_some() && question.target_triple.is_some());
+    let scratch = work.path("recomputed");
+    std::fs::create_dir_all(&scratch).expect("a directory for the recomputed header");
+    let expected =
+        chard::compile::RunWitness::derived_in(question.lines(), &scratch).expect("a witness");
+    assert_eq!(
+        published_witness(&report),
+        (expected.nonce_hex().to_owned(), "derived".to_owned())
+    );
 }

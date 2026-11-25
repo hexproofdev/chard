@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# House shellcheck configuration (shellcheck 0.11.0). A repository copies this file to its root as
+# .shellcheckrc, unedited; the gate runs `shellcheck -S style` (every severity) on tracked scripts.
+# Chosen by running every check over 295 scripts in 26 checkouts (16,695 findings,
+# Jinja templates excluded) and turning off what sampling showed to be noise: 345 remain, 83 of
+# them SC2016 in the 15 files that disable it at the top.
+
+# Optional checks kept: each found real defects or costs almost nothing.
+#   add-default-case: a `case` without `*)` lets an unknown mode do nothing, silently (110 measured)
+#   avoid-nullary-conditions, avoid-negated-conditions, deprecate-which, useless-use-of-cat: 0-2 each
+enable=add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,useless-use-of-cat
+
+# Optional checks left off. Each was sampled finding by finding (36 per check across up to 23
+# checkouts) and found no defect at a usable rate:
+#   require-variable-braces SC2250 (13,258) and require-double-brackets SC2292 (1,524): style only;
+#     `[[` also fights POSIX sh scripts
+#   check-extra-masked-returns SC2312 (1,184): 0 defects, 2 latent in 36; 377 of the 1,183 lines
+#     flagged are message text. A script can opt in: # shellcheck enable=check-extra-masked-returns
+#   check-set-e-suppressed SC2310 (238): 1 defect in 36, found by accident (the bug was elsewhere)
+#   quote-safe-variables SC2248 (183): 0 in 36; the unsafe case stays covered by SC2086 (default on)
+#   check-unassigned-uppercase: CI-provided variables such as FORGEJO_OUTPUT
+# SC2016 stays on: 0 defects in all 83 findings, but all 83 sit in 15 files that carry sed, awk,
+# jq or bash -c code in single quotes on purpose. Those files disable it at the top, with a reason,
+# so a new file still gets the check.
+
+# Follow `source` and `.` relative to the script, so SC1091 reports a real missing file.
+external-sources=true
+source-path=SCRIPTDIR

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier crypto: constant-time and secret-handling code (select with arith and nofloat).
+clippy.integer_division = "deny"               # variable-time division is a constant-time review flag
+clippy.use_debug = "deny"                      # {:?} can print a key

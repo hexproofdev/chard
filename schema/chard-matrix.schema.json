@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hexproofdev/chard/schema/chard-matrix.schema.json",
   "title": "chard cross-configuration matrix",
-  "description": "A view over many reports, keyed on the full configuration tuple rather than on the distribution. The distribution is one variable among several and frequently not the one that explains a result: whether an undeclared call is an error is decided by the compiler version, whether fortify exists at all by the libc, whether it is instantiated by the optimization level, and where hardening comes from by the profile. A table with one column per distribution cannot express any of those, and silently attributes them to the distribution instead. Reports remain the atomic facts; this is derived from them.",
+  "description": "A view over many reports, derived from them and keyed on the full configuration tuple rather than on the distribution. The compiler version, the C library, the optimization level and the profile each explain results a distribution column would claim.",
   "type": "object",
   "additionalProperties": true,
   "required": [
@@ -16,9 +16,9 @@
   ],
   "properties": {
     "chard_schema": {
-      "description": "The major version of this document's shape. When it moves is the CLI contract's rule (`chard --help`; DESIGN.md, \"The command-line contract\"): a key chard adds is not a change, which is why every object here admits one. The key was `chard_matrix_schema` before the first publication.",
+      "description": "The major version of this document's shape. When it moves is the CLI contract's rule (`chard --help`; DESIGN.md, \"The command-line contract\"): a key chard adds is not a change, which is why every object here admits one.",
       "type": "string",
-      "const": "1"
+      "const": "2"
     },
     "inputs": {
       "type": "integer",
@@ -91,7 +91,12 @@
                 "type": "string"
               },
               "arch": {
-                "type": "string"
+                "type": "string",
+                "description": "The report's `toolchain.target.arch`, the architecture every arch-gated decision was taken under; empty where the report carries none. ` (contradicted)` follows it (`x86_64 (contradicted)`) where one of the report's own witnesses of the target disagrees, or an observation is withheld under `target-arch-contradicted` or `target-abi-contradicted`."
+              },
+              "machine": {
+                "type": "string",
+                "description": "The machine the run had: what names its CPU (`environment.cpu.arm_parts` joined by `+`, or `<vendor>/<model>`), then `features:` and the sorted `relevant_features`, as `0xc0:0xac3 features:bti,paca,pacg`; `unread` where the report carries no `environment.cpu`. Matched exactly, since one image on two machines of one architecture can answer the runtime checks differently."
               },
               "profile": {
                 "type": "string"
@@ -101,11 +106,11 @@
               },
               "execution_basis": {
                 "type": "string",
-                "description": "The report's `environment.execution.mode_evidence.basis`, what established `execution`: `measured`, `asserted-and-corroborated`, `asserted-but-unobservable` or `assumed-host`, and `unpublished` for a report that carries none, a word outside that field's enumeration. A report on the default (`host` on `assumed-host`) withholds the checks that declare `needs_vm` where an asserted `host` measures them, so the two are separate cells; keyed on the mode alone they would be one, the later report's verdicts written over the earlier's."
+                "description": "The report's `environment.execution.mode_evidence.basis`, what established `execution`, or `unpublished` for a report that carries none. An assumed `host` and an asserted one withhold different checks, so they are separate cells."
               },
               "image": {
                 "type": "string",
-                "description": "The image the measurement ran in \u2014 the axis of last resort, distinguishing two specimens that agree on every other axis. Without it two portage profiles collided into one cell and their disagreement rendered as `varies: false`."
+                "description": "The image the measurement ran in: the axis of last resort, distinguishing two specimens that agree on every other axis."
               }
             }
           },
@@ -120,7 +125,7 @@
               "unsettled",
               "unpublished"
             ],
-            "description": "The report's `environment.kernel.ownership`: whose kernel the cell's run had. `own` on the operator's word, `--execution host` or `vm`, which nothing chard reads corroborates; the checks that declare needs_vm are not withheld on this field. `borrowed` in a container, where they are withheld under `needs-vm`; `unsettled` on the default basis `assumed-host`, where they are withheld under `execution-mode-assumed`. `unpublished` where no report of the cell carries the field. Not an axis: it is a function of `key.execution` and `key.execution_basis`, which each report that carries it is held to on read, so every report of a cell that publishes it publishes the same word."
+            "description": "The report's `environment.kernel.ownership`, whose kernel the cell's run had; `unpublished` where no report of the cell carries it. Not an axis: it follows from `key.execution` and `key.execution_basis`, so every report of a cell that publishes it publishes the same word."
           },
           "flags": {
             "type": "object",
@@ -138,6 +143,13 @@
               ]
             },
             "description": "flag -> the report's `observations[].polarity`, for each flag in `flags` whose observation carries one. For a `weaken` flag `off` is the protected state, the flag's effect being absent, so a verdict in `flags` is read with its polarity."
+          },
+          "gating": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "flag -> the report's `observations[].gating.rule`, for each flag whose observation carries one; absent where none does. It tells apart the `?` in `flags` that the machine could not answer from one the toolchain's run left unread."
           }
         }
       }
@@ -186,7 +198,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Axes under which every group of observations agrees. Empty when no single axis fits, which is the common case once several axes vary \u2014 hardening posture is multi-causal and saying so is more useful than forcing an attribution."
+            "description": "Axes under which every group of observations agrees, as `strength` qualifies them; an axis with an unknown value for a configuration carrying the flag explains nothing. Empty when no single axis fits, the common case once several axes vary."
           },
           "strength": {
             "enum": [
@@ -194,7 +206,7 @@
               "controlled",
               "none"
             ],
-            "description": "`grouped`: some axis value covers two or more agreeing observations, so the axis explains rather than merely identifies. `controlled`: the axis was the only thing that changed but no group has more than one member \u2014 a controlled comparison, weaker. `none`: nothing fits. The distinction matters because an axis taking a unique value per observation satisfies consistency vacuously; one report per distribution would otherwise let the distribution 'explain' a compiler-version boundary."
+            "description": "`grouped`: some axis value covers two or more agreeing observations. `controlled`, weaker: no group has two members, but two configurations that read the flag differently differ, with known values, only on that axis and those that change with it by construction. `none`: nothing fits, or an axis fits only with a value per configuration, which `note` names. A value is not known where it is empty (`image` aside), `unread`, `unknown`, `unpublished` or a contradicted architecture."
           },
           "confounded_with": {
             "type": "object",
@@ -204,14 +216,14 @@
                 "type": "string"
               }
             },
-            "description": "Maps an explaining axis to the axes these inputs cannot separate it from, because fewer than two of its values were observed under more than one value of the other. Two are required for the same reason `strength` requires a group of two: one cross-link is an anecdote. Contingent on the input set, not permanent \u2014 the named axes are exactly what one more configuration would separate. Structural refinements (compiler_version within compiler, release within distro) are omitted as true but useless."
+            "description": "Maps an explaining axis to the axes these inputs cannot separate it from: fewer than two of its values were observed under more than one value of the other. It depends on the input set, and omits the structural refinements (compiler_version within compiler, release within distro)."
           },
           "explained_by_combination": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "A pair of axes holding more agreeing observations in one group than any single axis manages, and therefore the better-evidenced explanation. Present because a fine-grained axis partitions the data cheaply: compiler_version took a near-unique value per configuration and so 'explained' flags that are really a distribution patching one compiler, which reads as upstream compiler behaviour. Absent when no pair beats the best single axis. Cannot express an ordered threshold such as 'compiler version >= 14', so flags that flip at a version boundary may attribute to any axis correlated with recency."
+            "description": "A pair of axes holding more agreeing observations in one group than any single axis does, and absent when no pair beats the best single axis. It cannot express an ordered threshold such as a minimum compiler version, so a flag that flips at a version boundary may attribute to any axis correlated with recency."
           },
           "note": {
             "type": "string"

@@ -1,49 +1,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Executing a probe binary and recording how it died.
-//!
-//! For the `runtime` channel the observable *is* the manner of death: exit
-//! status, terminating signal, and the diagnostic text libc printed. Under glibc,
-//! `SIGABRT` with `*** buffer overflow detected ***` means FORTIFY caught the write;
-//! `SIGABRT` with `*** stack smashing detected ***` means the canary did;
-//! `SIGSEGV` means nothing caught it; `SIGILL` is how a CET or BTI violation
-//! surfaces. These must be distinguishable, so we record all three facts rather
-//! than collapsing them to a boolean.
-//!
-//! ## The diagnostic is glibc's convention, not the mechanism's
-//!
-//! Recording all three matters most where that mapping does not hold. Alpine's
-//! fortify-headers signals an overflow with `__builtin_trap()` (`ud2` on x86_64, so
-//! `SIGILL` and an empty stderr) and musl's canary handler calls `a_crash()` rather
-//! than printing and aborting. A detector keyed on glibc's wording sees a bare signal
-//! with no message and correctly declines to claim anything, which is safe and useless:
-//! it reports nothing on a system where the protection is present and working.
-//!
-//! So a signal alone can license a verdict, but only once something else has
-//! established who owns it. [`RunRecord::trapped`] is deliberately separate from
-//! [`RunRecord::aborted`] for that reason, and its callers pair it with the probe's
-//! self-reported `_FORTIFY_IMPL` before reading anything into it; a compiler-inserted
-//! trap for undefined behaviour is the same instruction.
-//!
-//! Output goes to files rather than pipes. Probes emit almost nothing, but a
-//! pipe that fills while we are polling `try_wait` would deadlock, and the files
-//! double as retained evidence in the work directory.
-//!
-//! ## The environment a probe runs under
-//!
-//! A probe receives no ambient variable at all. [`execute`] clears the environment and sets exactly
-//! [`PROBE_ENVIRONMENT`] and the pins the probe itself declares (`probe::Probe::run_environment`,
-//! empty for all but one probe), and every [`RunRecord`] carries that map as
-//! [`RunRecord::environment`] so a reader can re-derive a runtime verdict under the same
-//! conditions. The constant's own documentation says why clearing rather than a named list, and why
-//! each pin. `DESIGN.md` places this among the conditions the control triple cannot see, since
-//! an ambient variable reaches every arm alike.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::os::unix::process::ExitStatusExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -54,25 +17,11 @@ use serde::{Deserialize, Serialize};
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// The finer interval, and how long it is used for.
-///
-/// A flat 2 ms poll does not round a short duration, it *replaces* it: a probe that
-/// finishes in 300 µs sleeps exactly once and is recorded as 2 ms. That is not a fast
-/// probe reported imprecisely; it is the instrument's own resolution published as a
-/// measurement. Ten of the thirteen run records in a full `chard measure` on the
-/// development host read exactly 2 ms, and so does every run record in
-/// `tests/fixtures/detectors.json`. For a tool whose entire claim is that it reports
-/// what it measured rather than what it was told, that is the wrong number to ship.
-///
-/// So poll finely while a short child could still be running, then back off. The extra
-/// cost is bounded at `FINE_POLL_WINDOW / FINE_POLL_INTERVAL` (one hundred wakeups,
-/// after which a two-minute compile polls exactly as it did before.
 const FINE_POLL_INTERVAL: Duration = Duration::from_micros(100);
 const FINE_POLL_WINDOW: Duration = Duration::from_millis(10);
 
 /// Sleep before the next `try_wait`, finely while the child is still young.
-///
-/// Shared with [`crate::compile`], which polls a child the same way, so the reasoning
-/// above lives in one place instead of being restated at each polling site.
+#[expect(clippy::disallowed_methods, reason = "the wait is on a child's exit")]
 pub(crate) fn poll_sleep(elapsed: Duration) {
     if elapsed < FINE_POLL_WINDOW {
         std::thread::sleep(FINE_POLL_INTERVAL);
@@ -81,67 +30,106 @@ pub(crate) fn poll_sleep(elapsed: Duration) {
     }
 }
 
+/// How long [`kill_group`] waits for the shell it signals the group through. The shell's
+/// `kill` is a builtin and returns at once; this bounds a shell that does not.
+const KILL_BOUND: Duration = Duration::from_secs(5);
+
+/// The shell [`kill_group`] runs, by absolute path, so `PATH` does not choose it.
+const KILL_SHELL: &str = "/bin/sh";
+
+/// Kill the process group `child` leads, `child` with it, after a timeout and before `child`
+/// is reaped.
+pub(crate) fn kill_group(child: &mut Child) {
+    kill_group_through(child, KILL_SHELL);
+}
+
+/// [`kill_group`] through the shell `shell`, so a test can name one that cannot run.
+fn kill_group_through(child: &mut Child, shell: &str) {
+    let pid = child.id();
+    if let Some(group) = group_operand(pid)
+        && let Err(err) = signal_group(shell, &group)
+    {
+        crate::error::note(&format!(
+            "the process group of timed-out child {pid} could not be killed ({err})"
+        ));
+    }
+    crate::error::best_effort(child.kill());
+}
+
+/// The operand `kill` names the group `pid` leads by, `-<pid>`; none for a pid of 0 or 1,
+/// which as a group operand would name the caller's own group or every process.
+fn group_operand(pid: u32) -> Option<String> {
+    (pid > 1).then(|| format!("-{pid}"))
+}
+
+/// [`kill_group`]'s shell, `shell`: `kill -KILL <group>`, waited for under [`KILL_BOUND`] and
+/// killed past it. An error where the shell cannot be spawned, outlives the bound, or exits
+/// other than 0, as `kill` does where it signalled nothing.
+fn signal_group(shell: &str, group: &str) -> std::io::Result<()> {
+    let started = Instant::now();
+    let mut killer = Command::new(shell)
+        .args(["-c", "kill -KILL \"$1\"", "sh", group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_clear()
+        .spawn()?;
+    let status = loop {
+        if let Some(status) = killer.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= KILL_BOUND {
+            crate::error::best_effort(killer.kill());
+            crate::error::best_effort(killer.wait());
+            return Err(std::io::Error::other(format!(
+                "{shell} did not finish within {KILL_BOUND:?}"
+            )));
+        }
+        poll_sleep(started.elapsed());
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{shell}'s kill ended with {status}"
+        )))
+    }
+}
+
+/// Whether process `pid` has ended within `grace`, read by `kill -0` through `/bin/sh` every 20
+/// ms: the tests of [`kill_group`]'s two callers read what a timeout left behind with it. A
+/// zombie still answers `kill -0`, and a process whose parent was killed is reaped by the one
+/// it is handed to, so `grace` covers that reap.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the condition is another process's end, which no handle here can wait on: the pid \
+              is not this process's child, so `kill -0` between sleeps, under `grace`, is the \
+              wait"
+)]
+pub(crate) fn gone_within(pid: u32, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        let alive = Command::new(KILL_SHELL)
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", &pid.to_string()])
+            .status()
+            .expect("spawning /bin/sh to ask whether the process is alive")
+            .success();
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The whole environment a probe runs under.
-///
-/// A probe consults no variable legitimately, so it receives none: [`execute`] clears the
-/// ambient environment and sets exactly these. The driver side is cleared the same way
-/// (`compile::compiler_environment`) and differs in one name: a compiler is handed `PATH`,
-/// which it needs to find its assembler and linker, and a probe is not. A named list of
-/// variables to remove would have to
-/// enumerate everything a loader or a libc reads, and any name left off it would reach the
-/// probe unrecorded. `LD_PRELOAD` substitutes the functions under test, `LD_AUDIT` and
-/// `LD_LIBRARY_PATH` substitute the objects they live in, `GLIBC_TUNABLES` arms and disarms
-/// the hardware features a check observes, `MALLOC_CHECK_` and `MALLOC_PERTURB_` change
-/// what the heap probes see, `LD_BIND_NOW` makes a lazy binding look eager, and
-/// `UBSAN_OPTIONS=log_path=` moves a diagnostic off the stream a detector reads. Clearing
-/// covers each of those and the ones nobody has listed yet, and it is what lets
-/// [`RunRecord::environment`] be exact without chard reading its own environment, which
-/// it does not do beyond `PATH`.
-///
-/// Each pin has a reason:
-///
-/// - `LC_ALL=C` pins the wording of every diagnostic a runtime detector matches on, for
-///   the reason `compile.rs` gives at length: glibc ships translated messages.
-/// - `LIBC_FATAL_STDERR_=1` keeps glibc's fatal messages on stderr on the releases that
-///   would otherwise send them to the terminal. In `sysdeps/posix/libc_fatal.c` at the
-///   2.28, 2.29 and 2.30 tags, `__libc_message` reads this variable and, when it is
-///   unset, opens `/dev/tty` for `*** buffer overflow detected ***` and `*** stack
-///   smashing detected ***` (in 2.30 only under the `do_backtrace` action), falling back
-///   to file descriptor 2 only when that open fails. A probe run from an interactive
-///   terminal on those releases prints its diagnostic to the terminal, the captured
-///   stderr is empty, and the fortify and canary detectors read a bare `SIGABRT` they
-///   decline to attribute. From the 2.31 tag on, through master, the message goes to
-///   `STDERR_FILENO` unconditionally and the variable is never read. The pin is
-///   load-bearing on glibc 2.30 and earlier (RHEL 8's 2.28 is in the fixture span),
-///   inert from 2.31 on, and harmless on musl and Apple libc, which have no such path.
-///
-/// A probe that needs something else, a cross-architecture artifact whose `binfmt_misc`
-/// interpreter is configured only through `QEMU_LD_PREFIX`, say, fails to run and is
-/// recorded as such; the record's `environment` is what explains it.
-///
-/// One probe needs a variable as part of its question, and declares it rather than
-/// receiving it from here: `shadow-stack` runs with
-/// `GLIBC_TUNABLES=glibc.cpu.hwcaps=SHSTK:glibc.malloc.perturb=170`, glibc's opt-in to the x86
-/// shadow stack, which glibc 2.39 and later leave off without it, beside a tunable whose effect
-/// shows the opt-in reached the C library.
-/// A pin on this list would reach every probe, and arming the shadow stack under every
-/// runtime probe built with `-fcf-protection` changes the conditions of checks that are
-/// not about it; a pin on the probe reaches its own arms and nothing else, and its run
-/// records carry it like these two. The pin's reason is on the probe, and `THREAT_MODEL.md`
-/// names it beside these, which `tests/register.rs` holds. That probe also
-/// starts a second process of its own, the same program with `GLIBC_TUNABLES` removed, so
-/// under exactly this list; that is the probe's act rather than chard's, read from its
-/// stdout, and `probes/shadow_stack.c` says why (the check's level is what a deployment that
-/// sets nothing gets).
 pub const PROBE_ENVIRONMENT: &[(&str, &str)] = &[("LC_ALL", "C"), ("LIBC_FATAL_STDERR_", "1")];
 
 /// [`PROBE_ENVIRONMENT`] and the probe's own `pins`, as the map the record carries and the
 /// child is given.
-///
-/// A pin naming a variable this list already sets would replace the list's value for one
-/// probe, which is not what a pin is for;
-/// `probe::tests::no_probe_pin_restates_the_base_environment` refuses one in the corpus, so
-/// the merge here never has to choose.
 fn probe_environment(pins: &[(&str, &str)]) -> BTreeMap<String, String> {
     PROBE_ENVIRONMENT
         .iter()
@@ -164,48 +152,22 @@ pub struct RunRecord {
     pub stdout: String,
     pub stderr: String,
     /// Whether `deadline_ms` elapsed before chard saw the child exit.
-    ///
-    /// `true` does not by itself mean the probe was killed: [`execute`] looks once more
-    /// before killing, and a probe that exited in that window keeps its real status beside
-    /// this flag. Read with `deadline_ms`, the bound it hit.
     pub timed_out: bool,
     /// The deadline this run was held to, in whole milliseconds: `--timeout`, applied to
     /// each probe run on its own.
-    ///
-    /// Published so that `timed_out` names the bound it hit. Without it a report would carry
-    /// the flag and not the bound, and `--timeout` would reach a report only through
-    /// `run.invocation`, which does not carry the default. `None` only on a record without
-    /// the field, which the replay fixtures are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u128>,
     /// Why an output stream could not be read, when one could not.
-    ///
-    /// Absent on every healthy run. Present means `stdout` or `stderr` above is empty
-    /// because chard failed to read the file, **not** because the probe was silent,
-    /// and on the runtime and `compiler-diag` channels those two are opposite
-    /// measurements.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_error: Option<String>,
     /// Whether a stream hit `MAX_CAPTURE` and lost its tail.
-    ///
-    /// A detector scanning for a diagnostic that appears late would otherwise read a
-    /// truncated stream's silence as the probe's. Consumed through
-    /// [`stream_cut`](Self::stream_cut), with `output_error`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[serde(default)]
     pub output_truncated: bool,
     /// Whole milliseconds, so `0` means the probe finished in under a millisecond,
-    /// not that it went untimed. Most probes do: before `poll_sleep` backed off
-    /// instead of sleeping a flat 2 ms, ten of the thirteen run records in a full
-    /// measurement reported exactly the poll interval.
+    /// not that it went untimed.
     pub duration_ms: u128,
     /// Every variable the probe received, with its value.
-    ///
-    /// The complete environment, since [`execute`] clears the ambient one before setting
-    /// [`PROBE_ENVIRONMENT`]: a reader re-deriving a runtime verdict runs the artifact
-    /// under exactly this map (`env -i LC_ALL=C LIBC_FATAL_STDERR_=1 ./probe`) and has
-    /// reproduced the conditions. `None` only on a record made before the field existed,
-    /// which the replay fixtures are; a record chard writes today always carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<BTreeMap<String, String>>,
 }
@@ -218,29 +180,6 @@ impl RunRecord {
     }
 
     /// True when the process hit a deliberate trap instruction.
-    ///
-    /// Deliberately separate from [`aborted`](Self::aborted). `__builtin_trap()` is how
-    /// fortify-headers signals an overflow, and it is a far weaker signal than an abort
-    /// carrying a diagnostic: a compiler-inserted trap for undefined behaviour looks
-    /// identical. A caller must establish who owns the trap before reading anything
-    /// into it.
-    ///
-    /// Both signals, because the instruction differs by architecture rather than by who
-    /// emitted it: `__builtin_trap()` is `ud2` on x86_64, which raises `SIGILL`, and
-    /// `brk` on aarch64, which raises `SIGTRAP`. Matching only `SIGILL` made this
-    /// predicate silently architecture-specific; it would miss an aarch64
-    /// fortify-headers trap as readily as the Apple one it was first observed to miss.
-    ///
-    /// Where the probe was built with the fault reporter and its report matches the
-    /// signal it died by, the report decides: only a [`Fault::CompilerTrap`] is a trap.
-    /// A BTI fault, a PAC authentication failure, an undefined instruction and a report
-    /// that could not decide ([`Fault::Undetermined`]) are not. Without a report the bare
-    /// signal decides; a probe that does not opt in is unaffected.
-    ///
-    /// A reading for a probe that opts in must read [`fault`](Self::fault) rather than
-    /// this: there `None` means the report the probe was built to write is missing, and
-    /// `Undetermined` that it could not decide, and either withholds the reading. This
-    /// predicate cannot say which of those it saw.
     pub fn trapped(&self) -> bool {
         match self.fault() {
             Some(fault) => fault == Fault::CompilerTrap,
@@ -250,14 +189,6 @@ impl RunRecord {
 
     /// The fault report a probe built with `CHARD_WANT_FAULT_REPORT` wrote to stderr,
     /// when it wrote one about the signal this record says it died by.
-    ///
-    /// The last `chard-fault-v1` line counts, since the handler resets itself and so
-    /// writes at most one; an earlier one would be a probe printing the prefix itself.
-    /// A report whose signal is not the recorded death is about something else (a fault
-    /// the probe survived, or a death the handler never saw) and is not returned, so a
-    /// mismatch falls back to the bare signal rather than classifying the wrong event.
-    /// The numbers are read with this platform's signal table; the reporter emits on
-    /// Linux only, where the table is Linux's.
     #[must_use]
     pub fn fault_report(&self) -> Option<FaultReport> {
         let line = self
@@ -283,23 +214,6 @@ impl RunRecord {
 
     /// Why this record's streams are not the whole of what the probe printed, in one
     /// sentence, or `None` when both were read whole.
-    ///
-    /// Every runtime decoder reads a marker's absence somewhere: `absent` needs the
-    /// survival marker and no diagnostic, the reason for an `indeterminate` falls through
-    /// a list of messages, and `cxx-stdlib-assertions` reads the optimisation level from
-    /// whether `chard-opt=0` was printed. On a stream that lost its tail, or that chard
-    /// could not read at all, a missing marker is chard's silence rather than the probe's.
-    /// So a reading over such a record is withheld whatever it was, the way
-    /// `report::truncated_reading` withholds a reading over a half-read ELF table:
-    /// `measure::withhold_unreadable` replaces the detection before the control triple
-    /// sees it, and `report::stream_limitation` names the rule on the measured cell.
-    ///
-    /// A probe [killed at its deadline](Self::killed_at_deadline) is cut the same way: it
-    /// never finished writing, stdout redirected to a file is fully buffered so its
-    /// unflushed tail is lost, and a partial last line can parse as a different marker
-    /// (`ratio_pct=9` from `ratio_pct=95`), so on such a run a decoder could read a false
-    /// `on` as readily as a false `off`. Counting only the capture cap and a failed read,
-    /// a killed run printing `null-check=deleted` would read `off`.
     #[must_use]
     pub fn stream_cut(&self) -> Option<String> {
         let mut cuts: Vec<String> = Vec::new();
@@ -330,10 +244,6 @@ impl RunRecord {
     /// Whether chard's deadline is what ended this run: it timed out and the status is
     /// the `SIGKILL` [`execute`] sends, or no status at all (a `wait` that failed after
     /// the kill).
-    ///
-    /// A probe that exited in the window between the deadline and the kill keeps its real
-    /// status beside `timed_out`, and this reads `false` for it: the probe finished, and
-    /// its streams are whole.
     #[must_use]
     pub fn killed_at_deadline(&self) -> bool {
         self.timed_out
@@ -344,9 +254,6 @@ impl RunRecord {
     }
 
     /// That the run's deadline elapsed, naming the deadline.
-    ///
-    /// The one spelling a runtime decoder and the `run-deadline-elapsed` gating use for a
-    /// timed-out run, so a reader sees the bound beside the fact.
     #[must_use]
     pub fn timeout_note(&self) -> String {
         match self.deadline_ms {
@@ -364,13 +271,6 @@ impl RunRecord {
     }
 
     /// Whether a probe's stdout carries `marker` as a whole whitespace-separated token.
-    ///
-    /// The reader for a `key=value` marker the probe prints on its own line. A substring
-    /// search ([`RunRecord::output_contains`]) reads `overflow-guard=ranged` as
-    /// `overflow-guard=ran` and `null-check=kept-over` as `null-check=kept`; a token
-    /// match does not, and is case-sensitive because the probes print lower-case markers.
-    /// Stdout only: every probe that prints a marker prints it there, and stderr carries
-    /// the C library's and the compiler runtime's words, which can quote a marker back.
     #[must_use]
     pub fn has_marker(&self, marker: &str) -> bool {
         self.stdout
@@ -388,12 +288,8 @@ impl RunRecord {
     }
 }
 
-/// What a fault report says killed a probe.
-///
-/// The classes the enforcement checks need kept apart: a trap a compiler or sanitizer
-/// planted, a branch-target (BTI) fault, a pointer-authentication (PAC) failure, an
-/// undefined instruction that is none of these, and a report that cannot tell. The rules
-/// are in [`FaultReport::classify`] and the measurements behind them in
+/// What a fault report says killed a probe: the classes the enforcement checks need kept
+/// apart. The rules are in [`FaultReport::classify`] and the measurements behind them in
 /// `probes/chard_selfreport.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
@@ -444,9 +340,6 @@ pub enum FaultArch {
 }
 
 /// One `chard-fault-v1` line, parsed. See `probes/chard_selfreport.h`.
-///
-/// Made only by [`RunRecord::fault_report`], which holds it to the reporter's shape:
-/// `sent` agrees with `code`, an aarch64 word fits 32 bits, every field is present once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FaultReport {
@@ -478,8 +371,7 @@ impl FaultReport {
     pub const PREFIX: &'static str = "chard-fault-v1 ";
 
     /// Every field a report line carries, each exactly once, in sorted order, which is the
-    /// order `parse` collects them in. `tests/register.rs` holds this list to
-    /// the fields the handler in `probes/chard_selfreport.h` writes and to `THREAT_MODEL.md`.
+    /// order `parse` collects them in.
     pub const FIELDS: [&'static str; 9] = [
         "addr",
         "arch",
@@ -556,27 +448,6 @@ impl FaultReport {
     }
 
     /// The class of fault this report describes.
-    ///
-    /// Each rule keys on what the 2026-10-09 measurements showed the kernel delivers
-    /// (`probes/chard_selfreport.h` lists them) and on the instruction itself, so a
-    /// signal with the right number and the wrong cause is not credited:
-    ///
-    /// - a sent signal (`si_code` at or below zero) is other, whatever its number.
-    /// - aarch64 SIGILL `ILL_ILLOPN` with ESR class 0x1c is a PAC failure.
-    /// - aarch64 SIGILL `ILL_ILLOPC` with ESR class 0x0d is a BTI fault, as qemu-user
-    ///   reports it. On the hardware measured the kernel writes no ESR record for a BTI
-    ///   fault and delivers it exactly as a `udf`, so there a BTI fault needs the probe's
-    ///   declared target, and a word that is not a `udf`; undeclared, it reads as an
-    ///   illegal instruction.
-    /// - aarch64 SIGTRAP `TRAP_BRKPT` at a `brk` word is a compiler trap.
-    /// - x86 SIGILL `ILL_ILLOPN` at `ud2`, `ud1` or `ud0` after at most four legacy or
-    ///   REX prefixes, or SIGTRAP `SI_KERNEL` (`int3`), is a compiler trap. On i386 the
-    ///   reporter reads four bytes, so a trap behind more than two prefixes reads as an
-    ///   illegal instruction there.
-    /// - a SIGILL or SIGTRAP whose rule needs the instruction bytes, where the reporter
-    ///   could not read them, is undetermined: without the bytes a trap and an undefined
-    ///   instruction cannot be told apart.
-    /// - any other SIGILL is an illegal instruction; everything else is other.
     #[must_use]
     pub fn classify(&self) -> Fault {
         const SIGILL: i32 = 4;
@@ -642,18 +513,17 @@ fn x86_trap_bytes(word: u64) -> bool {
     matches!(bytes.get(prefixes..), Some([0x0f, 0x0b | 0xb9 | 0xff, ..]))
 }
 
+/// This platform's number for the signal a run record names, the inverse of the table run
+/// records are named by: `Some(10)` for `SIGBUS` on Darwin and the BSDs, `Some(7)` on Linux.
+/// The table's bare `SIG<n>` for a number it does not name is found too, for 1 to 64; any
+/// other name is `None`. A test that writes a number beside a name takes the number from
+/// here, so it holds on every platform the table covers.
+#[must_use]
+pub fn signal_number(name: &str) -> Option<i32> {
+    (1..=64).find(|&sig| signal_name(sig) == name)
+}
+
 /// Signal numbers are per-platform, and only some of them agree.
-///
-/// 4, 5, 6, 8, 9, 11, 13 and 15 are identical under Linux's asm-generic numbering and the
-/// 4.4BSD numbering the Darwin and BSD targets use, which is every signal any predicate
-/// in this file keys on, so no verdict turns on the difference. The rest diverge, and
-/// silently: Linux's 7 is `SIGBUS` where Darwin's 7 is `SIGEMT`, Linux's 31 is `SIGSYS`
-/// where Darwin's 31 is `SIGUSR2`. A single table would not fail on the wrong platform,
-/// it would publish a confident wrong *name* into a report field, which is worse than the
-/// bare `SIG7` an unmapped number produces.
-///
-/// Split the way `env.rs::platform_reads` is split, and for the same reason: a new target
-/// should be a build failure rather than a silent inheritance of Linux semantics.
 #[cfg(target_os = "linux")]
 fn signal_name(sig: i32) -> String {
     match sig {
@@ -697,23 +567,9 @@ fn signal_name(sig: i32) -> String {
     target_os = "freebsd",
     target_os = "openbsd"
 )))]
-compile_error!(
-    "chard has no signal-number table for this target_os. Add a `signal_name` arm in \
-     src/run.rs rather than letting the build fall through to Linux numbering: a run \
-     record naming a signal the process did not receive is not a thing chard emits."
-);
+compile_error!("chard has no signal-number table for this target_os.");
 
 /// Read one of the probe's output files, capped, reporting what it could not do.
-///
-/// The empty string is a *measurement* on the runtime channel: "the probe printed
-/// nothing" is what a `compiler-diag` or runtime detector reads to decide a verdict, so
-/// returning it for a file that could not be opened or read publishes an observation
-/// chard never made. This is the same conversion `compile::invoke_with_timeout` refuses
-/// twice, with a regression test, one module away.
-///
-/// Truncation is reported for the same reason and a weaker one: at `MAX_CAPTURE` the
-/// tail is gone, and a detector scanning for a diagnostic that appears late would read
-/// its absence as absence.
 fn read_capped(path: &Path) -> Result<(String, bool), std::io::Error> {
     let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
@@ -728,37 +584,11 @@ fn read_capped(path: &Path) -> Result<(String, bool), std::io::Error> {
 
 /// Execute `binary`, capturing its fate. `work` holds the two output files.
 ///
-/// A timeout is reported as `timed_out` rather than raised as an error: a probe
-/// that hangs is a measurement result (`indeterminate`), not a harness failure,
-/// and the sweep must continue.
-///
-/// # Core files
-///
-/// Several probes work by aborting. On Linux each makes itself non-dumpable first
-/// (`CHARD_NOT_DUMPABLE` in `probes/chard_selfreport.h`), so its abort leaves no core.
-/// Off Linux, or where that call fails, each abort leaves a core wherever the system
-/// collects them. The limit that would stop that is `RLIMIT_CORE`, which can only be set
-/// between `fork` and `exec` through `CommandExt::pre_exec`, an `unsafe` hook, and the
-/// crate denies `unsafe_code`. A `prlimit --core=0` or `sh -c 'ulimit -c 0; exec ...'`
-/// wrapper lowers its own limit and execs the probe in its own process, so chard's child is
-/// still the probe and the signal and status it reports are the probe's (measured 2026-10-05
-/// on Fedora 44 x86_64, util-linux 2.41.5 `prlimit`, bash 5.3.9 as `sh`; only a shell that
-/// runs the probe as a non-final command forks it, and then reports `128+n` for the signal).
-/// What a wrapper adds is a program chard did not build in front of every probe, whose own
-/// failure to exec the probe reads back as exit status 127, where a failed spawn here is a
-/// harness error. So the limit is not set, and `THREAT_MODEL.md` tells the caller: confining
-/// a run is the caller's job, and a container or a `core_pattern` the caller controls is
-/// where the cores go. `MALLOC_CHECK_=0` does not prevent cores either: its whole effect is
-/// on heap consistency checking, and on glibc 2.34 and later even that effect needs
-/// `libc_malloc_debug.so` preloaded.
-///
 /// # Errors
 ///
 /// Errors when the capture files cannot be created or the binary cannot be
 /// spawned. A probe that crashes, aborts, or times out is a normal result and
 /// is reported in the [`RunRecord`].
-///
-/// `pins` is the probe's own `run_environment`, set beside [`PROBE_ENVIRONMENT`].
 pub fn execute(
     binary: &Path,
     work: &Path,
@@ -770,10 +600,8 @@ pub fn execute(
         .map_or_else(|| "probe".into(), std::ffi::OsString::from);
     let out_path = work.join(format!("{}.stdout", stem.to_string_lossy()));
     let err_path = work.join(format!("{}.stderr", stem.to_string_lossy()));
-    // Every path here is chard's own, and each is tagged `HarnessPath` under its message.
-    // `measure::gather` contains what this function returns, so none of these reaches the
-    // envelope today; the tag is so that a future caller which does propagate them cannot
-    // have the envelope tell an operator to check a path chard constructed.
+    // Every path here is chard's own, tagged `HarnessPath` so that an envelope carrying one
+    // does not tell an operator to check a path chard constructed.
     let out_file = std::fs::File::create(&out_path)
         .with_context(|| crate::error::HarnessPath(out_path.clone()))
         .context("creating the stdout capture")?;
@@ -783,12 +611,7 @@ pub fn execute(
 
     // The child's working directory is set to `work`, and execvp resolves the
     // program path *after* that chdir, so a `work`-relative program path would be
-    // looked up as `work/work/...` and fail with ENOENT. Absolutize first.
-    //
-    // This was live: with the default relative `--workdir chard-work`, every
-    // runtime probe failed to spawn and the documented `chard measure` invocation
-    // produced an error envelope instead of a report. It went unnoticed because
-    // every test invocation happened to pass an absolute workdir.
+    // looked up as `work/work/...` and fail with ENOENT.
     let program = std::path::absolute(binary)
         .with_context(|| format!("resolving {} to an absolute path", binary.display()))?;
 
@@ -800,12 +623,13 @@ pub fn execute(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file))
-        // The probe's whole environment. `PROBE_ENVIRONMENT` says why nothing ambient is
-        // let through and why each of these is set; the record below carries the same
-        // map, so what the child was given and what the report says it was given cannot
+        // The probe's whole environment (`PROBE_ENVIRONMENT` says why); the record below
+        // carries the same map, so what the child was given and what the report says cannot
         // differ.
         .env_clear()
         .envs(&environment)
+        // A group of its own, so a timeout kills what the probe forked too ([`kill_group`]).
+        .process_group(0)
         .spawn()
         .with_context(|| crate::error::HarnessPath(program.clone()))
         .with_context(|| format!("executing {}", binary.display()))?;
@@ -817,22 +641,13 @@ pub fn execute(
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            // One more look before killing. The probe may have finished in the window between the
-            // `try_wait` above and this comparison, and its real status is worth more than the one
-            // this branch would invent; a probe that aborted with `*** buffer overflow detected
-            // ***` microseconds before the deadline is a *measurement*, and recording it as
-            // `SIGKILL` makes `aborted()` false, drops the fortify detector to `indeterminate`, and
-            // on a control arm publishes `probe-invalid` with a `failure_reason` blaming the
-            // detector. A loaded sweep host would then read as a chard defect.
+            // One more look before killing.
             if let Ok(Some(status)) = child.try_wait() {
                 break Some(status);
             }
-            // Both calls can only fail if the child has already exited, which is
-            // the outcome we were trying to bring about.
-            crate::error::best_effort(child.kill());
-            // Reap, and keep what the kernel says. `wait` returns the real status: the signal
-            // that actually ended the process. A hardcoded `SIGKILL` in its place would be a
-            // field derived from chard's own request rather than from a measured outcome.
+            // The probe's whole group, before the reap ([`kill_group`] says why).
+            kill_group(&mut child);
+            // Reap, and keep the signal that ended the process, not the `SIGKILL` chard sent.
             break child.wait().ok();
         }
         poll_sleep(started.elapsed());
@@ -844,15 +659,12 @@ pub fn execute(
             status.code().unwrap_or(-1),
             status.signal().map(signal_name),
         ),
-        // Only when `wait` itself failed, which means the status is genuinely unknown rather than
-        // known to be a kill. `timed_out` carries the fact that the deadline elapsed; that much is
-        // measured.
+        // Only when `wait` itself failed: the status is unknown, not known to be a kill, and
+        // `timed_out` carries what was measured.
         None => (-1, None),
     };
 
     // A stream chard could not read is recorded as such rather than as an empty one.
-    // Both are attempted before reporting, so one unreadable file does not hide what
-    // the other stream said.
     let mut output_error: Vec<String> = Vec::new();
     let mut output_truncated = false;
     let mut read = |path: &Path, name: &str| match read_capped(path) {
@@ -887,13 +699,6 @@ pub fn execute(
 mod tests {
     use super::*;
 
-    /// A clean exit is both halves, and a signal is never one.
-    ///
-    /// Every runtime detector's `absent` reading rests on this: the probe ran to
-    /// completion and printed its survival marker. As a disjunction, a process killed by
-    /// a signal with an exit status of 0 (which is how a signalled child is recorded,
-    /// `exit_status: -1` notwithstanding on some platforms), would read as having exited
-    /// cleanly, and a death would be published as the flag being absent.
     #[test]
     fn a_clean_exit_needs_both_halves() {
         let record = |signal: Option<&str>, status: i32| RunRecord {
@@ -922,9 +727,6 @@ mod tests {
         assert!(!record(Some("SIGABRT"), 1).exited_cleanly());
     }
 
-    /// A record read whole has no cut to name; a capped or unreadable stream does, and
-    /// the sentence says which. The timeout note carries the deadline when the record has
-    /// one.
     #[test]
     fn a_cut_stream_and_a_deadline_are_named() {
         let mut run = RunRecord {
@@ -983,7 +785,62 @@ mod tests {
         assert!(!run.killed_at_deadline(), "its own signal ended it");
     }
 
-    /// `execute` publishes the deadline it held the child to.
+    #[test]
+    fn a_timeout_kills_what_the_probe_forked() {
+        let dir = std::env::temp_dir().join(format!("chard-rungroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        // `test_script` runs the script once from this process's directory to wait out
+        // `ETXTBSY`, and there it exits at once: `execute` runs it in `dir`, beside itself.
+        let probe = crate::compile::test_script(
+            &dir.join("forks-on-timeout"),
+            "[ -e forks-on-timeout ] || exit 0\n(trap '' TERM HUP INT; exec /bin/sleep 30) &\n\
+             echo $! > forked\nwait",
+        );
+        let record = execute(&probe, &dir, Duration::from_millis(400), &[]).expect("ran");
+        assert!(record.timed_out, "the probe outlived its bound: {record:?}");
+        let forked: u32 = std::fs::read_to_string(dir.join("forked"))
+            .expect("the probe wrote its child's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            gone_within(forked, Duration::from_secs(2)),
+            "the probe's child {forked} is still running after the timeout killed the probe"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_group_operand_is_never_the_callers_group_or_every_process() {
+        assert_eq!(group_operand(0), None);
+        assert_eq!(group_operand(1), None);
+        assert_eq!(group_operand(2).as_deref(), Some("-2"));
+    }
+
+    #[test]
+    fn a_failed_group_kill_is_an_error_and_the_child_is_killed() {
+        assert!(
+            signal_group("/nonexistent/sh", "-2").is_err(),
+            "a shell that cannot run"
+        );
+        assert!(
+            signal_group(KILL_SHELL, "-2147483646").is_err(),
+            "a group that does not exist: `kill` exits other than 0"
+        );
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawning sleep");
+        kill_group_through(&mut child, "/nonexistent/sh");
+        let status = child.wait().expect("reaping sleep");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the child alone is killed: {status:?}"
+        );
+    }
+
     #[test]
     fn a_run_record_carries_its_deadline() {
         let dir = std::env::temp_dir().join(format!("chard-rundeadline-{}", std::process::id()));
@@ -1000,17 +857,10 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// The capture cap reports truncation exactly at the boundary.
-    ///
-    /// A detector scanning for a diagnostic that appears late reads its absence as the
-    /// observable being absent, so a silently truncated stream is a wrong verdict waiting
-    /// to happen. The flag must be set when the cap was reached and not when the output
-    /// merely came close to it.
     #[test]
     fn truncation_is_reported_at_the_cap_and_not_before() {
-        // Named for this test, not just the process: `elf.rs` has a scratch directory
-        // under the same `chard-cap-<pid>` name, tests share a process, and the cleanup
-        // below deleted that one mid-run the first time this was written.
+        // Named for this test, not just the process: tests share a process, and `elf.rs`
+        // has a `chard-cap-<pid>` scratch directory the cleanup below must not delete.
         let dir = std::env::temp_dir().join(format!("chard-runcap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch directory");
 
@@ -1033,19 +883,10 @@ mod tests {
         assert_eq!(over.len(), cap, "and nothing past the cap is read");
         assert!(truncated);
 
-        // Cleanup, and its failure is not a finding: the scratch directory is
-        // per-process and the next run makes its own.
+        // Cleanup, and its failure is not a finding: the directory is per-process.
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// The probe receives the pinned environment and nothing else, and the record says so.
-    ///
-    /// The probe is a shell script that prints its environment. Run directly, inheriting
-    /// this process's environment, it prints `PATH` and `HOME` like every process on the
-    /// host; run through `execute` it must not, and that pair is what proves the ambient
-    /// environment was cleared rather than that there was nothing to clear. `PWD`,
-    /// `SHLVL`, `OLDPWD` and `_` are set by the shell running the script, for itself, and
-    /// are the only names allowed past the pinned set.
     #[test]
     fn a_probe_receives_the_pinned_environment_and_nothing_else() {
         let dir = std::env::temp_dir().join(format!("chard-runenv-{}", std::process::id()));
@@ -1116,9 +957,20 @@ mod tests {
         assert_eq!(signal_name(99), "SIG99");
     }
 
-    /// `SIGTRAP` is how `__builtin_trap()` surfaces on aarch64, so a missing entry here
-    /// left every trap on that architecture named `SIG5`. A detector matching a name
-    /// then cannot match it, and the number is not a name.
+    #[test]
+    fn signal_numbers_are_this_platforms() {
+        for sig in 1..=64 {
+            let name = signal_name(sig);
+            assert_eq!(signal_number(&name), Some(sig), "{name}");
+        }
+        assert_eq!(signal_number("SIGNOPE"), None);
+        assert_eq!(signal_number("SIG99"), None);
+        assert_eq!(signal_number("SIG34"), Some(34));
+        let bus = if cfg!(target_os = "linux") { 7 } else { 10 };
+        assert_eq!(signal_number("SIGBUS"), Some(bus));
+        assert_eq!(signal_number("SIGSEGV"), Some(11));
+    }
+
     #[test]
     fn a_trap_is_named_rather_than_numbered() {
         assert_eq!(signal_name(5), "SIGTRAP");
@@ -1170,10 +1022,6 @@ mod tests {
         assert!(!run.has_marker_key("null-check="));
     }
 
-    /// The trap instruction differs by architecture, not by who emitted it: `ud2` on
-    /// x86_64 raises `SIGILL`, `brk` on aarch64 raises `SIGTRAP`. Both are the same
-    /// `__builtin_trap()`, so a predicate that recognised only one was reporting the
-    /// host architecture rather than the mechanism.
     #[test]
     fn both_architectures_spellings_of_a_trap_are_traps() {
         assert!(record(-1, Some("SIGILL"), "").trapped());
@@ -1192,85 +1040,85 @@ mod tests {
     /// record; the hardware guest wrote none.
     const MEASURED: &[(&str, &str, &str, Fault)] = &[
         (
-            "aarch64 on the M2 guest: gcc trap",
+            "aarch64 on hardware: gcc trap",
             "SIGTRAP",
             "chard-fault-v1 signal=5 code=1 sent=no arch=aarch64 pc=0xb93cf0ca09dc addr=0xb93cf0ca09dc word=0xd4207d00 esr=none at-target=undeclared",
             Fault::CompilerTrap,
         ),
         (
-            "aarch64 on the M2 guest: gcc udf",
+            "aarch64 on hardware: gcc udf",
             "SIGILL",
             "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 pc=0xc06a95440a5c addr=0xc06a95440a5c word=0x0 esr=none at-target=undeclared",
             Fault::IllegalInstruction,
         ),
         (
-            "aarch64 on the M2 guest: gcc segv",
+            "aarch64 on hardware: gcc segv",
             "SIGSEGV",
             "chard-fault-v1 signal=11 code=1 sent=no arch=aarch64 pc=0xb300c0560a6c addr=0x8 word=none esr=0x92000044 at-target=undeclared",
             Fault::Other,
         ),
         (
-            "aarch64 on the M2 guest: gcc jump-unmapped",
+            "aarch64 on hardware: gcc jump-unmapped",
             "SIGSEGV",
             "chard-fault-v1 signal=11 code=1 sent=no arch=aarch64 pc=0x10 addr=0x10 word=none esr=0x82000004 at-target=undeclared",
             Fault::Other,
         ),
         (
-            "aarch64 on the M2 guest: gcc trap-elsewhere",
+            "aarch64 on hardware: gcc trap-elsewhere",
             "SIGTRAP",
             "chard-fault-v1 signal=5 code=1 sent=no arch=aarch64 pc=0xb99c3ac509ec addr=0xb99c3ac509ec word=0xd4207d00 esr=none at-target=no",
             Fault::CompilerTrap,
         ),
         (
-            "aarch64 on the M2 guest: gcc kill",
+            "aarch64 on hardware: gcc kill",
             "SIGILL",
             "chard-fault-v1 signal=4 code=0 sent=yes arch=aarch64 pc=0xef7f9aa3cd8c addr=0x3e800017c40 word=none esr=none at-target=undeclared",
             Fault::Other,
         ),
         (
-            "aarch64 on the M2 guest: gcc raise",
+            "aarch64 on hardware: gcc raise",
             "SIGILL",
             "chard-fault-v1 signal=4 code=-6 sent=yes arch=aarch64 pc=0xe6be0ca274d8 addr=0x3e800017c47 word=none esr=none at-target=undeclared",
             Fault::Other,
         ),
         (
-            "aarch64 on the M2 guest: gcc bus",
+            "aarch64 on hardware: gcc bus",
             "SIGBUS",
             "chard-fault-v1 signal=7 code=2 sent=no arch=aarch64 pc=0xc31961010b18 addr=0xf0122596e000 word=none esr=0x92000007 at-target=undeclared",
             Fault::Other,
         ),
         (
-            "aarch64 on the M2 guest: gcc pac",
+            "aarch64 on hardware: gcc pac",
             "SIGILL",
             "chard-fault-v1 signal=4 code=2 sent=no arch=aarch64 pc=0xb95168ec0cdc addr=0xb95168ec0cdc word=0xd50323bf esr=0x72000000 at-target=undeclared",
             Fault::PacFailure,
         ),
         (
-            "aarch64 on the M2 guest: gcc bti-declared",
+            "aarch64 on hardware: gcc bti-declared",
             "SIGILL",
             "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 pc=0xe8e60eb4f000 addr=0xe8e60eb4f000 word=0xd28000e0 esr=none at-target=yes",
             Fault::BtiFault,
         ),
         (
-            "aarch64 on the M2 guest: gcc bti-undeclared",
+            "aarch64 on hardware: gcc bti-undeclared",
             "SIGILL",
             "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 pc=0xefd19fd92000 addr=0xefd19fd92000 word=0xd28000e0 esr=none at-target=undeclared",
             Fault::IllegalInstruction,
         ),
         (
-            "aarch64 on the M2 guest: clang trap",
+            "aarch64 on hardware: clang trap",
             "SIGTRAP",
             "chard-fault-v1 signal=5 code=1 sent=no arch=aarch64 pc=0xcaa96e590984 addr=0xcaa96e590984 word=0xd4200020 esr=none at-target=undeclared",
             Fault::CompilerTrap,
         ),
         (
-            "aarch64 on the M2 guest: clang trap-elsewhere",
+            "aarch64 on hardware: clang trap-elsewhere",
             "SIGTRAP",
             "chard-fault-v1 signal=5 code=1 sent=no arch=aarch64 pc=0xb8f64a6e0994 addr=0xb8f64a6e0994 word=0xd4200020 esr=none at-target=no",
             Fault::CompilerTrap,
         ),
         (
-            "aarch64 on the M2 guest: clang overflow -fsanitize=signed-integer-overflow -fsanitize-trap=signed-integer-overflow",
+            "aarch64 on hardware: clang overflow -fsanitize=signed-integer-overflow -fsanitize-trap=signed-integer-overflow",
             "SIGTRAP",
             "chard-fault-v1 signal=5 code=1 sent=no arch=aarch64 pc=0xc6c82ebd0ac0 addr=0xc6c82ebd0ac0 word=0xd42aa000 esr=none at-target=undeclared",
             Fault::CompilerTrap,
@@ -1360,25 +1208,23 @@ mod tests {
             Fault::CompilerTrap,
         ),
         (
-            "aarch64 under qemu-user (emulated): emulated bti-declared",
+            "aarch64 under emulation: emulated bti-declared",
             "SIGILL",
             "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 pc=0x7f2dfcdc1000 addr=0x7f2dfcdc1000 word=0xd28000e0 esr=0x36000002 at-target=yes",
             Fault::BtiFault,
         ),
         (
-            "aarch64 under qemu-user (emulated): emulated udf",
+            "aarch64 under emulation: emulated udf",
             "SIGILL",
             "chard-fault-v1 signal=4 code=1 sent=no arch=aarch64 pc=0x4006dc addr=0x4006dc word=0x0 esr=0x2000000 at-target=undeclared",
             Fault::IllegalInstruction,
         ),
     ];
 
-    /// Each measured fault classifies as what provoked it, and only the compiler traps
-    /// count as [`RunRecord::trapped`]: a BTI fault, a PAC failure and an undefined
-    /// instruction all die by SIGILL, which the bare-signal rule reads as a trap.
     #[test]
     fn each_measured_fault_report_classifies_as_what_provoked_it() {
         for (what, signal, line, want) in MEASURED {
+            let line = on_this_platform(line, signal);
             let run = record(-1, Some(signal), &format!("{line}\n"));
             assert_eq!(run.fault(), Some(*want), "{what}: {line}");
             assert_eq!(run.trapped(), *want == Fault::CompilerTrap, "{what}");
@@ -1401,10 +1247,6 @@ mod tests {
         }
     }
 
-    /// Every class but `Undetermined` has a measured row; `Undetermined` is the class of
-    /// a report the reporter could not complete, which a working reporter never writes,
-    /// and it is held by `each_rule_needs_all_of_its_evidence`. The match is exhaustive,
-    /// so a new class fails to compile here until it is placed.
     #[test]
     fn every_class_is_measured_or_held_by_name() {
         for fault in Fault::ALL {
@@ -1420,7 +1262,6 @@ mod tests {
         }
     }
 
-    /// A probe without the reporter reads as the bare signal says.
     #[test]
     fn without_a_report_the_bare_signal_decides() {
         for signal in ["SIGILL", "SIGTRAP"] {
@@ -1443,7 +1284,35 @@ mod tests {
             .expect("a measured row")
     }
 
-    /// A report is believed only about the death it describes, and only whole.
+    /// `line`, measured on Linux, with its one `signal=` field in this platform's number for
+    /// `name`: the reporter emits on Linux alone, and the classification under test must not
+    /// rest on Linux's numbering where the table is another (`SIGBUS` is 7 on Linux and 10
+    /// under 4.4BSD numbering). On Linux it is the line itself, asserted, so a measured row
+    /// whose number is not its name's still fails where it was measured.
+    fn on_this_platform(line: &str, name: &str) -> String {
+        let number = signal_number(name).expect("the table names the signal");
+        let fields = line.split(' ').filter(|f| f.starts_with("signal=")).count();
+        assert_eq!(
+            fields, 1,
+            "a measured line carries one signal field: {line}"
+        );
+        let renumbered = line
+            .split(' ')
+            .map(|field| {
+                if field.starts_with("signal=") {
+                    format!("signal={number}")
+                } else {
+                    field.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if cfg!(target_os = "linux") {
+            assert_eq!(renumbered, line, "{name} is not the measured line's signal");
+        }
+        renumbered
+    }
+
     #[test]
     fn a_report_that_does_not_describe_the_death_or_is_malformed_is_ignored() {
         let bti = measured("gcc bti-declared");
@@ -1483,14 +1352,13 @@ mod tests {
             Some(Fault::BtiFault)
         );
         // A SIGBUS report describes a SIGBUS death and no other.
-        let bus = measured("gcc bus");
-        assert_eq!(record(-1, Some("SIGBUS"), bus).fault(), Some(Fault::Other));
-        assert_eq!(record(-1, Some("SIGSEGV"), bus).fault(), None);
+        let bus = on_this_platform(measured("gcc bus"), "SIGBUS");
+        assert_eq!(record(-1, Some("SIGBUS"), &bus).fault(), Some(Fault::Other));
+        assert_eq!(record(-1, Some("SIGSEGV"), &bus).fault(), None);
     }
 
-    /// Each rule needs every part of its evidence: change one and the class changes.
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one assertion per part of each rule's evidence, read as one table"
     )]
@@ -1565,7 +1433,7 @@ mod tests {
         );
         assert_eq!(class("SIGILL", &pac.replace("code=2", "code=1")), illegal);
         // A brk needs TRAP_BRKPT and a brk word; hlt, svc and an immediate-less mask do not pass.
-        let brk = measured("aarch64 on the M2 guest: gcc trap");
+        let brk = measured("aarch64 on hardware: gcc trap");
         assert_eq!(class("SIGTRAP", brk), Some(Fault::CompilerTrap));
         for not_brk in [
             "0xd28000e0",
@@ -1669,8 +1537,6 @@ mod tests {
         assert!(!segv.aborted());
     }
 
-    /// A probe's own output of a few KiB is kept whole, and a stream past the cap is cut
-    /// and the record says so, whichever stream it was.
     #[test]
     fn a_run_keeps_a_few_kib_whole_and_names_a_cut_stream() {
         let dir = std::env::temp_dir().join(format!("chard-runkeep-{}", std::process::id()));
@@ -1693,8 +1559,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// A probe ended by a signal is recorded as that signal, by name, beside the exit
-    /// status that is no status.
     #[test]
     fn a_signalled_run_is_recorded_by_its_signal() {
         let dir = std::env::temp_dir().join(format!("chard-runsignal-{}", std::process::id()));
@@ -1708,8 +1572,6 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
-    /// An aarch64 instruction word is 32 bits: the largest reads, one past it rejects the
-    /// line.
     #[test]
     fn an_aarch64_word_is_held_to_32_bits() {
         let line = |word: &str| {

@@ -2,30 +2,26 @@
 
 //! The layout `src/predicate/`, `src/decode/`, `src/elf.rs` and `src/elf/` keep, so that their source
 //! can be read as decoder code alone.
-//!
-//! `probe::decoders_sha256` is a fingerprint over that source, and it has to strip what is
-//! not code; `probe::decoder_code` is the strip, and it is only as good as the layout it
-//! assumes. Four properties make a line-based strip total:
-//!
-//! - No file opens a block comment. A line-comment strip leaves the interior of one in
-//!   place, so a comment edit would move the fingerprint.
-//! - A module's unit tests sit outside the text being read: in a sibling `*_tests.rs` file
-//!   under `src/decode/`, and after the one top-level `#[cfg(test)]` in `src/elf.rs`, in
-//!   any file under `src/elf/` and in any file under `src/predicate/` that carries tests.
-//! - Every runtime and compiler-diag detector the corpus names is defined under
-//!   `src/decode/`, so the directory holds the code those verdicts come from.
-//! - `probe::DECODER_SOURCES`, the list the fingerprint reads, is every module file of the
-//!   two directories, `src/elf.rs` and every file under `src/elf/`, so a file added there is
-//!   read or fails here.
-//!
-//! A source scan, in the style of `tests/evidence_completeness.rs`, and a tripwire rather
-//! than a proof: each assertion counts what it read against what it expected, so a scan
-//! that stops matching fails instead of passing over nothing.
 
-use std::collections::BTreeMap;
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use chard::probe::{CORPUS, Channel, DECODER_SOURCES, decoder_code};
+use chard::digest::sha256_hex;
+use chard::fingerprint::{NOT_DECODER_SOURCES, sources_canonical, test_module_gate};
+use chard::probe::{CORPUS, Channel, DECODER_SOURCES, decoder_code, decoder_sources_sha256};
 
 fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -33,9 +29,6 @@ fn src() -> PathBuf {
 
 /// Every `.rs` file under `src/<dir>/`, at any depth, sorted, with its path relative to
 /// that directory and its text.
-///
-/// The walk is recursive so that a nested module, `src/decode/x/mod.rs` say, is read by
-/// every tripwire here and fails the pinned module list rather than sitting unscanned.
 fn files_under(dir: &str) -> Vec<(String, String)> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) {
         let entries =
@@ -80,9 +73,6 @@ fn predicate_files() -> Vec<(String, String)> {
 /// Whether `line` is a `cfg` attribute whose predicate mentions `test`, at any indentation
 /// and in any spelling: `#[cfg(test)]`, `#[cfg(any(test, ..))]`, `#[cfg_attr(test, ..)]`,
 /// `#![cfg(test)]`.
-///
-/// A `cfg` attribute that does not close on its own line is refused outright, because its
-/// predicate may name `test` on a later line this reading does not join.
 fn is_test_gate(file: &str, line: &str) -> bool {
     let t = line.trim_start();
     if !(t.starts_with("#[cfg") || t.starts_with("#![cfg")) {
@@ -138,8 +128,7 @@ fn no_decode_or_elf_source_opens_a_block_comment() {
     );
     assert!(
         offenders.is_empty(),
-        "a block comment survives a line-comment strip, so its text would enter a \
-         fingerprint over this source: {offenders:?}"
+        "a decode, predicate or ELF source opens a block comment: {offenders:?}"
     );
 }
 
@@ -180,8 +169,7 @@ fn a_decode_module_file_holds_no_test_code_and_names_its_sibling() {
         assert_eq!(
             gates.len(),
             1,
-            "{name}: one test-gated attribute, a #[cfg(test)] on the declaration of its \
-             sibling test file"
+            "{name}: not exactly one test-gated attribute"
         );
         let tail: Vec<&str> = lines
             .iter()
@@ -215,8 +203,7 @@ fn assert_one_trailing_test_module(name: &str, text: &str) -> bool {
         .collect();
     assert!(
         gates.len() <= 1,
-        "{name} has {} test-gated attributes at any indentation; the one allowed is the \
-         top-level gate, and everything before it is read as decoder code",
+        "{name} has {} test-gated attributes; at most one is allowed",
         gates.len()
     );
     let Some(&gate) = gates.first() else {
@@ -264,8 +251,6 @@ fn elf_rs_has_one_test_gate_and_only_the_test_module_follows_it() {
     );
 }
 
-/// The ELF reader's modules under `src/elf/` keep the layout `src/elf.rs` does: at most one
-/// test gate, top-level, with only the test module after it.
 #[test]
 fn an_elf_module_ends_in_its_test_module_if_it_has_one() {
     let files = elf_files();
@@ -310,11 +295,67 @@ fn a_predicate_file_ends_in_its_test_module_if_it_has_one() {
     );
 }
 
-/// The fingerprint reads every module file under `src/predicate/` and `src/decode/`, and
-/// `src/elf.rs` and every file under `src/elf/`, and nothing else; and what it reads of each is that file's code alone.
+/// Every `.rs` file under `src/`, at any depth, with its path from the manifest directory.
+fn every_source_file() -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = files_under("")
+        .into_iter()
+        .map(|(n, t)| (format!("src/{n}"), t))
+        .collect();
+    files.sort();
+    files
+}
+
 #[test]
-fn the_fingerprint_reads_every_decoder_module_file() {
-    let mut on_disk: Vec<String> = predicate_files()
+fn every_source_file_is_read_by_the_fingerprint_or_set_aside_with_a_reason() {
+    let on_disk: Vec<String> = every_source_file().into_iter().map(|(p, _)| p).collect();
+    let mut registered: Vec<String> = DECODER_SOURCES
+        .iter()
+        .map(|p| (*p).to_owned())
+        .chain(NOT_DECODER_SOURCES.iter().map(|(p, _)| (*p).to_owned()))
+        .collect();
+    let listed = registered.len();
+    registered.sort();
+    registered.dedup();
+    assert_eq!(
+        registered.len(),
+        listed,
+        "a file is in both lists, or twice in one"
+    );
+    assert_eq!(
+        registered, on_disk,
+        "fingerprint::DECODER_SOURCES and NOT_DECODER_SOURCES against src/"
+    );
+    // Every file the fingerprint reads besides the detectors, named here rather than trusted
+    // to the register's prose: each settles, gates, withholds or derives what a report says
+    // (`main.rs` orders the withholdings that run after every probe: the target, twin and
+    // no-twin rules and the fortify ratchet), so a reason that sets one aside cannot be
+    // true.
+    let deciding = [
+        "src/compile.rs",
+        "src/compile_inputs.rs",
+        "src/composite.rs",
+        "src/env.rs",
+        "src/guide.rs",
+        "src/link_inputs.rs",
+        "src/listings.rs",
+        "src/main.rs",
+        "src/measure.rs",
+        "src/mechanism.rs",
+        "src/overridden.rs",
+        "src/probe.rs",
+        "src/report.rs",
+        "src/report/digest.rs",
+        "src/run.rs",
+        "src/structured.rs",
+        "src/toolchain.rs",
+    ];
+    for path in deciding {
+        assert!(
+            DECODER_SOURCES.contains(&path),
+            "{path} settles, gates or withholds a verdict and the fingerprint does not read it"
+        );
+    }
+    let always_read = predicate_files()
         .into_iter()
         .map(|(n, _)| format!("src/predicate/{n}"))
         .chain(
@@ -324,45 +365,97 @@ fn the_fingerprint_reads_every_decoder_module_file() {
                 .map(|(n, _)| format!("src/decode/{n}")),
         )
         .chain(std::iter::once("src/elf.rs".to_owned()))
-        .chain(elf_files().into_iter().map(|(n, _)| format!("src/elf/{n}")))
-        .collect();
-    on_disk.sort();
-    let mut listed: Vec<String> = DECODER_SOURCES
+        .chain(elf_files().into_iter().map(|(n, _)| format!("src/elf/{n}")));
+    let always_read: Vec<String> = always_read.collect();
+    let named: BTreeSet<&str> = deciding
         .iter()
-        .map(|(p, _)| (*p).to_owned())
+        .copied()
+        .chain(always_read.iter().map(String::as_str))
         .collect();
-    listed.sort();
-    assert_eq!(listed, on_disk, "probe::DECODER_SOURCES against the tree");
+    let read: BTreeSet<&str> = DECODER_SOURCES.iter().copied().collect();
+    assert_eq!(
+        named, read,
+        "the fingerprint reads other files than the deciding and detector files named here"
+    );
+    let mut checked = 0usize;
+    for path in always_read {
+        assert!(
+            DECODER_SOURCES.contains(&path.as_str()),
+            "{path} is detector code and the fingerprint does not read it"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 11,
+        "only {checked} detector files were checked, so the walk is not reaching them"
+    );
+    eprintln!(
+        "{} files under src/: {} read, {} set aside",
+        on_disk.len(),
+        DECODER_SOURCES.len(),
+        NOT_DECODER_SOURCES.len()
+    );
+    the_stamped_digest_is_the_trees_and_the_cut_skips_only_the_test_module();
+}
+
+/// The digest the binary was built with is the digest of the files as they are, each read
+/// as code alone, and each read file's cut skips no shipped code: where a gate opens a test
+/// module, the module runs to the end of the file. Run by the register's test, after it has
+/// held the list to the tree.
+fn the_stamped_digest_is_the_trees_and_the_cut_skips_only_the_test_module() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut read = 0usize;
-    for (path, text) in DECODER_SOURCES {
-        let disk = std::fs::read_to_string(manifest.join(path))
+    let mut texts = Vec::new();
+    for path in DECODER_SOURCES {
+        let text = std::fs::read_to_string(manifest.join(path))
             .unwrap_or_else(|e| panic!("reading {path}: {e}"));
-        assert_eq!(*text, disk, "{path}: the compiled copy is the file");
-        let code = decoder_code(text);
+        let code = decoder_code(&text);
         assert!(!code.is_empty(), "{path} read as no code");
         for line in code.lines() {
             assert!(
                 !line.trim_start().starts_with("//") && !line.trim().is_empty(),
                 "{path}: a comment or blank line survived the strip: {line:?}"
             );
-            assert!(
-                !is_test_gate(path, line),
-                "{path}: the strip read past the test gate"
+        }
+        if let Some(gate) = test_module_gate(&text) {
+            let lines: Vec<&str> = text.lines().collect();
+            let rest: Vec<(usize, &str)> = lines
+                .iter()
+                .copied()
+                .enumerate()
+                .skip(gate + 1)
+                .filter(|(_, l)| !l.trim().is_empty() && !l.starts_with("#["))
+                .collect();
+            let (open, declaration) = rest.first().copied().expect("the gate declares a module");
+            let last = rest.last().map(|(i, _)| *i).expect("a non-empty file");
+            let end = if declaration.ends_with(';') {
+                open
+            } else {
+                rest.iter()
+                    .skip(1)
+                    .find(|(_, l)| l.starts_with('}'))
+                    .map_or_else(|| panic!("the test module in {path} closes"), |(i, _)| *i)
+            };
+            assert_eq!(
+                end,
+                last,
+                "{path}: code follows the test module at line {}, and the cut would skip it",
+                end + 2
             );
         }
-        read += 1;
+        texts.push((*path, text));
     }
-    assert_eq!(read, DECODER_SOURCES.len());
+    let canonical = sources_canonical(texts.iter().map(|(p, t)| (*p, t.as_str())));
+    assert_eq!(
+        sha256_hex(canonical.as_bytes()),
+        decoder_sources_sha256(),
+        "the binary's stamped digest is not the tree's: build.rs read other files"
+    );
+    assert_eq!(texts.len(), DECODER_SOURCES.len());
 }
 
 /// `(channel, decoder)` for every `Check { .. }` literal in `src/probe.rs`, in order: the
 /// `Decoder` variant, and the predicate function a predicate variant names or the `detect`
 /// function a code variant names on a later line.
-///
-/// Read up to the test module. A `decoder: Decoder::` line opens at most one pending code
-/// variant, and its `detect:` line closes it, so a variant whose detector is not found
-/// fails here rather than pairing with the next check's.
 fn corpus_detectors() -> Vec<(String, String)> {
     let text = std::fs::read_to_string(src().join("probe.rs")).expect("reading src/probe.rs");
     let mut pairs = Vec::new();
@@ -461,7 +554,6 @@ fn every_runtime_and_compiler_diag_detector_is_defined_under_decode() {
     assert!(checked > 0, "no runtime or compiler-diag check was found");
     assert!(
         misplaced.is_empty(),
-        "each runtime and compiler-diag detector is defined once under src/decode/ and \
-         not in src/probe.rs: {misplaced:?}"
+        "detectors not defined once under src/decode/, or defined in src/probe.rs: {misplaced:?}"
     );
 }

@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A JSON Schema validator for the keywords chard's schemas use, and no others.
-//!
-//! Shared by `tests/schema_conformance.rs`, which holds reports and matrices to their
-//! schemas, and `tests/predicate_language.rs`, which holds predicates to theirs. The
-//! rationale for a small hand-written validator, and the history of the keywords it once
-//! dropped, is in `tests/schema_conformance.rs`'s module documentation. A keyword outside
-//! the implemented set panics rather than passing.
 
 use std::collections::BTreeSet;
 
@@ -14,15 +8,6 @@ use serde_json::Value;
 
 /// How an object that declares `additionalProperties: true` beside its `properties` is
 /// read.
-///
-/// The shipped report, matrix, `detect` and envelope schemas declare it on every object, so a
-/// consumer's validator admits a key a later chard adds (the rule `chard --help` states). Read
-/// as a consumer reads it, that object admits any key. Read as chard's producer, it admits
-/// none it does not declare: a field chard emits and the schema does not declare is the drift
-/// `tests/schema_conformance.rs` exists to catch, as it would for a closed object
-/// (`additionalProperties: false`). An object meant to stay open to chard's own output as well
-/// declares no `additionalProperties`, or a schema for its other members
-/// (`additionalProperties: {}` for any), and is open in both readings.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reading {
     Producer,
@@ -72,6 +57,34 @@ fn walk(
         };
         walk(instance, target, root, path, errors, reading);
         return;
+    }
+
+    // An open enumeration is `anyOf` of the known values and any string.
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+        let open_known = match branches.as_slice() {
+            [known, any]
+                if known.get("enum").is_some()
+                    && any == &serde_json::json!({ "type": "string" }) =>
+            {
+                Some(known)
+            }
+            _ => None,
+        };
+        if let (Some(known), Reading::Producer) = (open_known, reading) {
+            walk(instance, known, root, path, errors, reading);
+        } else {
+            let passing = branches.iter().any(|branch| {
+                let mut branch_errors = Vec::new();
+                walk(instance, branch, root, path, &mut branch_errors, reading);
+                branch_errors.is_empty()
+            });
+            if !passing {
+                errors.push(format!(
+                    "{path}: {instance} matches none of the {} anyOf branches",
+                    branches.len()
+                ));
+            }
+        }
     }
 
     if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
@@ -310,21 +323,6 @@ pub fn check_scalar_constraints(
 /// Does `text` match `pattern`, for the sliver of regular-expression syntax this
 /// schema uses?
 ///
-/// Deliberately not a regex engine, and deliberately not a dependency. The schemas'
-/// patterns take three forms. `profile.id`'s is an anchored alternation of literals where
-/// one branch ends in a character class. The digests' and the like are an anchored
-/// `[class]+` or `[class]{n}`, which the branch form below reads as an empty literal
-/// prefix. The predicate schema's are `^[^@]`, a first character outside a literal set, and
-/// `\S`, some character outside ECMA-262's `\s`; the report schema embeds the predicate
-/// schema's `$defs/clause`, so it holds those two as well. Supporting those is sixty lines;
-/// `regex` would be a fifth direct dependency and 200-odd transitive crates for a handful
-/// of strings.
-///
-/// `profile.id`'s pattern ends in an optional group, `(\+env:[0-9a-f]{12})?`: one branch
-/// of the same form, whose literal may escape a
-/// character with `\` and whose class may be counted `{n}` as well as `+`. The text matches
-/// the alternation alone, or the alternation followed by the group.
-///
 /// # Panics
 ///
 /// On any construct outside the supported subset. That is the whole design: an
@@ -373,8 +371,7 @@ pub fn matches_pattern(pattern: &str, text: &str) -> bool {
         .unwrap_or(body);
     assert!(
         !body.contains(['(', ')', '*', '?', '{', '\\']),
-        "unsupported pattern construct in {pattern}: this validator handles anchored \
-         alternations of literals with an optional trailing `[class]+` only"
+        "unsupported pattern construct in {pattern}"
     );
     body.split('|').any(|branch| matches_branch(branch, text))
 }
@@ -457,9 +454,7 @@ pub fn matches_format(format: &str, text: &str) -> bool {
         format == "date-time",
         "unsupported format `{format}`: implement it or stop declaring it"
     );
-    // RFC 3339, in the one shape `iso8601_utc` emits: YYYY-MM-DDTHH:MM:SSZ. Deliberately
-    // strict about the `Z`: chard timestamps are UTC by construction, and an offset
-    // here would mean something upstream started guessing.
+    // RFC 3339, in the one shape `iso8601_utc` emits: YYYY-MM-DDTHH:MM:SSZ.
     let bytes = text.as_bytes();
     if bytes.len() != 20 || bytes[19] != b'Z' {
         return false;
@@ -475,9 +470,7 @@ pub fn matches_format(format: &str, text: &str) -> bool {
     {
         return false;
     }
-    // RFC 3339 section 5.7: the fields are ranges, not just digits. A shape-only check
-    // passed `2026-13-45T25:61:61Z`, which any standard `date-time` validator rejects.
-    // Seconds stop at 59 because `iso8601_utc` never emits a leap second.
+    // RFC 3339 section 5.7: the fields are ranges, not just digits.
     let field = |start: usize, end: usize| text[start..end].parse::<u32>().unwrap();
     let (year, month, day) = (field(0, 4), field(5, 7), field(8, 10));
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
@@ -552,6 +545,7 @@ pub fn is_ecma_whitespace(c: char) -> bool {
 const IMPLEMENTED: &[&str] = &[
     "$ref",
     "oneOf",
+    "anyOf",
     "const",
     "enum",
     "type",
@@ -588,8 +582,7 @@ fn refuse_unimplemented_keywords(schema: &Value, path: &str) {
     for key in schema.as_object().into_iter().flat_map(|o| o.keys()) {
         assert!(
             IMPLEMENTED.contains(&key.as_str()) || ANNOTATIONS.contains(&key.as_str()),
-            "{path}: keyword `{key}` is not implemented by this validator; implement it or \
-             stop declaring it"
+            "{path}: keyword `{key}` is not implemented by this validator"
         );
     }
 }

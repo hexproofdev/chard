@@ -2,31 +2,11 @@
 
 //! A builder for the synthetic ELF objects under `tests/fixtures/elf/`, and the
 //! catalogue of what is built.
-//!
-//! Every fixture the reader is pinned against comes from here, so the bytes checked in
-//! and the code that made them cannot drift apart: `tests/elf_fixtures.rs` asserts the
-//! two are equal on every run and rewrites the files only under
-//! `CHARD_REGENERATE_ELF_FIXTURES=1`. The objects are synthetic and labelled so in the
-//! record beside each one. They are not the output of any linker, and a fact that only a
-//! linker could get wrong is not what they pin; what they pin is the reader's arithmetic
-//! over the two widths, the two byte orders, the object types and the three spellings of
-//! `BIND_NOW`, on inputs no compiler on a given host can be asked to produce.
-//!
-//! The layout is the plainest one `readelf` accepts: the ELF header, the program headers,
-//! every section's bytes in declaration order at its own alignment, then the
-//! section-header table, with one `PT_LOAD` mapping the whole file at `base` so a virtual
-//! address is a file offset plus `base`. Shared between `tests/elf_fixtures.rs` and
-//! `tests/elf_readelf.rs` as a directory module for the reason `tests/common` gives: a
-//! builder in two copies is a builder that disagrees with itself.
-//!
-//! A note writer that padded the owner name as `12 + align_up(namesz, align)` would make
-//! the off-by-four `src/elf.rs`'s header names as the one rule that must not be got wrong,
-//! and `llvm-readelf -n` would report the property note corrupt before any test of the
-//! reader did. An oracle earns its keep on the fixture before it earns it on the
-//! reader, which is the argument for `tests/elf_readelf.rs` running over these files.
 
-// Each test binary that declares this module uses a different subset of it.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary that declares this module uses a different subset of it"
+)]
 
 pub mod generate;
 
@@ -197,6 +177,10 @@ pub enum Covers {
     File,
     /// One section's bytes.
     Section(&'static str),
+    /// The bytes from the first named section's start to the second's end, the sections
+    /// between them included, as a linker maps several note sections through one
+    /// `PT_NOTE`.
+    Sections(&'static str, &'static str),
     /// Nothing: offset, address and size all zero (`PT_GNU_STACK`).
     Nothing,
 }
@@ -538,6 +522,12 @@ impl Object {
                     self.addr_of(layout, name),
                     self.size_of(layout, name),
                 ),
+                Covers::Sections(first, last) => {
+                    let start = self.offset_of(layout, first);
+                    let end = self.offset_of(layout, last) + self.size_of(layout, last);
+                    assert!(end >= start, "{last} is laid out before {first}");
+                    (start, self.addr_of(layout, first), end - start)
+                }
                 Covers::Nothing => (0, 0, 0),
             };
             out.u32(seg.p_type);
@@ -1340,10 +1330,6 @@ pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 
 /// [`relocatable`] with a `.rela.text` holding one `R_X86_64_REX_GOTPCRELX` against a
 /// defined `chard_pic_object_anchor`: the relocation `pic-object-relocs` reads as `-fPIC`.
-///
-/// The anchor is the fourth symbol table entry (the null symbol, the function, the canary
-/// reference, then it), which the entry's `r_info` names. Not in the catalogue, so no
-/// checked-in fixture's bytes move; `tests/elf_truncations.rs` cuts it.
 pub fn relocatable_with_code_relocation() -> Object {
     let mut object = relocatable();
     let symtab = object
@@ -1620,11 +1606,6 @@ fn riscv_code(call: RiscvCall) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<&'static str>)
 /// reads (`.data`, `.bss`, `.comment`, `.eh_frame` and its relocations) are left out, and
 /// the symbol table keeps the three symbols the relocations need: the `auipc`'s local label,
 /// which GNU as names `.L0 ` with a trailing space, the caller, and the undefined callee.
-///
-/// Under [`RiscvCall::Got`] the code relocations are `R_RISCV_GOT_HI20` against the callee
-/// and `R_RISCV_PCREL_LO12_I` against the label; under [`RiscvCall::Plt`],
-/// `R_RISCV_CALL_PLT` against the callee. Each carries an `R_RISCV_RELAX` and the section
-/// an `R_RISCV_ALIGN`, both against symbol 0, which names nothing.
 pub fn relocatable_riscv_no_plt(call: RiscvCall) -> Object {
     let (text, rela, symtab, strings) = riscv_code(call);
     let align = 8;
@@ -1689,6 +1670,81 @@ pub fn relocatable_riscv_no_plt(call: RiscvCall) -> Object {
     }
 }
 
+/// `SHT_AARCH64_ATTRIBUTES`, `SHT_LOPROC + 3`: the type `.ARM.attributes` carries on aarch64,
+/// the same number as [`SHT_RISCV_ATTRIBUTES`].
+pub const SHT_AARCH64_ATTRIBUTES: u32 = 0x7000_0003;
+
+/// The `.ARM.attributes` gcc 16.1.1 (Fedora 44's aarch64 cross compiler, binutils 2.46)
+/// writes under `-mbranch-protection=standard`: format version `A`, one
+/// `aeabi_feature_and_bits` subsection, optional and ULEB128-encoded, holding
+/// `Tag_Feature_BTI` (0), `Tag_Feature_PAC` (1) and `Tag_Feature_GCS` (2), each 1. The length
+/// is computed rather than written, and the result is byte for byte what that compiler wrote.
+fn aarch64_feature_attributes() -> Vec<u8> {
+    let mut sub = b"aeabi_feature_and_bits\0".to_vec();
+    sub.extend_from_slice(&[1, 0, 0, 1, 1, 1, 2, 1]);
+    let mut out = vec![b'A'];
+    out.extend_from_slice(&u32_of(4 + sub.len()).to_le_bytes());
+    out.extend_from_slice(&sub);
+    out
+}
+
+/// An aarch64 relocatable object in the shape gcc 16.1.1 (Fedora 44's aarch64 cross
+/// compiler, binutils 2.46) writes for one function under `-O2 -mbranch-protection=standard`:
+/// that compiler's `.text` (`bti c`, `add w0, w0, #1`, `ret`), its `.ARM.attributes` marking
+/// BTI, PAC and GCS, and no property note, which that toolchain does not write to an object.
+/// The sections gcc writes and no fact reads (`.data`, `.bss`, `.comment`, `.eh_frame` and its
+/// relocations) are left out, and the symbol table keeps the function.
+pub fn relocatable_aarch64_build_attributes() -> Object {
+    let text = vec![
+        0x5f, 0x24, 0x03, 0xd5, 0x00, 0x04, 0x00, 0x11, 0xc0, 0x03, 0x5f, 0xd6,
+    ];
+    let strings = vec!["chard_branch_protection_probe"];
+    let mut symtab = vec![0u8; 24];
+    symtab.extend_from_slice(&strtab_offset(&strings, strings[0]).to_le_bytes());
+    symtab.push(0x12); // STB_GLOBAL, STT_FUNC
+    symtab.push(0);
+    symtab.extend_from_slice(&1u16.to_le_bytes()); // .text
+    symtab.extend_from_slice(&0u64.to_le_bytes());
+    symtab.extend_from_slice(&12u64.to_le_bytes());
+    Object {
+        class64: true,
+        little: true,
+        e_type: ET_REL,
+        e_machine: EM_AARCH64,
+        base: 0,
+        sections: vec![
+            section(
+                ".text",
+                SHT_PROGBITS,
+                SHF_ALLOC | SHF_EXECINSTR,
+                32,
+                Content::Bytes(text),
+            ),
+            section(
+                ".ARM.attributes",
+                SHT_AARCH64_ATTRIBUTES,
+                0,
+                1,
+                Content::Bytes(aarch64_feature_attributes()),
+            ),
+            Section {
+                name: ".symtab",
+                sh_type: SHT_SYMTAB,
+                flags: 0,
+                addralign: 8,
+                entsize: 24,
+                link: Some(".strtab"),
+                info: 1,
+                content: Content::Bytes(symtab),
+            },
+            section(".strtab", SHT_STRTAB, 0, 1, Content::Strings(strings)),
+        ],
+        segments: Vec::new(),
+        strip_section_headers: false,
+        section_headers_first: false,
+    }
+}
+
 /// The first bytes of each `cet-endbr` probe function as gcc 16.1.1 and clang 22.1.8
 /// compile it under `-O2 -fcf-protection=none` on Fedora 44 x86_64: `lea 0xN(%rdi),%eax`
 /// then `ret`, with no `endbr64` (2026-10-05, `chard detect cet-endbr-emitted --artifact`
@@ -1703,12 +1759,6 @@ pub const UNMARKED_ENTRIES: [(&str, [u8; 4]); 3] = [
 /// no landing pad: [`linked_default`], its IBT|SHSTK property kept, with `.text` holding
 /// `main` and the `cet-endbr` probe's three functions as [`UNMARKED_ENTRIES`] spells them,
 /// each sixteen bytes apart and sized in `.symtab` at its address.
-///
-/// The shape GNU ld 2.46.1 writes for that probe built `-O2 -fcf-protection=none` and
-/// linked `-z ibt -z shstk` under gcc 16.1.1 and clang 22.1.8 on Fedora 44 x86_64
-/// (2026-10-05): the linker forces both bits of `GNU_PROPERTY_X86_FEATURE_1_AND` whatever
-/// its inputs carry, so the marking claims what the code does not hold. `cet-marked`
-/// reads that note and `cet-endbr-emitted` reads those bytes, one artifact under both.
 pub fn linked_cet_forged() -> Object {
     const STRIDE: u64 = 16;
     let mut object = linked_default().object();
@@ -2148,6 +2198,15 @@ pub fn catalogue() -> Vec<Fixture> {
          and PAC), and a .riscv.attributes section. What code_relocations names on RISC-V \
          and plt-bypassed reads as present.",
         relocatable_riscv_no_plt(RiscvCall::Got).build(),
+    ));
+    all.push(fixture(
+        "elf64-le-aarch64-rel-build-attributes",
+        "ELF64 little-endian aarch64 relocatable object in the shape gcc 16.1.1 with binutils \
+         2.46 writes for one function under -O2 -mbranch-protection=standard: bti c in .text, \
+         and an .ARM.attributes aeabi_feature_and_bits subsection marking BTI, PAC and GCS \
+         with no property note, which that toolchain does not write to an object. What \
+         branch-protection-marked and gcs-marked read from such an object.",
+        relocatable_aarch64_build_attributes().build(),
     ));
     all.push(fixture(
         "elf64-le-x86_64-exec-cet-forged",

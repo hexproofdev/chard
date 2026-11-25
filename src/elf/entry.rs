@@ -1,49 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The first bytes of a few named functions: what each begins with in the artifact.
-//!
-//! `-fcf-protection=branch` (and `=full`) has the compiler begin every function an
-//! indirect branch may reach with a landing pad, `endbr64` (`f3 0f 1e fa`) on x86_64 and
-//! `endbr32` (`f3 0f 1e fb`) on i386. The property note `cet-marked-object` reads is the
-//! compiler's claim that it did; the instruction is the instrumentation itself, and this
-//! module reads it. A function's first four bytes are the smallest case of a code-byte
-//! reader: one fixed prefix at one known address, never decoded and never searched.
-//!
-//! # What is read
-//!
-//! [`ENTRY_FUNCTIONS`] names the functions, each the `cet-endbr` probe's own. A function
-//! is located through `.symtab`: a defined `STT_FUNC` entry of that exact name. Its first
-//! [`ENTRY_BYTES`] bytes (fewer where `st_size` is smaller) are read from
-//! `st_value` mapped through the section header its `st_shndx` names: section-relative in
-//! an `ET_REL`, a virtual address in a linked object, which the section's `sh_addr` maps
-//! back. The section must carry `SHF_EXECINSTR` and file bytes, and every step is bounded
-//! by the section's declared extent and by the file through `Cursor`.
-//!
-//! The fact is `function_entries`, `<function>=<hex>` for each listed function read, the
-//! bytes in file order as lowercase hex. A listed function the file does not define is not
-//! recorded, since an absent function is a question with no referent here, and the
-//! predicate that reads the fact turns a missing entry into `indeterminate` rather than a
-//! reading. A listed function that is defined and cannot be read, or that more than one
-//! entry defines, is recorded as [`ElfTable::FunctionEntries`] `unread`, with the step
-//! that stopped it.
-//!
-//! # Why a prefix at a symbol's address is the instruction
-//!
-//! A function's address is an instruction boundary by construction: it is where the
-//! function's first instruction begins, so the four bytes there are that instruction's
-//! encoding or the start of it, and cannot be the tail of another. `f3 0f 1e fa` and
-//! `f3 0f 1e fb` are the whole encodings of `endbr64` and `endbr32`. The probe's functions
-//! are global and address-taken, so a compiler instrumenting indirect-branch targets must
-//! give each a landing pad, and `noinline` keeps each a function of its own at every -O
-//! level. The control triple checks the result: under `-fcf-protection=none` the same
-//! functions begin otherwise, on the toolchain being measured.
-//!
-//! # Overlap
-//!
-//! `elf::code` is a fixed-pattern search over named functions' whole bodies, with its own
-//! symbol walk and its own table (`code`). This reader is the smallest case of it (one
-//! pattern, at offset 0), with a walk of its own beside it; unifying the two walks is open
-//! in the project ledger.
 
 use super::{ET_REL, Elf, ElfTable, SHF_EXECINSTR, SHN_UNDEF, SHT_NOBITS, SHT_SYMTAB, Truncation};
 
@@ -113,11 +70,7 @@ impl Elf<'_> {
                 more => {
                     trunc.push(Truncation::unread(
                         ElfTable::FunctionEntries,
-                        format!(
-                            "{name}: {} defined functions carry the name, so which one is \
-                             the probe's cannot be told and none was read",
-                            more.len()
-                        ),
+                        format!("{name}: {} defined functions carry the name", more.len()),
                     ));
                     continue;
                 }
@@ -131,14 +84,6 @@ impl Elf<'_> {
 
     /// Every defined `STT_FUNC` in `.symtab` that [`ENTRY_FUNCTIONS`] names, and the entry
     /// this walk could not read, if it met one.
-    ///
-    /// A walk of its own rather than `symbols`', which keeps a name and a definedness and
-    /// nothing else. Where it stops for a reason `symbols` meets over the same bounds (a
-    /// table below one entry, a string table that cannot be held, a name offset past its
-    /// table) the stop is recorded there, against [`ElfTable::Symbols`], which the check
-    /// that reads this fact declares, and is not recorded twice. Only this walk reads an
-    /// entry's `st_info`, `st_value` and `st_size`, so an entry whose bytes end before
-    /// those is a stop it alone meets, and that one is returned for the caller to record.
     fn entry_definitions(&self) -> (Vec<(&'static str, Definition)>, Option<String>) {
         let mut out = Vec::new();
         let mut recorded_by_symbols = Vec::new();
@@ -156,6 +101,17 @@ impl Elf<'_> {
                 return (out, None);
             };
             for i in 0..count {
+                // A spent budget forgets the definitions found, so every function the walk
+                // looks for reads as not found before it stopped, and is recorded so: one
+                // found before the stop could have a second definition after it.
+                if let Err(spent) = self.step() {
+                    return (
+                        Vec::new(),
+                        Some(format!(
+                            "{table} not read past symbol {i} of {count}: {spent}"
+                        )),
+                    );
+                }
                 let base = sh.sh_offset.saturating_add(i.saturating_mul(step));
                 let (name_off, info, shndx, value, size) = match self.entry_symbol(base) {
                     Ok(entry) => entry,
@@ -174,7 +130,21 @@ impl Elf<'_> {
                 if info & 0xf != STT_FUNC || shndx == SHN_UNDEF {
                     continue;
                 }
-                let name = self.cur.cstr_at(strtab.sh_offset, name_off, strtab.sh_size);
+                // A name not read, past the bound on one name or the budget, stops the walk
+                // as a spent budget does: the definitions found are forgotten and every
+                // function looked for is recorded as not found before the stop, whatever
+                // `symbols` records over the same entry.
+                let name = match self.name_at(strtab.sh_offset, name_off, strtab.sh_size) {
+                    Ok(name) => name,
+                    Err(fault) => {
+                        return (
+                            Vec::new(),
+                            Some(format!(
+                                "{table}: the name of symbol {i} of {count} was not read: {fault}"
+                            )),
+                        );
+                    }
+                };
                 if let Some(known) = ENTRY_FUNCTIONS.iter().find(|f| **f == name) {
                     out.push((*known, Definition { value, size, shndx }));
                 }
@@ -193,8 +163,8 @@ impl Elf<'_> {
         };
         let name_off = self.cur.u32_at(base)?;
         let at = base.saturating_add(info_at);
-        // `slice` returned exactly one byte or an error; the `else` is the error's own
-        // shape for a window that did not hold the byte, never a substituted value.
+        // `slice` returned exactly one byte or an error; the `else` is the error's shape,
+        // never a substituted value.
         let &[info] = self.cur.slice(at, 1)? else {
             return Err(super::ReadError::OutOfBounds {
                 start: usize::try_from(at).unwrap_or(usize::MAX),

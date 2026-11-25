@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# The house lint standard, vendored in .lints/std/ and pinned here by the hash of its
+# SHA256SUMS. sh .lints/std/lints-gate.sh reads this file.
+version 1.0.0-draft
+sha256 146003d80f0bf842a76fedc4def09812014be49c7f18780ca56317bd6247c83f
+workspace . std kani arith
+workspace fuzz std
+# The canary caps the lints of its own copies of the tree under TMPDIR, in the caller's
+# variables and a cargo configuration above a copy, to show the clippy-gate rule clears them;
+# it lowers no level of this tree. The flags check would read those caps as this tree's.
+exempt scripts/clippy-canary.sh the canary's caps are its copies', not this tree's

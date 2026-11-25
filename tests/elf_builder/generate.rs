@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Objects drawn from a seed, for the tests that hold the reader to a property over many
-//! objects rather than to a record over thirteen.
-//!
-//! The catalogue in the parent module pins one object per shape a reviewer thought of.
-//! What it cannot reach is a combination nobody listed: a big-endian ELF32 shared object
-//! with two property notes and a versioned canary in `.symtab`, say. A [`Spec`] is the
-//! set of choices that separate such objects, drawn by [`Spec::draw`] from a generator the
-//! caller seeds, and built with the same [`Object`] writer the fixtures use, so a
-//! generated object and a fixture cannot disagree on layout. [`Spec::simpler`] lists the
-//! specs one choice smaller, which is what a failing test shrinks through: a greedy walk
-//! that keeps any smaller spec that still fails ends at one no single step can simplify
-//! without the failure going away, and that is the spec the failure message prints.
-//!
-//! Every draw is an object `readelf` accepts and the reader reads whole, with no
-//! malformed table; the one truncation a draw carries is the one a stripped
-//! section-header table records by design. Cutting it is the caller's business
-//! (`tests/elf_truncations.rs`).
-//!
-//! The draw takes a closure rather than a generator type, so this module needs nothing
-//! from a sibling the test binaries declare and the fixture tests that never draw do not.
+//! objects rather than to the catalogue's records.
 
 use super::{
     AARCH64_FEATURE_1_BTI, BindNow, Content, Covers, DF_1_NOOPEN, DF_1_NOW, DF_1_PIE, DF_BIND_NOW,
@@ -321,11 +303,6 @@ impl Spec {
     }
 
     /// Every spec one choice smaller than this one, for shrinking a failure.
-    ///
-    /// Each candidate drops one entry of a list, clears one flag or option, or moves the
-    /// width, byte order or machine to the default fixture's. `e_type` and `dynamic` are
-    /// not shrunk: the other fields are drawn for them, and changing either under the
-    /// rest would build an object [`Spec::draw`] never produces.
     #[must_use]
     pub fn simpler(&self) -> Vec<Self> {
         let mut out = Vec::new();

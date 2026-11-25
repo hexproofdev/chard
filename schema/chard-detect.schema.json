@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hexproofdev/chard/schema/chard-detect.schema.json",
   "title": "chard detect output",
-  "description": "What `chard detect <check>` prints on success: a replay of every reading a report publishes for the check (`kind: replay`), or one decoder run over one set of facts (`kind: detection`). A detection is not a verdict, since no control triple ran. `src/detect.rs` states the mechanism, and `tests/schema_conformance.rs` holds live output to this file.",
+  "description": "What `chard detect <check>` prints on success: a replay of every reading a report publishes for the check (`kind: replay`), or one decoder run over one set of facts (`kind: detection`). A detection is not a verdict, since no control triple ran.",
   "oneOf": [
     {
       "$ref": "#/$defs/replay"
@@ -166,7 +166,7 @@
                   "unkept-c-int-follow",
                   "reading-absent"
                 ],
-                "description": "`reading-absent` is a site that owes a reading and publishes none, and exits 1; the others are readings no replay can reach. A code decoder is replayed through this binary over the records its site publishes, and `code-decoder` names what remains: an arm of a check whose decoder reads an artifact the store does not keep (`detect::READS_UNSTORED_ARTIFACT`); a record that does not read, or an artifact key the store does not resolve, is refused as unusable input. `record-cut` is a record an excerpt budget cut."
+                "description": "`reading-absent` is a site that owes a reading and publishes none, and exits 1. The others are readings no replay can reach: `code-decoder` an arm whose decoder reads an artifact the store does not keep, and `record-cut` a record an excerpt budget cut."
               },
               "key": {
                 "type": "string",
@@ -270,9 +270,64 @@
             }
           }
         },
+        "gates": {
+          "type": "array",
+          "description": "Each observation's gating, held to the listing rules re-derived from the report's `listings`, where the replay covers the measured build (no `--arm`, or `--arm measured`). Always written, but not required, since chard 0.1.0's `detect` output at this `chard_schema` has no such key.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "probe",
+              "verdict",
+              "rule",
+              "outcome",
+              "rederived"
+            ],
+            "properties": {
+              "probe": {
+                "type": "string"
+              },
+              "verdict": {
+                "type": "string",
+                "description": "The published verdict."
+              },
+              "rule": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The published `gating.rule`; null where the observation carries no gating."
+              },
+              "outcome": {
+                "enum": [
+                  "agrees",
+                  "disagrees",
+                  "not-reached",
+                  "overwritten",
+                  "listings-unpublished"
+                ],
+                "description": "`disagrees` exits 1. `not-reached` is an observation settled before the listing rules, `overwritten` one whose target or twin rule replaces the ladder's, and `listings-unpublished` a report of another chard's decoders with no `listings` member, taken as written even where its `listings` were removed and its `run.decoders_sha256` edited."
+              },
+              "rederived": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": "The rule the listing rules give over the published listings, null where none fires: one entry for the published verdict, or one per verdict the rules tell apart where the published rule is one of theirs. Empty where no replay ran."
+              },
+              "detail": {
+                "type": "string",
+                "description": "Why the replay disagrees, where no rederived rule shows it: the gating, the probe or the record it could not hold."
+              }
+            }
+          }
+        },
         "restated": {
           "type": "array",
-          "description": "Each value the report states beside a published reading, held to what the reading licenses: a control arm's `outcome` against its reading's outcome, and a measured `on`, `off` or `partial` and its `level`, whether or not the observation carries a `gating`, against the verdict and level the measured reading gives on the check's scale; also each reading's `facts` and `macros` keys against the digests its own site's record publishes, and a measured `on`, `off` or `partial` against the control triple published beside it (`controls`), which earns a measurement when its positive arm is `present`, its negative arm `absent`, any regime arm `absent` and `discriminating` is true. `controls` is restated on every check, a code decoder's included, and an `outcome` or `verdict` beside a reading listed in `not_replayable` restates to `null` and disagrees. A regime arm is owed where the check's declaration in this binary's corpus asks for one and the report's `profile` adds a flag, and an owed arm that is unpublished or states no `outcome` withholds; and a `probe-invalid` beside a published triple is restated against it too, disagreeing where the triple discriminated. `indeterminate`, `unsupported` and `not-applicable` are not restated against the triple: beside a discriminating one they are what a gating rule or the fortify ratchet leaves, and a replay re-derives neither. Any entry with `agrees: false` exits 1.",
+          "description": "Each value the report states beside a published reading, held to what the reading and its control triple license: an arm's `outcome`, a measured verdict and `level`, and each reading's `facts` and `macros` keys. Any entry with `agrees: false` exits 1.",
           "items": {
             "type": "object",
             "additionalProperties": true,
@@ -322,7 +377,7 @@
                   "string",
                   "null"
                 ],
-                "description": "The reading's outcome, or the verdict it licenses (`null` where it licenses no measured verdict, and where the reading was not replayed); for `controls`, the stated verdict where the triple earned it, `probe-invalid` where a triple is published and did not, `null` where none is and beside a `probe-invalid` whose triple discriminated; for `facts` and `macros`, the key the site's record binds the member to, `null` where it binds no single key."
+                "description": "What the reading licenses for `field`: its outcome, its verdict, the key its record binds, or, for `controls`, the stated verdict where the triple earned it and `probe-invalid` where it did not. `null` where it licenses none or was not replayed."
               },
               "restated_level": {
                 "type": "string",

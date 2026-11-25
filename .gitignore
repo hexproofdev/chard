@@ -32,18 +32,10 @@
 # record where things live on a particular machine goes here instead.
 *.private.md
 
-# The leak gate's private pattern list: the names and host-only paths that identify a
-# developer's machine, which `scripts/leak-gate.sh` scans the object graph for. Ignored
-# because the list is the disclosure: tracked, it would publish every name it exists to
-# keep out. Each machine holds its own; the script's header says how to write one. The glob
-# covers a copy or backup made beside it.
-/scripts/leak-gate.private*
-
 # Editor detritus. Not merely untidy: a swap file is a binary snapshot of whatever was
 # being edited, and its header records the editing user and host by construction, so one
-# committed here publishes the development machine. `scripts/leak-gate.sh` scans the object
-# graph rather than the checkout, since an ignore rule leaves exposed whatever was committed
-# before it.
+# committed here publishes the development machine. An ignore rule leaves exposed whatever
+# was committed before it.
 *.swp
 *.swo
 *~

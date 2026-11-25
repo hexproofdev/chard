@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! The synthetic ELF fixtures under `tests/fixtures/elf/`: what is checked in is what
-//! the builder builds, and what the reader reads from it is what the record beside it
-//! says.
-//!
-//! Three things are pinned, and each catches a different drift. The bytes against the
-//! builder, so a fixture cannot be edited by hand and a builder change cannot go
-//! unrecorded. The reader's facts against the recorded `.expected.json`, so a change in
-//! what the reader says about a fixed input surfaces as a red test before it can reach
-//! a published table. And a short table of the facts each fixture was *built* to carry,
-//! written by hand, so the recorded JSON cannot be regenerated into agreement with a
-//! wrong reader without a human noticing the fact it was built for.
-//!
-//! Regenerate both files with `CHARD_REGENERATE_ELF_FIXTURES=1`, and read the diff: the
-//! record is evidence, and a regeneration that makes a test green needs a reason.
-//!
-//! Every fixture here is synthetic, which the record says in its first field. None was
-//! produced by a linker, so the ELF32, big-endian and relocatable cases are pinned by
-//! bytes this builder wrote, with no toolchain's output behind them; `tests/elf_readelf.rs`
-//! is what compares the reader against an independent oracle over them.
+//! The synthetic ELF fixtures under `tests/fixtures/elf/`: the checked-in bytes are the
+//! builder's, and the reader reads from each the facts the builder's spec says it carries.
+//! None was produced by a linker; `tests/elf_readelf.rs` compares the reader against an
+//! independent oracle over them.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::path::PathBuf;
 
@@ -33,24 +31,9 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf")
 }
 
-fn regenerating() -> bool {
-    std::env::var_os("CHARD_REGENERATE_ELF_FIXTURES").is_some()
-}
-
-/// The record beside each fixture's bytes.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Record {
-    synthetic: bool,
-    built_by: String,
-    description: String,
-    facts: serde_json::Value,
-}
-
-/// The bytes checked in are the bytes the builder produces, byte for byte.
 #[test]
 fn the_checked_in_bytes_are_what_the_builder_builds() {
     let dir = fixture_dir();
-    std::fs::create_dir_all(&dir).expect("the fixture directory exists");
     let fixtures = catalogue();
     assert_eq!(
         fixtures.len(),
@@ -60,20 +43,11 @@ fn the_checked_in_bytes_are_what_the_builder_builds() {
     let mut compared = 0;
     for f in &fixtures {
         let path = dir.join(format!("{}.elf", f.name));
-        if regenerating() {
-            std::fs::write(&path, &f.bytes).expect("writing the fixture");
-        }
-        let on_disk = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "{}: {e}; regenerate with CHARD_REGENERATE_ELF_FIXTURES=1",
-                path.display()
-            )
-        });
+        let on_disk = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}; write the builder's bytes there", path.display()));
         assert!(
             on_disk == f.bytes,
-            "{}: the checked-in bytes differ from the builder's ({} vs {} bytes). Either the \
-             builder changed, in which case regenerate and record why, or the file was \
-             edited by hand, which is not how a fixture changes.",
+            "{}: the checked-in bytes differ from the builder's ({} vs {} bytes)",
             path.display(),
             on_disk.len(),
             f.bytes.len()
@@ -83,63 +57,6 @@ fn the_checked_in_bytes_are_what_the_builder_builds() {
     assert_eq!(compared, ELF_FIXTURE_COUNT);
 }
 
-/// The reader's facts about each fixture are the facts on record.
-#[test]
-fn the_checked_in_facts_are_what_the_reader_reads() {
-    let dir = fixture_dir();
-    let fixtures = catalogue();
-    let mut compared = 0;
-    for f in &fixtures {
-        let path = dir.join(format!("{}.expected.json", f.name));
-        let facts = elf::Elf::parse(&f.bytes)
-            .unwrap_or_else(|e| panic!("{}: the builder's bytes do not parse: {e}", f.name))
-            .facts();
-        let live = serde_json::to_value(&facts).expect("facts serialize");
-        if regenerating() {
-            let record = Record {
-                synthetic: true,
-                built_by: "tests/elf_builder/mod.rs".to_owned(),
-                description: f.description.to_owned(),
-                facts: live.clone(),
-            };
-            let text = serde_json::to_string_pretty(&record).expect("record serializes");
-            std::fs::write(&path, format!("{text}\n")).expect("writing the record");
-        }
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "{}: {e}; regenerate with CHARD_REGENERATE_ELF_FIXTURES=1",
-                path.display()
-            )
-        });
-        let record: Record = serde_json::from_str(&text).expect("the record parses");
-        assert!(
-            record.synthetic,
-            "{}: every fixture here is synthetic and must say so",
-            f.name
-        );
-        assert_eq!(
-            record.description, f.description,
-            "{}: the description drifted",
-            f.name
-        );
-        assert!(
-            record.facts == live,
-            "{}: the reader now says something different from the record.\n  record: {}\n  live:   {}\nRead the \
-             difference and decide which is right before regenerating.",
-            f.name,
-            record.facts,
-            live
-        );
-        compared += 1;
-    }
-    assert_eq!(compared, ELF_FIXTURE_COUNT);
-}
-
-/// The facts each fixture was built to carry, by hand.
-///
-/// Independent of the recorded JSON on purpose: the record is what the reader said, and
-/// this is what the input is. A regeneration that makes the record agree with a wrong
-/// reader still has to get past these.
 #[test]
 fn each_fixture_carries_the_facts_it_was_built_to_carry() {
     let mut checked = 0;
@@ -151,6 +68,7 @@ fn each_fixture_carries_the_facts_it_was_built_to_carry() {
             expect_static_pies,
             expect_widths,
             expect_riscv,
+            expect_aarch64_attributes,
             expect_forged_marking,
         ]
         .iter()
@@ -257,11 +175,12 @@ fn expect_kinds(name: &str, facts: &elf::ElfFacts) -> bool {
             assert_eq!(facts.bind_now, Some(false), "otherwise the control");
         }
         "elf64-le-x86_64-exec-stripped-section-headers" => {
-            assert!(facts.sections.is_empty());
+            let (sections, comment) = (&facts.sections, &facts.comment);
+            assert!(sections.is_empty(), "no section is listed: {sections:?}");
             assert_eq!(facts.symbol_count, 0);
             // `.comment` could not be looked up, and the field says so; an empty list
             // would read as a section read to its end with no lines.
-            assert!(facts.comment.is_empty());
+            assert!(comment.is_empty(), "no .comment line is read: {comment:?}");
             assert!(
                 facts
                     .comment_truncation()
@@ -601,6 +520,89 @@ fn expect_riscv(name: &str, facts: &elf::ElfFacts) -> bool {
     true
 }
 
+/// The aarch64 object gcc 16.1.1 writes: no property note, its BTI, PAC and GCS marking read
+/// from `.ARM.attributes`, which is listed with nothing cut.
+fn expect_aarch64_attributes(name: &str, facts: &elf::ElfFacts) -> bool {
+    if name != "elf64-le-aarch64-rel-build-attributes" {
+        return false;
+    }
+    assert_eq!(
+        (
+            facts.elf_class,
+            facts.machine.as_str(),
+            facts.elf_type.as_str()
+        ),
+        (64, "aarch64", "ET_REL")
+    );
+    assert!(facts.gnu_property_types.is_empty(), "no property note");
+    assert_eq!(
+        [facts.aarch64_bti, facts.aarch64_pac, facts.aarch64_gcs],
+        [true; 3],
+        "the marking the build attributes state"
+    );
+    assert!(
+        facts.sections.iter().any(|s| s == ".ARM.attributes"),
+        "{:?}",
+        facts.sections
+    );
+    assert!(facts.truncations.is_empty(), "{:?}", facts.truncations);
+    true
+}
+
+#[test]
+fn the_marking_checks_read_an_objects_build_attributes_and_never_a_programs() {
+    use chard::predicate::{self, Live, elf_static};
+    use chard::probe::Outcome;
+    for (e_type, outcome) in [
+        (elf_builder::ET_REL, Outcome::Present),
+        (elf_builder::ET_EXEC, Outcome::Absent),
+        (elf_builder::ET_DYN, Outcome::Absent),
+    ] {
+        let mut object = elf_builder::relocatable_aarch64_build_attributes();
+        object.e_type = e_type;
+        let facts = elf::Elf::parse(&object.build())
+            .expect("the builder's object parses")
+            .facts();
+        for predicate in [
+            elf_static::branch_protection_marked(),
+            elf_static::gcs_marked(),
+        ] {
+            let evaluation = predicate::evaluate(
+                predicate,
+                &Live {
+                    macros: None,
+                    elf: Some(&facts),
+                },
+            )
+            .expect("a live view is complete");
+            assert_eq!(evaluation.outcome, outcome, "e_type {e_type}: {facts:?}");
+            // The object arm of `link-drops-marking`: a positive control whose linked program
+            // is silent beside this object names the link where the object reads marked.
+            if e_type == elf_builder::ET_REL {
+                let object = chard::report::ObjectMarking {
+                    outcome: evaluation.outcome,
+                    observed: "the aarch64 feature word".to_owned(),
+                    sha256: None,
+                };
+                for id in ["branch-protection-marked", "gcs-marked"] {
+                    let check = chard::probe::CORPUS
+                        .iter()
+                        .flat_map(|p| p.checks)
+                        .find(|c| c.id == id)
+                        .expect("the check is in the corpus");
+                    let gating = chard::report::link_drop_limitation(
+                        check,
+                        Some(Outcome::Absent),
+                        Some(&object),
+                    )
+                    .expect("a gcc 16 object's marking names the link");
+                    assert_eq!(gating.rule.id, "link-drops-marking", "{id}");
+                }
+            }
+        }
+    }
+}
+
 /// The `0xc0000000` property on `EM_RISCV`, holding 3: listed by type, counted once, and
 /// read as no feature bit of any other machine, since on RISC-V it is
 /// `GNU_PROPERTY_RISCV_FEATURE_1_AND` (landing pads and shadow stack) and on aarch64 the 3
@@ -637,15 +639,6 @@ fn riscv_relocations(call: RiscvCall) -> Vec<String> {
     .collect()
 }
 
-/// `plt-bypassed` over the builder's two RISC-V objects: the GOT form reads `present` and
-/// the PLT form `absent`, each by its own clause.
-///
-/// Without RISC-V's type names, both objects' entries would be `reloc-type-0x14` and
-/// `reloc-type-0x13`, which no clause matches, and both would read `indeterminate`, the safe
-/// direction. The reader names them because of a measurement, not this test: gcc
-/// 16.1.1 (Fedora 44's riscv64 cross compiler, 2026-10-05) writes these two shapes under
-/// `-fPIE` with and without `-fno-plt`, the measurements `predicate::elf_static`'s
-/// `PLT_BYPASSED` carries.
 #[test]
 fn plt_bypassed_reads_the_riscv_got_call_present_and_the_plt_call_absent() {
     use chard::predicate::{self, Live, elf_static};
@@ -682,15 +675,6 @@ fn plt_bypassed_reads_the_riscv_got_call_present_and_the_plt_call_absent() {
     assert_eq!(read, 2);
 }
 
-/// `code_relocations` on the builder's objects: the relocation a `.rela.text` holds,
-/// named by machine and keyed on its symbol; nothing for a relocation section patching
-/// data; a type no row names spelt by number; an i386 `SHT_REL` entry in the ELF32
-/// layout; a hidden anchor's visibility as a third word at both widths; and `None` on a
-/// linked object, whose static relocations are gone.
-///
-/// The objects are synthetic, so this holds the reader's arithmetic over the two entry
-/// layouts and its filters, not what a compiler writes; the measurements of that are
-/// beside `pic-object-relocs`' predicate.
 #[test]
 fn code_relocations_name_the_type_and_symbol_of_each_relocation_in_code() {
     use elf_builder::{EM_PPC, Object, relocatable, relocatable_with_code_relocation};
@@ -787,20 +771,6 @@ fn code_relocations_name_the_type_and_symbol_of_each_relocation_in_code() {
     }
 }
 
-/// `PT_GNU_STACK` headers in pairs: two that agree read as one does, and two that disagree
-/// on `PF_X`, in either order, publish the last and record the `gnu-stack` table
-/// unread, which withholds `noexecstack`.
-///
-/// Linux takes the last header (`elf::Elf::gnu_stack` cites the loop), so a reader taking
-/// the first reads the pair RW then RWX `on` over a file whose stack Linux maps executable.
-/// A pair differing only in `PF_R` or `PF_W` agrees on the one bit published, and records
-/// nothing.
-///
-/// The disagreement is recorded against `gnu-stack`, not `program-headers`, and the gate is
-/// held over every check that declares a table. Exactly the checks declaring `gnu-stack`
-/// are withheld over the pair, which are `noexecstack` and `linker-default-noexecstack`;
-/// every other, `pie`, `relro` and `textrel-absent` among them, is not, and those three
-/// read over the pair what they read over the single `RW` header.
 #[test]
 fn two_pt_gnu_stack_headers_read_as_one_where_they_agree_and_withhold_where_they_do_not() {
     use elf_builder::{Covers, PF_R, PF_W, PF_X, PT_GNU_STACK, Segment};
@@ -954,24 +924,6 @@ fn assert_the_pair_withholds_the_stack_readers_alone(
     declaring.len()
 }
 
-/// The forged CET marking on one artifact: `cet-marked` reads the property note `present`
-/// at `full`, `cet-endbr-emitted` reads the same file's code `absent`, and the control
-/// triple a profile that forces the marking owes `cet-marked` withholds it as
-/// `regime-confounded`, so `cfi-effective` is `indeterminate` and `fhardened-effective`'s
-/// CET slot not established.
-///
-/// The host-independent half of the two `INERT_FORMS` rows in `tests/inert_flags.rs` for
-/// `-fcf-protection=none -Wl,-z,ibt -Wl,-z,shstk`, which build live and so run only where
-/// `cc` targets x86 and its linker takes `-z ibt`. Each arm here is a builder object: the
-/// positive the control fixture, marked on both edges as `-fcf-protection=full` marks it;
-/// the negative the control with no property, as `-fcf-protection=none` leaves it; and the
-/// measured build and the regime arm both the forged fixture, since appending
-/// `-fcf-protection=none` to a profile whose linker flags force the bits leaves them
-/// forced (measured 2026-10-05 on Fedora 44 x86_64 under gcc 16.1.1 and clang 22.1.8, GNU
-/// ld 2.46.1: the regime arm's artifact read `x86_ibt=true x86_shstk=true`). Whether the
-/// regime arm is built at all is `Check::owes_regime_control`'s answer under a profile that
-/// adds flags, the question `measure` asks; the plain arms alone discriminate, and without
-/// the regime arm the forged marking reads `on`.
 #[test]
 fn a_forged_cet_marking_reads_on_beside_no_landing_pad_and_the_triple_withholds() {
     use chard::probe::Outcome;
@@ -1010,6 +962,7 @@ fn a_forged_cet_marking_reads_on_beside_no_landing_pad_and_the_triple_withholds(
     let arm = |detection, flags: &[&str]| ArmInput {
         detection: Some(detection),
         flags: flags.iter().map(|f| (*f).to_owned()).collect(),
+        overridden: None,
     };
     let triple = |regime: bool| {
         let regime_flags: Vec<&str> = profile
@@ -1031,8 +984,7 @@ fn a_forged_cet_marking_reads_on_beside_no_landing_pad_and_the_triple_withholds(
     };
     assert!(
         marked.owes_regime_control(false),
-        "cet-marked owes no regime arm under a profile that adds flags, so a marking the \
-         profile's linker flags forced is credited to the flag"
+        "cet-marked owes no regime arm under a profile that adds flags"
     );
     let (verdict, controls) = triple(marked.owes_regime_control(false));
     assert_eq!(

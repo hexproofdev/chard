@@ -1,45 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Every macro a code decoder reads is one the report records.
-//!
-//! A report publishes a verdict and, beside it, the evidence that verdict came from.
-//! `relevant_macros` decides what that evidence contains, because the raw preprocessor
-//! dump is thousands of lines and embedding it per observation would bury the few lines
-//! that matter. Trimming is right; trimming away something a detector actually consulted
-//! is not, and the two are indistinguishable by reading the list.
-//!
-//! What that costs is not hypothetical. `_CXX_STDLIB` (chard's own summary of which C++
-//! standard library answered) was absent from the list while both of its fallbacks were
-//! present. On Linux, where the artifact can be read, `measure` replaces the preprocessor
-//! dump with the self-report wholesale, and the self-report carries the summary and
-//! neither fallback. So `detect_cxx_hardening_requested` identified the library on every
-//! Linux run, answered `on` or `off`, and published evidence from which that answer could
-//! not be reproduced. Nothing failed: the replay harness read those observations back as
-//! `indeterminate`, which is a legitimate detector outcome, and the check sat as the only
-//! one in the corpus showing a single outcome across two thousand fixtures.
-//!
-//! # Scope: code decoders
-//!
-//! The macro and elf-static checks decode through `chard-predicate/1` predicates, which
-//! record every read they make, so their names are data rather than literals to scan for.
-//! `tests/predicates.rs` holds every name a predicate reads, and every name a `c-int`
-//! follows over the fixtures and a generated space, to the published filter
-//! (`every_name_a_predicate_reads_is_kept`, `filtered_macros_suffice`). This file holds
-//! the code decoders under `src/decode/`, the runtime and compiler-diag detectors and the
-//! `cxx_stdlib` ladder they share.
-//!
-//! # Why a source scan
-//!
-//! A code decoder is a function over an opaque map, so nothing at runtime can ask one
-//! which keys it will look at. The names are literals in `src/decode/`, and reading them
-//! out of the source is the only enumeration available, the same trade
-//! `discarded_failures.rs` makes, and honest about being a tripwire rather than a proof.
-//! A decoder that built a macro name at runtime would evade this, and the assertions below
-//! fail loudly if the shapes being scanned for stop appearing at all.
-//!
-//! A decoder that looks up names taken from macro values (`_LIBCPP_HARDENING_MODE_FAST`,
-//! say) is one no source scan can list. The filter keeps libc++'s mode constants, and the
-//! predicates that read libc++'s mode record their own reads (Scope, above).
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -62,10 +36,6 @@ fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 /// The code decoder source: every module file under `src/decode/` at any depth,
 /// concatenated. The sibling `*_tests.rs` files are left out, since a name a unit test
 /// plants is not one a decoder reads.
-///
-/// The runtime and compiler-diag detectors, and the `cxx_stdlib` ladder they share with
-/// the predicates' `cxx-stdlib` term, live there, so the number of files read is asserted
-/// rather than assumed.
 fn detector_source() -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut paths = Vec::new();
@@ -74,8 +44,7 @@ fn detector_source() -> String {
     paths.sort();
     assert!(
         paths.len() >= 4,
-        "only {} module files under src/decode/, so the runtime and compiler-diag detectors \
-         are not being scanned: {paths:?}",
+        "only {} module files under src/decode/: {paths:?}",
         paths.len()
     );
     let mut src = String::new();
@@ -138,8 +107,7 @@ fn every_macro_a_code_decoder_reads_is_one_the_report_records() {
         consulted.len()
     );
     // Anchors: names that must be found, so a scan that silently stops matching one of
-    // the verbs fails here rather than passing on the others. The `cxx_stdlib` ladder is
-    // the one macro read the code decoders make, through `detect_cxx_assertions`.
+    // the verbs fails here rather than passing on the others.
     for anchor in [
         "_CXX_STDLIB",     // get
         "_LIBCPP_VERSION", // contains_key
@@ -165,19 +133,11 @@ fn every_macro_a_code_decoder_reads_is_one_the_report_records() {
 
     assert!(
         dropped.is_empty(),
-        "{} macro(s) are read by a detector and dropped from the evidence a report \
-         publishes, so those observations carry a verdict their own evidence cannot \
-         reproduce: {dropped:?}\nAdd them to `measure::MACRO_EVIDENCE_KEEP`.",
+        "{} macro(s) a detector reads are dropped: {dropped:?}; add them to MACRO_EVIDENCE_KEEP",
         dropped.len()
     );
 }
 
-/// The list a report publishes as its filter is the list the filter uses.
-///
-/// The filter was applied and recorded nowhere, so `evidence.macros` read as the macro
-/// state when it was a fixed subset of it. The report now carries the list; this holds
-/// the published copy to the one `relevant_macros` reads, in both directions, so the
-/// two cannot drift into a report that names one list and applies another.
 #[test]
 fn the_published_macro_filter_is_the_one_applied() {
     let published = chard::report::evidence_filters().macros;

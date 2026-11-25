@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier arith: parsers, protocol, no_alloc and crypto crates, where an overflow or a lossy cast is a bug.
+clippy.arithmetic_side_effects = "deny"
+clippy.as_conversions = "deny"

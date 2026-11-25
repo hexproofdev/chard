@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! `chard table` and `chard matrix` over arbitrary JSON: a report someone else hands you is
-//! an input chard renders (THREAT_MODEL.md, "Whoever hands you the report"), so a malformed
-//! one is refused or rendered, never a panic. The input is one report, or an array of them
-//! read as one dataset, which is what reaches the joins: the dataset identity and its
-//! conflicts, the contradiction check, `matrix::build` and its serialization, and
-//! `table::render_files` in both formats and both groupings. A single report is also
-//! rendered beside itself. `table` takes paths only, so each report is written to a file
-//! in the system temporary directory first and removed after.
-//!
-//! Two invariants hold for every input. Rendering is deterministic: the same files render
-//! to the same table, or the same refusal, twice, and `matrix::build` serializes the same
-//! twice, since a table is evidence a reader diffs across runs. And a table reads the
-//! report, not its bytes: the plain table of the reports as written compactly equals that
-//! of the same reports pretty-printed, and for a single report, that of the input's own
-//! bytes, since the JSON value is what a report states.
+//! an input chard renders (`THREAT_MODEL.md`, "Against whom, and under what assumptions"),
+//! so a malformed one is refused or rendered, never a panic. The input is one report, or an
+//! array of them read as one dataset, which is what reaches the joins; a single report is
+//! also rendered beside itself. `table` takes paths only, so each report goes through a
+//! temporary file.
 
 #![no_main]
 
@@ -25,7 +16,7 @@ use libfuzzer_sys::{fuzz_mutator, fuzz_target};
 mod json_mutator;
 
 fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
-    json_mutator::mutate(data, size, max_size, seed)
+    json_mutator::mutate(data, size, max_size, seed, &[])
 });
 use serde_json::Value;
 
@@ -62,6 +53,11 @@ fn plain(paths: &[PathBuf]) -> [String; 2] {
 }
 
 fuzz_target!(|data: &[u8]| {
+    #![expect(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+    )]
     let Ok(value) = serde_json::from_slice::<Value>(data) else {
         return;
     };
@@ -75,13 +71,13 @@ fuzz_target!(|data: &[u8]| {
         .enumerate()
         .map(|(i, r)| (format!("r{i}.json"), r.clone()))
         .collect();
-    if named.is_empty() {
+    let Some(one) = named.get(..1) else {
         return;
-    }
-    for set in [&named[..1], &named[..]] {
+    };
+    for set in [one, &named[..]] {
         let identity = chard::dataset::Identity::of(set);
-        let _ = identity.conflicts();
-        let _ = chard::dataset::self_contradicted(set);
+        let _: Vec<String> = identity.conflicts();
+        let _: Vec<chard::dataset::Finding> = chard::dataset::self_contradicted(set);
         let first = chard::matrix::build(set).map(|m| serde_json::to_string(&m));
         let second = chard::matrix::build(set).map(|m| serde_json::to_string(&m));
         match (first, second) {
@@ -140,7 +136,9 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
+    // A report file left behind is never read: every input writes each of its paths before
+    // it renders from them.
     for path in &paths {
-        let _ = std::fs::remove_file(path);
+        chard::error::best_effort(std::fs::remove_file(path));
     }
 });

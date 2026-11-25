@@ -1,82 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A fixed-pattern search over the code bytes of named functions in the artifact.
-//!
-//! Some flags leave no mark in a table the reader already walks: their only trace is an
-//! instruction the compiler put inside a function. `-fsanitize-trap=undefined` is the case
-//! that built this. A trap-mode sanitizer check compiles to a trap instruction where a
-//! handler-mode one compiles to a call to `__ubsan_handle_*`, so the observable is the
-//! trap's encoding in the function's bytes. The reader here finds those bytes and nothing
-//! more: it is not a disassembler, and it never decodes an instruction.
-//!
-//! # What is read
-//!
-//! [`SCANS`] names the functions, each a probe's own, and the patterns each is searched
-//! for; [`CODE_PATTERNS`] gives each pattern's encoding and the one machine it belongs to,
-//! so a function is searched for the patterns of its own list that belong to the object's
-//! machine and for no other. A function is located through `.symtab`: a defined
-//! `STT_FUNC` entry of that exact name with a nonzero `st_size`. Its bytes are
-//! `[st_value, st_value + st_size)` mapped through the section header its `st_shndx`
-//! names (section-relative in an `ET_REL`, a virtual address in a linked object), and the
-//! section must carry `SHF_EXECINSTR` and file bytes. Every step is bounded by the
-//! section's own declared extent and by the file, through `Cursor`. A function that is
-//! listed and cannot be read whole is recorded as [`ElfTable::Code`] `unread`, with the
-//! step that stopped it; one the file does not define is not recorded, since an absent
-//! function is a question with no referent here, and the predicate that reads these facts
-//! turns a missing function into `indeterminate` rather than a reading.
-//!
-//! Two facts come out, both lists so the predicate language reads them without a new
-//! term. `code_scanned` holds `<function>:<pattern>=<count>` for every pattern searched
-//! in every function read whole, zero counts included, so the list says what was fed and
-//! what was found; a function that is absent, or whose list holds no pattern of the
-//! object's machine, has no entry at all. `code_matches` holds `<function>:<pattern>@<offset>` for each match, the
-//! offset from the function's first byte in hex, at most [`MATCHES_KEPT`] per function
-//! and pattern; the count in `code_scanned` is the whole count.
-//!
-//! # Why a byte search over one known function is sound
-//!
-//! A search over instruction bytes without decoding has one way to be wrong: the sequence
-//! can occur inside another instruction, as part of an opcode, a `ModRM` byte, a
-//! displacement or an immediate, and a match there is not the instruction. Three things
-//! close that here, and the triple checks the result rather than the argument.
-//!
-//! - The function is chosen, not found. It is the probe's own, written so that its only
-//!   source of the sequence is the flag: `probes/ubsan_trap.c` holds a load through a
-//!   pointer of an indexed array element, a shift and a signed add, constructs the
-//!   sanitizer checks, no call, and no constant but the array's bound. gcc's cold part of
-//!   it, `<function>.cold`, is listed beside it, since gcc moves blocks it predicts are
-//!   not taken there, failed checks' traps among them.
-//! - The artifact is an object file (`LinkMode::Object`). Every reference to another
-//!   symbol is a relocation, and on `x86_64` and `aarch64` with `RELA` the field it patches
-//!   holds zero until the link, so no call target, address or displacement into data can
-//!   contribute bytes. What remains is the compiler's own encoding of the function and the
-//!   frame offsets it chose. That is checked, not assumed (`Elf::relocated_fields`): every
-//!   relocation into the function's extent is sized by type ([`relocated_field`]: whole
-//!   bytes on `x86_64`, the immediate's bits of the instruction word on `aarch64`, whose
-//!   opcode bits are never zero) and its field read, and a field holding anything but
-//!   zero, a type the table does not size, or a relocation section the walk cannot finish
-//!   or does not decode leaves the function unread on [`ElfTable::Code`], so no reading is
-//!   drawn from its bytes. The trigger is any such field in the function, not only one a
-//!   match overlaps: a nonzero field can hide a pattern as well as forge one, since
-//!   `x86-call-rel32` and `x86-call-got` match a call by its zero field. An `SHT_REL`
-//!   entry keeps its addend in the field and is read the same way.
-//! - On `aarch64` there is nothing to straddle. Every instruction is one 32-bit word at a
-//!   4-byte-aligned address, so a word compared at an aligned address is exactly one
-//!   instruction, and the pattern is a mask over that word. Instruction words are
-//!   little-endian on `aarch64` whatever the data byte order, and are read so.
-//!
-//! The negative control arm is what proves the sequence absent from the function where the
-//! flag is not in effect, on the toolchain being measured, and the positive arm that it
-//! appears where the flag is. A probe whose function carried the sequence for another
-//! reason reads present in both arms, and the triple publishes `probe-invalid`. What the
-//! triple cannot see is a profile flag that lays the sequence into another instruction of
-//! the function in the measured build alone; that would need a frame offset or an
-//! encoding containing it, and none of the measured profiles produced one (the counts are
-//! on `predicate::elf_static`'s `UBSAN_TRAP`).
-//!
-//! A linked artifact is read the same way, for the reader's own consistency, and no check
-//! reads one: there the relocated fields hold real addresses and the argument above does
-//! not hold.
 
 use super::{
     EM_AARCH64, EM_X86_64, ET_REL, Elf, ElfTable, SHF_INFO_LINK, SHN_UNDEF, SHT_CREL, SHT_NOBITS,
@@ -96,41 +20,19 @@ pub struct Scan {
 /// shape whichever probe built the object. A function is searched only for its own
 /// patterns, so no pattern meant for one probe's construct is read in another's code.
 pub const SCANS: &[Scan] = &[
-    // `probes/ubsan_trap.c`: a load through a pointer of an indexed array element, a
-    // shift and a signed add, the constructs the sanitizer checks, and no call.
+    // `probes/ubsan_trap.c`'s first function: constructs the sanitizer checks, and no call.
     Scan {
         function: "chard_ubsan_trap_probe",
         patterns: UBSAN_TRAP_PATTERNS,
     },
-    // gcc's cold part of the same function. At -O2 gcc splits the blocks it predicts are
-    // not taken, a failed check's trap among them, into a local function of this name in
-    // `.text.unlikely`, so a trap can sit here and nowhere in the function above. Measured
-    // 2026-10-02 with `readelf -s` and `objdump -d` over the probe's function under gcc
-    // 16.1.1 on Fedora 44 x86_64: a sized `STT_FUNC`, `LOCAL`, holding the only `ud2`
-    // under `-fsanitize=shift -fsanitize-trap=shift -O2` and one of two under
-    // `-fsanitize=undefined -fsanitize-trap=undefined -O2`; gcc 16.2.1 on Fedora 44
-    // aarch64 emitted no cold part for it. A build with no cold part leaves this entry
-    // unsearched, which is not a stop: the predicate keys its unsearched clause to the
-    // function above.
+    // gcc's cold part of the same function.
     Scan {
         function: "chard_ubsan_trap_probe.cold",
         patterns: UBSAN_TRAP_PATTERNS,
     },
     // `probes/ubsan_trap.c`'s second function, a construct for each sanitizer group the
-    // first does not exercise and the compilers instrument without a call (the list is on
-    // the probe), so a trap configuration covering only those groups is read rather than
-    // taken for no trap. Searched for its own list, which leaves out the
-    // two call patterns a byte search forges here: in this larger function a ModRM byte
-    // `ff` (`mov %edi,%edi`, `89 ff`) or the last byte of a frame offset (`-0x90(%rbp)`,
-    // `8d 70 ff ff ff`) followed by a shift through `%cl` (`d3`) reads as `x86-call-reg`.
-    // Measured 2026-10-07 with `chard elf` and `objdump -d` under gcc 16.1.1 at -O2
-    // flagless and clang 22.1.8 at -O0 under `-fsanitize=undefined
-    // -fsanitize-trap=undefined` on Fedora 44 x86_64, before the list left them out. With
-    // it, over 315 builds of the probe there (both compilers, -O0 to -Og, 22 to 24 flag
-    // sets each), every trap and call matched in the probe's four functions was an
-    // instruction `objdump -d` decodes, and the counts were equal; the second function's
-    // calls through a register (`-mcmodel=large` handlers, `-ftrap-function` there) are
-    // not read, and the first function's still are.
+    // first does not exercise and the compilers instrument without a call, so a trap
+    // configuration covering only those groups is read rather than taken for no trap.
     Scan {
         function: "chard_ubsan_trap_groups",
         patterns: UBSAN_GROUP_PATTERNS,
@@ -143,27 +45,8 @@ pub const SCANS: &[Scan] = &[
     },
     // `probes/ubsan_trap.c`'s third function: an indexed access to a global array of
     // known size, which gcc checks under `object-size` and clang under `local-bounds`,
-    // neither of which the first two functions give anything to check. The access is
-    // through a pointer to the element type, `((int *)cells)[i]`, which neither
-    // compiler's `bounds` checks (the cast hides the array type from the front end;
-    // `objdump -d` under both at -O0 and -O2) while
-    // the two groups above size the object and still do: as `cells[i]`, clang at -O2
-    // folded the `local-bounds` handler call beneath a `bounds` trap on the same access,
-    // and `-fsanitize-trap=bounds -fno-sanitize-trap=local-bounds` read `on` over a build
-    // with a group in handler mode. Searched for the trap patterns alone: gcc's
-    // `object-size` check subtracts the array's relocated address from the access, and
-    // the immediate's encoding depends on
-    // the register (`48 81 ea 00 00 00 00`, `sub $0,%rdx`, measured 2026-10-07 with
-    // `objdump -d` under gcc 16.1.1 -O2 on Fedora 44 x86_64; with `%r8` the same
-    // instruction is `49 81 e8 00 00 00 00`, whose last five bytes are `x86-call-rel32`).
-    // A call routed through `-ftrap-function` here is not read, and the first function's
-    // still is. Measured 2026-10-07 through chard on Fedora 44 x86_64 at -O0 and -O2: gcc
-    // 16.1.1 `ud2` under `-fsanitize=object-size -fsanitize-trap=object-size` and
-    // `__ubsan_handle_type_mismatch_v1` without the trap flag; clang 22.1.8 `ud1` with
-    // check number 3 under `-fsanitize=local-bounds` with or without
-    // `-fsanitize-trap=local-bounds` and `__ubsan_handle_local_out_of_bounds_abort` under
-    // `-fno-sanitize-trap=local-bounds`; no trap and no call flagless or under the
-    // `openssf-tldr` flags, either compiler.
+    // neither of which the first two functions give anything to check (the probe says why
+    // the access is through a pointer to the element type).
     Scan {
         function: "chard_ubsan_trap_sized",
         patterns: UBSAN_SIZED_PATTERNS,
@@ -172,18 +55,8 @@ pub const SCANS: &[Scan] = &[
         function: "chard_ubsan_trap_sized.cold",
         patterns: UBSAN_SIZED_PATTERNS,
     },
-    // `probes/ubsan_trap.c`'s fourth function, from the same date: a call through a
-    // function pointer, which clang checks under `function` and gcc has no group for.
-    // Searched for clang's trap alone, `ud1` on x86_64 and `brk #0x55NN` on aarch64: a
-    // function that calls through a pointer is where clang's `-fsanitize=kcfi` puts its
-    // own trap, `ud2` on x86_64 (measured 2026-10-07 with `objdump -d` under clang 22.1.8
-    // at -O0 and -O2 on Fedora 44 x86_64, with no undefined-behavior sanitizer) and `brk
-    // #0x82NN` on aarch64 (LLVM's encoding; unmeasured here), and neither is read. The
-    // call itself is through a register (`call *%rax` at -O0, `jmp *%rax` at -O2 under
-    // both compilers), which no pattern here matches. Measured 2026-10-07 through chard
-    // under clang 22.1.8 on Fedora 44 x86_64 at -O0 and -O2: `ud1` with check number 6
-    // under `-fsanitize=function -fsanitize-trap=function` and
-    // `__ubsan_handle_function_type_mismatch` without the trap flag.
+    // `probes/ubsan_trap.c`'s fourth function: a call through a function pointer, which
+    // clang checks under `function` and gcc has no group for.
     Scan {
         function: "chard_ubsan_trap_indirect",
         patterns: UBSAN_INDIRECT_PATTERNS,
@@ -201,11 +74,7 @@ pub const SCANS: &[Scan] = &[
     // clang's form of the same: glibc's `printf` wrapper for clang is variadic, so clang
     // keeps it out of line as a local function carrying its `pass_object_size` (level 2)
     // or `pass_dynamic_object_size` (level 3) attribute in its mangled name, and the flag
-    // is loaded there before `__vprintf_chk`. Measured 2026-10-02 with `nm` over the probe's
-    // object under clang 22.1.8 with glibc 2.43 on Fedora 44 x86_64 and aarch64, at -O1,
-    // -O2, -Os and -Oz. These are glibc's names rather than chard's, and a glibc that names
-    // the wrapper otherwise leaves its flag unsearched, which the predicate reads as
-    // `indeterminate` beside the `__vprintf_chk` reference.
+    // is loaded there before `__vprintf_chk`.
     Scan {
         function: "_ZL6printfPKcU17pass_object_size1z",
         patterns: FORTIFY_FLAG_PATTERNS,
@@ -327,20 +196,13 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
         shape: Shape::Bytes(&[0x0f, 0xb9]),
     },
     // `ud1 NN(%eax),%eax`, `0f b9 40 NN`: clang's trap with a nonzero check number in the
-    // 8-bit displacement. Check 0, signed overflow on an add, is `ud1 (%eax),%eax`, `0f b9
-    // 00`, with no displacement, and does not match; nor does a form clang was not measured
-    // to emit, which `x86-ud1` still counts. Measured 2026-10-02 with `objdump -d` under
-    // clang 22.1.8 on Fedora 44 x86_64 at -O0 and -O2: `0x12` for `bounds`, `0x13`
-    // `pointer-overflow`, `0x14` `shift` and `0x16` `null` and `alignment`, each trapped
-    // alone, and `00` under `-fsanitize-trap=signed-integer-overflow` and under `-ftrapv`
-    // with no sanitizer, whose traps are the same bytes.
+    // 8-bit displacement.
     CodePattern {
         name: "x86-ud1-check",
         machine: EM_X86_64,
         shape: Shape::Bytes(&[0x0f, 0xb9, 0x40]),
     },
-    // `brk #imm16`: `0xd4200000 | imm16 << 5`. The mask keeps the opcode bits and drops the
-    // immediate, since gcc and clang choose different ones.
+    // `brk #imm16`: `0xd4200000 | imm16 << 5`.
     CodePattern {
         name: "a64-brk",
         machine: EM_AARCH64,
@@ -352,7 +214,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
     // `brk` but for `brk #0x5500`: clang's immediate is `0x55NN` with the check number in
     // its low byte, and check 0 is signed overflow on an add, which clang's `-ftrapv`
     // emits with the same immediate (measured as `x86-ud1-check` is, on Fedora 44 aarch64,
-    // the same numbers in `NN`). gcc's `brk #0x3e8` carries no check number and matches.
+    // the same numbers in `NN`).
     CodePattern {
         name: "a64-brk-check",
         machine: EM_AARCH64,
@@ -363,14 +225,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
         },
     },
     // `brk #0x55NN` but for `#0x5500`: clang's trap for a failed sanitizer check with a
-    // nonzero check number and no other `brk`. The mask keeps the opcode bits and the
-    // immediate's high byte (word bits 20 to 13, `0x55` as `0xaa000`) and drops its low
-    // byte, so gcc's `brk #0x3e8` and kcfi's `brk #0x82NN` do not match, and `#0x5500`
-    // is left out as `a64-brk-check` leaves it. Searched in the function that calls
-    // through a pointer, where gcc has no check to emit and kcfi has one. The encoding is
-    // the one `a64-brk-check` was measured against (`#0x5514` and `#0x5516`, clang 22.1.8
-    // on Fedora 44 aarch64, 2026-10-02); the `function` check's `#0x5506` is the same
-    // encoding with its own number and is unmeasured on aarch64 here (2026-10-07).
+    // nonzero check number and no other `brk`.
     CodePattern {
         name: "a64-brk-clang-check",
         machine: EM_AARCH64,
@@ -382,8 +237,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
     },
     // `call rel32` with the field zero, `e8 00 00 00 00`: a call to another symbol in an
     // object, whose displacement is a relocation (`R_X86_64_PLT32` or `PC32`) that holds
-    // zero until the link. A call the assembler resolved inside the object has a nonzero
-    // field and is not matched; the probe's function makes none.
+    // zero until the link.
     CodePattern {
         name: "x86-call-rel32",
         machine: EM_X86_64,
@@ -397,12 +251,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
         shape: Shape::Bytes(&[0xff, 0x15, 0x00, 0x00, 0x00, 0x00]),
     },
     // `call *%reg`, `ff` and a `ModRM` byte `11 010 rrr`, `d0` to `d7`; behind a REX
-    // prefix (`41 ff d0`) the same two bytes name `%r8` to `%r15`. Under `-mcmodel=large`
-    // a call loads its target's 64-bit address and calls through the register, and the
-    // address is a relocation, so nothing in these bytes names the callee: measured
-    // 2026-10-02 under clang 22.1.8 `-ftrap-function=` with `-mcmodel=large` on Fedora 44
-    // x86_64, `movabs $0,%rax` and `call *%rax` at -O0 to -O3, -Os and -Oz, the argument's
-    // `mov` between the two from -O1, so the pair is not a pattern.
+    // prefix (`41 ff d0`) the same two bytes name `%r8` to `%r15`.
     CodePattern {
         name: "x86-call-reg",
         machine: EM_X86_64,
@@ -416,8 +265,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
         machine: EM_X86_64,
         shape: Shape::Bytes(&[0xff, 0x14]),
     },
-    // `bl imm26`: `0x94000000 | imm26`. The mask keeps the opcode and drops the offset, so
-    // a call is matched whether or not a relocation left its field zero.
+    // `bl imm26`: `0x94000000 | imm26`.
     CodePattern {
         name: "a64-bl",
         machine: EM_AARCH64,
@@ -426,10 +274,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
             value: 0x9400_0000,
         },
     },
-    // `blr xN`: `0xd63f0000 | n << 5`. A call through a register, which is how a call
-    // through the GOT ends under `-fno-plt` on aarch64 (`adrp`, `ldr`, `blr`); measured
-    // 2026-10-02 under clang 22.1.8 `-ftrap-function=` with `-fno-plt -fPIC` on Fedora 44
-    // aarch64, where the function held no `bl`.
+    // `blr xN`: `0xd63f0000 | n << 5`.
     CodePattern {
         name: "a64-blr",
         machine: EM_AARCH64,
@@ -449,8 +294,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
         machine: EM_X86_64,
         shape: Shape::Bytes(&[0xbf, 0x02, 0x00, 0x00, 0x00]),
     },
-    // `push $imm8`, `6a NN`: the same argument at -Oz, popped into `%rdi` later. The pop is
-    // not part of the pattern, since gcc puts other moves between the two.
+    // `push $imm8`, `6a NN`: the same argument at -Oz, popped into `%rdi` later.
     CodePattern {
         name: "x86-push-1",
         machine: EM_X86_64,
@@ -462,7 +306,6 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
         shape: Shape::Bytes(&[0x6a, 0x02]),
     },
     // `mov w0, #N`, the `movz` alias with no shift: `0x52800000 | N << 5`, register `w0`.
-    // Whole-word equality: the register is part of the claim.
     CodePattern {
         name: "a64-mov-w0-1",
         machine: EM_AARCH64,
@@ -486,7 +329,7 @@ pub const CODE_PATTERNS: &[CodePattern] = &[
 /// function holds a handful.
 pub const MATCHES_KEPT: usize = 64;
 
-/// What a relocation type patches in an object's code, for [`Elf::relocated_fields`].
+/// What a relocation type patches in an object's code, for `Elf::relocated_fields`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     /// Nothing: a marker the linker reads to choose a sequence and writes no value
@@ -504,8 +347,8 @@ pub enum Field {
 /// does not size: one an object should not carry (the dynamic linker's, `COPY`,
 /// `GLOB_DAT`, `JUMP_SLOT`, `RELATIVE` and the like) or one added after this table (the
 /// x86_64 `CODE_4_*` to `CODE_6_*` forms of APX). Widths are the x86-64 psABI's and masks
-/// the immediates of the `AArch64` ELF ABI's instruction classes; every number is held to
-/// its `elf/reloc_names.rs` name by a test, so a misnumbered row fails there.
+/// the immediates of the `AArch64` ELF ABI's instruction classes, each held to its
+/// `elf/reloc_names.rs` name by `every_sized_relocation_type_is_sized_by_its_name`.
 #[must_use]
 pub fn relocated_field(machine: u16, kind: u32) -> Option<Field> {
     // AArch64 immediates: `movz`/`movk`/`movn` imm16, `adr`/`adrp` immlo and immhi, a
@@ -685,11 +528,7 @@ impl Elf<'_> {
                 more => {
                     trunc.push(Truncation::unread(
                         ElfTable::Code,
-                        format!(
-                            "{name}: {} defined functions carry the name, so which one is \
-                             the probe's cannot be told and none was read",
-                            more.len()
-                        ),
+                        format!("{name}: {} defined functions carry the name", more.len()),
                     ));
                     continue;
                 }
@@ -704,6 +543,16 @@ impl Elf<'_> {
                 continue;
             }
             for pattern in &patterns {
+                // Each search is charged the bytes it reads: every function `SCANS` names may
+                // be defined over the same bytes, and each is searched once per pattern.
+                let units = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if let Err(spent) = self.budget.spend(units) {
+                    trunc.push(Truncation::unread(
+                        ElfTable::Code,
+                        format!("{name}: {} was not searched: {spent}", pattern.name),
+                    ));
+                    break;
+                }
                 let at = find(pattern, bytes, definition.value);
                 scanned.push(format!("{name}:{}={}", pattern.name, at.len()));
                 matches.extend(
@@ -718,14 +567,6 @@ impl Elf<'_> {
 
     /// Every defined `STT_FUNC` in `.symtab` whose name a [`SCANS`] entry names, and
     /// the entry this walk could not read, if it met one.
-    ///
-    /// A walk of its own rather than `symbols`', which keeps a name and a definedness and
-    /// nothing else. Where it stops for a reason `symbols` meets over the same bounds (a
-    /// table below one entry, a string table that cannot be held, a name offset past its
-    /// table) the stop is recorded there, against [`ElfTable::Symbols`], which the check
-    /// that reads these facts declares, and is not recorded twice. This walk alone reads an
-    /// entry's `st_info`, `st_value` and `st_size`, so an entry whose bytes end before
-    /// those is a stop only it meets, and that one is returned for `code_scan` to record.
     fn function_definitions(&self) -> (Vec<(&'static str, Definition)>, Option<String>) {
         let mut out = Vec::new();
         let mut recorded_by_symbols = Vec::new();
@@ -743,6 +584,17 @@ impl Elf<'_> {
                 return (out, None);
             };
             for i in 0..count {
+                // A spent budget forgets the definitions found, so every function the walk
+                // looks for reads as not found before it stopped, and is recorded so: one
+                // found before the stop could have a second definition after it.
+                if let Err(spent) = self.step() {
+                    return (
+                        Vec::new(),
+                        Some(format!(
+                            "{table} not read past symbol {i} of {count}: {spent}"
+                        )),
+                    );
+                }
                 let base = sh.sh_offset.saturating_add(i.saturating_mul(step));
                 let (name_off, info, shndx, value, size) = match self.symbol_entry(base) {
                     Ok(entry) => entry,
@@ -761,7 +613,21 @@ impl Elf<'_> {
                 if info & 0xf != STT_FUNC || shndx == SHN_UNDEF {
                     continue;
                 }
-                let name = self.cur.cstr_at(strtab.sh_offset, name_off, strtab.sh_size);
+                // A name not read, past the bound on one name or the budget, stops the walk
+                // as a spent budget does: the definitions found are forgotten and every
+                // function looked for is recorded as not found before the stop, whatever
+                // `symbols` records over the same entry.
+                let name = match self.name_at(strtab.sh_offset, name_off, strtab.sh_size) {
+                    Ok(name) => name,
+                    Err(fault) => {
+                        return (
+                            Vec::new(),
+                            Some(format!(
+                                "{table}: the name of symbol {i} of {count} was not read: {fault}"
+                            )),
+                        );
+                    }
+                };
                 if let Some(known) = SCANS.iter().find(|scan| scan.function == name) {
                     out.push((known.function, Definition { value, size, shndx }));
                 }
@@ -856,24 +722,11 @@ impl Elf<'_> {
 
     /// Every field a relocation patches within an object's function, checked to hold
     /// zero, or why the function's bytes cannot be taken as the compiler's own encoding.
-    ///
-    /// Called after [`Self::function_bytes`] has read the definition whole, so its section
-    /// index and extent are known good. Every `SHT_RELA` and `SHT_REL` section whose
-    /// `sh_info` names the function's section is walked to its end; a relocation whose
-    /// field overlaps `[st_value, st_value + st_size)` is sized by [`relocated_field`]
-    /// and its bytes read. Any field holding a nonzero value, any type the table does not
-    /// size, any field running past the section, any relocation section the walk cannot
-    /// finish, and a section relocating the function in an encoding not decoded
-    /// (`SHT_CREL`, or another type carrying `SHF_INFO_LINK`) is a stop. An `SHT_REL`
-    /// entry keeps its addend in the field, so it is read like any other and stops where
-    /// the addend is nonzero. Each section is walked in records (`Elf::section_stride`), and
-    /// a declared `sh_entsize` that differs is recorded in `trunc`, equal to the record the
-    /// walks of the same section in `elf.rs` write, which the facts keep once.
     fn relocated_fields(
         &self,
         def: &Definition,
         trunc: &mut Vec<Truncation>,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<(), String> {
         let start = def.value;
         let end = def.value.saturating_add(def.size);
         let Some(section) = self.shdrs.get(usize::from(def.shndx)) else {
@@ -892,8 +745,7 @@ impl Elf<'_> {
                 SHT_REL => false,
                 kind if kind == SHT_CREL || sh.sh_flags & SHF_INFO_LINK != 0 => {
                     return Err(format!(
-                        "{label} relocates its section in an encoding the reader does not \
-                         decode (type {kind:#x}), so no relocated field was checked"
+                        "{label} relocates its section in an encoding the reader does not decode (type {kind:#x})"
                     ));
                 }
                 _ => continue,
@@ -901,14 +753,16 @@ impl Elf<'_> {
             let step = self.section_stride(idx, sh, relocation_record(self.elf64, rela), trunc);
             if sh.sh_size % step != 0 {
                 return Err(format!(
-                    "{label}'s sh_size {:#x} is not a whole number of {step}-byte entries, \
-                     so its relocated fields were not all checked",
+                    "{label}'s sh_size {:#x} is not a whole number of {step}-byte entries",
                     sh.sh_size
                 ));
             }
             let count = sh.sh_size / step;
             let step = step.get();
             for i in 0..count {
+                self.step().map_err(|spent| {
+                    format!("{label} was not read past entry {i} of {count}: {spent}")
+                })?;
                 let base = sh.sh_offset.saturating_add(i.saturating_mul(step));
                 let entry = if self.elf64 {
                     self.cur
@@ -922,10 +776,7 @@ impl Elf<'_> {
                     })
                 };
                 let Ok((offset, kind)) = entry else {
-                    return Err(format!(
-                        "{label} is unreadable at entry {i} of {count}, so its relocated \
-                         fields were not all checked"
-                    ));
+                    return Err(format!("{label} is unreadable at entry {i} of {count}"));
                 };
                 let kind = u32::try_from(kind).unwrap_or(u32::MAX);
                 self.relocated_field_is_zero(section, offset, kind, (start, end))
@@ -943,14 +794,10 @@ impl Elf<'_> {
         offset: u64,
         kind: u32,
         (start, end): (u64, u64),
-    ) -> std::result::Result<(), String> {
+    ) -> Result<(), String> {
         let name = reloc_type_name(self.e_machine, kind);
-        let field = relocated_field(self.e_machine, kind).ok_or_else(|| {
-            format!(
-                "{name}, whose field the reader does not size, so whether it patches the \
-                 function was not checked"
-            )
-        })?;
+        let field = relocated_field(self.e_machine, kind)
+            .ok_or_else(|| format!("{name}, whose field the reader does not size"))?;
         let width = match field {
             Field::Marker => return Ok(()),
             Field::Bytes(width) => width,
@@ -987,9 +834,7 @@ impl Elf<'_> {
             .map(|nibble| char::from(HEX.get(usize::from(nibble)).copied().unwrap_or(b'?')))
             .collect();
         Err(format!(
-            "{name} at {offset:#x} patches a field holding {held} (an addend or a value the \
-             assembler wrote), so bytes the relocation will replace are not the compiler's own \
-             encoding and were not searched"
+            "{name} at {offset:#x} patches a field holding {held}"
         ))
     }
 }
@@ -1096,9 +941,6 @@ mod tests {
         assert_eq!(find(other, &code, 0), vec![0, 8]);
     }
 
-    /// `a64-brk-clang-check` reads clang's `brk #0x55NN` with a nonzero number and nothing
-    /// else: not check 0, not gcc's `#0x3e8`, and not kcfi's `#0x82NN`, which is why the
-    /// function that calls through a pointer is searched for it rather than `a64-brk-check`.
     #[test]
     fn the_clang_check_pattern_leaves_out_every_brk_but_clangs_numbered_ones() {
         let clang = pattern("a64-brk-clang-check");
@@ -1211,7 +1053,7 @@ mod tests {
         (facts.code_scanned, unread)
     }
 
-    /// x86_64 `R_X86_64_PC32`, `R_X86_64_PLT32` and `R_X86_64_GOTPCRELX`.
+    /// x86_64 `R_X86_64_PC32` and `R_X86_64_PLT32`.
     const PC32: u32 = 2;
     const PLT32: u32 = 4;
 
@@ -1228,10 +1070,6 @@ mod tests {
         assert!(scanned.contains(&"chard_ubsan_trap_probe:x86-call-rel32=1".to_owned()));
     }
 
-    /// A field holding a value the relocation will replace is not the compiler's encoding:
-    /// here the bytes of `ud2`, which a search over the function would have counted as a
-    /// trap, and a call's nonzero field, which would have hidden the call. Each leaves the
-    /// function unread, so no reading is drawn from its bytes.
     #[test]
     fn a_nonzero_relocated_field_leaves_the_function_unread() {
         let trap_in_field = [0xe8, 0x0f, 0x0b, 0, 0, 0xc3];
@@ -1260,12 +1098,6 @@ mod tests {
         assert!(scanned.is_empty() && unread.len() == 1, "{unread:?}");
     }
 
-    /// A relocation section is walked in records whatever its `sh_entsize` says
-    /// (2026-10-20). Two `R_X86_64_PC32` entries, the first over a zero field and the second
-    /// over the bytes of `ud2`: at the honest 24 the second stops the function. Walked at a
-    /// declared 48, as the reader did before, only the first was read, and the trap in the
-    /// second's field was counted as the compiler's `ud2`, a proof from bytes the linker
-    /// overwrites.
     #[test]
     fn a_relocation_section_is_walked_in_records_whatever_its_entsize() {
         let code = [0xe8, 0, 0, 0, 0, 0xe8, 0x0f, 0x0b, 0, 0, 0xc3];
@@ -1299,7 +1131,6 @@ mod tests {
         );
     }
 
-    /// `SHT_REL` keeps the addend in the field, so a call's `-4` is read there and stops.
     #[test]
     fn a_rel_entrys_addend_is_read_in_its_field() {
         let code = [0xe8, 0xfc, 0xff, 0xff, 0xff, 0xc3];
@@ -1311,8 +1142,6 @@ mod tests {
         assert!(unread.is_empty() && !scanned.is_empty(), "{unread:?}");
     }
 
-    /// A type the table does not size stops the function, and so does an encoding the
-    /// reader does not decode; a nonzero field outside the function's extent does not.
     #[test]
     fn an_unsized_type_or_undecoded_encoding_stops_and_a_field_outside_does_not() {
         let code = [0x0f, 0x0b, 0xc3, 0, 0xff, 0xff, 0xff, 0xff];
@@ -1337,8 +1166,6 @@ mod tests {
         assert!(scanned.contains(&"chard_ubsan_trap_probe:x86-ud2=1".to_owned()));
     }
 
-    /// On aarch64 the field is an immediate inside the instruction word: `bl` with a zero
-    /// `imm26` and `adrp` with a zero immediate are searched, a `bl` with an offset is not.
     #[test]
     fn an_aarch64_field_is_the_immediate_not_the_word() {
         let words = |ws: &[u32]| ws.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
@@ -1362,11 +1189,6 @@ mod tests {
         );
     }
 
-    /// Through `ubsan-trap-mode`'s decoder: a function whose only trap-like bytes are a
-    /// relocated field's reads neither `present` nor `absent`. With the field zero the
-    /// same function, a real `ud2` beside the call, reads `present`; with the trap's bytes
-    /// in the field it is withheld through the check's declared `code` table, where before
-    /// this reader the bytes read as a trap.
     #[test]
     fn a_trap_in_a_relocated_field_withholds_ubsan_trap_mode() {
         let decode = |code: &[u8], at: u64| {
@@ -1404,8 +1226,6 @@ mod tests {
         );
     }
 
-    /// Every type the field table sizes is one `elf/reloc_names.rs` names, and the size
-    /// follows the name: a number copied wrong reads as the wrong class here.
     #[test]
     fn every_sized_relocation_type_is_sized_by_its_name() {
         const MOVW: Field = Field::Word(0x001f_ffe0);

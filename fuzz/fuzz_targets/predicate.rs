@@ -2,26 +2,9 @@
 //! The predicate language over arbitrary JSON. The input is one vector, `{"predicate": ...,
 //! "facts": ...}`, or a file of them under `vectors`, so `schema/chard-predicate-vectors.json`
 //! seeds it as it stands. A predicate that deserializes is validated, and one that validates
-//! is evaluated over the facts beside it through the Published view a report is read with;
-//! each evaluation that concludes is rendered as the `observed` sentence a report carries.
-//! The Live view a measurement reads with evaluates the sources that read as typed facts
-//! (`ElfFacts`, a macro map), and renders what concludes. None of it panics.
-//!
-//! Where every source the input carries reads as typed facts, the evaluator's two promises
-//! are held over them as `tests/predicate_language.rs`'s property test holds them
-//! over generated facts, with that test's construction of a publication:
-//!
-//! - the facts serialized as a report publishes them (`truncations` written out, the macro
-//!   map untrimmed, this chard's watch list) evaluate to exactly what the Live view
-//!   evaluated to, a conclusion or the `Incomplete` key it stopped at;
-//! - where the Live view concludes, the macro map trimmed to its own names and the names
-//!   the evaluation read concludes the same; a publication with no watch list stops at
-//!   `symbols_filter` exactly when a symbol was read and is otherwise unchanged; and
-//!   removing any one key the evaluation read makes the evaluation stop at that key;
-//! - where the input's own publication (its filter and watch list as given) and the Live
-//!   view both conclude, they state the same clause, outcome and level. The input's own
-//!   publication may stop where the Live view concludes: that is the `Incomplete` the
-//!   language requires of a publication that lacks a key, not a disagreement.
+//! is evaluated over the facts beside it through the Published view a report is read with,
+//! and through the Live view a measurement reads with over the sources that read as typed
+//! facts (`ElfFacts`, a macro map). What concludes is rendered. None of it panics.
 
 #![no_main]
 
@@ -35,7 +18,7 @@ use libfuzzer_sys::{fuzz_mutator, fuzz_target};
 mod json_mutator;
 
 fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
-    json_mutator::mutate(data, size, max_size, seed)
+    json_mutator::mutate(data, size, max_size, seed, &[])
 });
 use serde_json::Value;
 
@@ -54,6 +37,10 @@ fn watch_list() -> Vec<String> {
 /// `ElfFacts` as a re-evaluated publication carries them: `truncations` written out even
 /// when empty, since `ElfFacts`' own serializer omits the empty list and the Published view
 /// reads an absent one as `Incomplete`.
+#[expect(
+    clippy::expect_used,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn publish_elf(facts: &ElfFacts) -> Value {
     let mut json = serde_json::to_value(facts).expect("ElfFacts serializes");
     json.as_object_mut()
@@ -64,6 +51,10 @@ fn publish_elf(facts: &ElfFacts) -> Value {
 }
 
 /// A macro publication trimmed to the map's names and every name `live` read, less `drop`.
+#[expect(
+    clippy::expect_used,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn published_macros(
     map: &BTreeMap<String, String>,
     live: &Evaluation,
@@ -72,7 +63,7 @@ fn published_macros(
     let mut filter: BTreeSet<String> = map.keys().cloned().collect();
     for read in &live.reads {
         if let ReadKey::Macro(name) = &read.key {
-            filter.insert(name.clone());
+            filter.insert(name.as_str().to_owned());
         }
     }
     let mut object = serde_json::to_value(map).expect("a string map serializes");
@@ -96,6 +87,10 @@ fn stated(eval: &Evaluation) -> (&str, &str, Option<&str>) {
 }
 
 /// The Live view against publications of the same facts (module documentation).
+#[expect(
+    clippy::expect_used,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn hold_live_to_published(
     p: &Predicate,
     macros: Option<&BTreeMap<String, String>>,
@@ -168,7 +163,7 @@ fn hold_live_to_published(
         let key = read.key.published_key();
         let (macro_pub, elf_pub) = match &read.key {
             ReadKey::Macro(name) => (
-                macros.map(|m| published_macros(m, &live, Some(name))),
+                macros.map(|m| published_macros(m, &live, Some(name.as_str()))),
                 elf_json.clone(),
             ),
             ReadKey::Elf(_) | ReadKey::Symbol(_) | ReadKey::SymbolNames | ReadKey::Truncations => {
@@ -218,7 +213,7 @@ fn one(vector: &Value) {
     if let Ok(view) = Published::new(macros, filter.as_deref(), elf, watch.as_deref())
         && let Ok(eval) = predicate::evaluate(&p, &view)
     {
-        let _ = predicate::render_observed(&p, &eval);
+        drop(predicate::render_observed(&p, &eval));
         own = Some(eval);
     }
     // The Live view reads each source that types and reads one that does not as absent, so
@@ -233,11 +228,10 @@ fn one(vector: &Value) {
         elf: elf_ok,
     };
     if let Ok(eval) = predicate::evaluate(&p, &live) {
-        let _ = predicate::render_observed(&p, &eval);
+        drop(predicate::render_observed(&p, &eval));
     }
-    // A source the input carries that the typed facts cannot read has no Live view to hold a
-    // publication to: reading it as absent would compare a publication against facts it does
-    // not hold.
+    // A source the typed facts cannot read leaves no Live view to hold a publication to:
+    // reading it as absent would compare a publication against facts it does not hold.
     if matches!(typed_elf, Some(Err(_))) || matches!(typed_macros, Some(Err(_))) {
         return;
     }

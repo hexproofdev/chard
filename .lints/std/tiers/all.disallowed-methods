@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: BSD-3-Clause
+{ path = "std::thread::sleep", reason = "a timed wait flakes in tests and blocks an executor; wait on the condition, use the runtime's sleep, or #[expect] with a reason" },

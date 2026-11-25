@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: BSD-3-Clause
+{ path = "std::fs::read", reason = "blocking file I/O in async code; use spawn_blocking" },
+{ path = "std::fs::read_to_string", reason = "blocking file I/O in async code; use spawn_blocking" },
+{ path = "std::fs::write", reason = "blocking file I/O in async code; use spawn_blocking" },

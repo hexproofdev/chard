@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A reader that closes the pipe has left, and chard keeps its exit status.
-//!
-//! `chard probes | head -1` panicked with "failed printing to stdout: Broken pipe" and
-//! exited 101: Rust ignores `SIGPIPE`, so the write returns `EPIPE` where a C program
-//! would have been killed, and `println!` panics on it. Each case here hands chard a pipe
-//! whose read end is already closed, so every write chard makes is refused with `EPIPE`
-//! and the result does not depend on how much chard prints or on when a reader stops.
-//! The case runs the same invocation with a reader first, and asserts that it printed
-//! something, then that the closed pipe kept its exit status (`0`, `1` and `2` each appear;
-//! `3` is `measure`'s own contradiction, which no run reaches short of a defect in chard, and
-//! its envelope goes through the writer `error::emit`'s does) and its stderr byte for byte. Each of the six subcommands is held here, and each
-//! writes its output through `write_stdout` in `src/main.rs`, and an error's envelope
-//! through `error::emit`; one failing `elf` holds the second path. A stdout that refuses
-//! for any other reason (`/dev/full`) is a failure, exit `2`, and the envelope it could not
-//! take goes to stderr: held for `probes`, a failing `elf`, `measure`, `table` and `matrix`.
-//! Where this system has no `/dev/full` that half is a capability gap, announced.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -23,14 +21,7 @@ use std::process::{Command, Output, Stdio};
 
 mod common;
 
-fn chard_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("chard")
-}
+use common::chard_binary;
 
 fn ready(verifies: &str) -> bool {
     common::require_binary(&chard_binary(), verifies)
@@ -169,8 +160,6 @@ fn detect_into_a_closed_pipe_exits_zero() {
     );
 }
 
-/// The envelope's path: a failing `elf` into a closed pipe keeps its `2`. `error::emit` reads
-/// its write's result, and this test holds that path.
 #[test]
 fn a_failure_into_a_closed_pipe_keeps_its_exit_status() {
     if !ready("that a failure into a closed pipe keeps exit 2") {
@@ -185,12 +174,6 @@ fn a_failure_into_a_closed_pipe_keeps_its_exit_status() {
     );
 }
 
-/// `measure` publishes its report on stdout last, and `table`, `matrix` and `detect`
-/// read one back: each is held against one measurement, into a closed pipe and into
-/// `/dev/full`. The measurement also carries both gates' `1` into the closed pipe: the
-/// coverage gate's, from a run narrowed by `--probe` (the gate counts the whole corpus, so it
-/// fails on any host), and `detect`'s, from the report with one published verdict turned
-/// over.
 #[test]
 fn measure_table_matrix_and_detect_into_a_closed_pipe_keep_their_status() {
     let verifies = "that `chard measure`, `table`, `matrix` and `detect` into `head` exit quietly";
@@ -200,13 +183,7 @@ fn measure_table_matrix_and_detect_into_a_closed_pipe_keep_their_status() {
     let work = common::Work::new("closedpipe", "measure");
     let workdir = work.path("wd");
     let report = work.path("report.json");
-    // `-o -`: the report is the stdout the pipe closes on; by default it goes to a file. Two
-    // probes, not the corpus: the pipe's read end is closed before chard starts, so its first
-    // write fails whatever the report's size; and the replay below needs an elf-static check
-    // reading on or off, which link-defaults' `pie` and `relro` do on every ELF host where
-    // stack-canary's `canary-emitted` can withhold (OpenBSD's clang, RETGUARD). The whole
-    // corpus here was four full measurements, 71 s of the suite; a full-corpus
-    // report and its exit 0 are error_classes' to hold.
+    // `-o -`: the report is the stdout the pipe closes on; by default it goes to a file.
     let measure = [
         OsStr::new("measure"),
         OsStr::new("-o"),
@@ -281,9 +258,6 @@ fn measure_table_matrix_and_detect_into_a_closed_pipe_keep_their_status() {
     );
 }
 
-/// A stdout that refuses for another reason is not a reader leaving: the run fails and
-/// the envelope it could not print reaches stderr. `print_json`'s path here, a failing
-/// command's own envelope under `elf`, and the direct writes beside the measurement above.
 #[test]
 fn a_full_stdout_fails_with_the_envelope_on_stderr() {
     if !ready("that a stdout refusing with ENOSPC fails the run") {

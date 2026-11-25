@@ -4,116 +4,23 @@
 //! compile programs it runs, the header search directories, system root and forced
 //! includes it hands them, the macros it defines or undefines, and the defaults it
 //! removes.
-//!
-//! [`crate::link_inputs`] compares what a gcc `-specs=` or clang `--config=` file chooses
-//! for the link. The same two files reach the compile, and the control arms do not carry
-//! them there either (`measure::arm_flags`): a specs `*cpp`, `*cpp_options` or `*cc1`
-//! can add `-isystem`, `-include`, `-D` or `-U`, and a configuration file's
-//! `--gcc-install-dir=` chooses the C++ library's `include/c++` as well as the startup
-//! objects. Where one does, the measured build reads other headers or other predefined
-//! macros than every arm, and the triple validates a detector on a compile the measured
-//! build did not make. Measured on 2026-10-07 on Fedora 44 x86_64 (gcc 16.1.1, clang
-//! 22.1.8, glibc 2.43), `--profile explicit` against the same flags without
-//! the file:
-//!
-//! - gcc, `-O2 -D_FORTIFY_SOURCE=3` and a specs file whose `*cpp` adds `-isystem` a
-//!   directory holding a copy of glibc's `features.h` that declines fortification:
-//!   `fortify-effective`, `fortify-printf-flag` and the four fortify runtime checks read
-//!   `off` from `on`, over arms that read the host's `features.h`;
-//! - gcc, `-O2 -fhardened` and a specs file whose `*cpp` adds `-D_FORTIFY_SOURCE=0`:
-//!   `fortify-requested` read `off` from `on` with the six above, a macro the profile's
-//!   flags never defined, so `macro-supplied-by-profile` could not see it;
-//! - clang, `-O2 -D_GLIBCXX_ASSERTIONS` and `--config=` a file holding
-//!   `--gcc-install-dir=` a copy of the gcc install whose `include/c++` `c++config.h`
-//!   leaves `_GLIBCXX_VERBOSE_ASSERT` undefined, as a libstdc++ configured without
-//!   verbose assertions does: `cxx-assertions-symbol` read `off` from `on` while the
-//!   measured program aborted on the out-of-range subscript (its assertions fail through
-//!   `__builtin_abort`, naming no symbol), and `cxx-stdlib-assertions` read
-//!   `indeterminate`.
-//!
-//! So chard asks the driver, for the measured build's flags and for the arms' selection,
-//! what it would hand the compile, and compares. `measure` withholds the checks whose
-//! observable the headers or the predefined macros decide
-//! (`report::COMPILE_INPUT_READINGS`) under `compile-inputs-unmatched-by-arms` where the
-//! two listings differ, or where either could not be read.
-//!
-//! The listing is taken over an empty input of the probe's language with `-c` and
-//! `-no-integrated-cpp`, so gcc names two `cc1` commands, the preprocessor's (`*cpp` and
-//! `*cpp_options`, the step chard's `-dM -E` macro dump runs) and the compiler's
-//! (`*cc1_options`, which the integrated build runs beside `*cpp`'s), and each is read;
-//! clang names its `-cc1` for each step, carrying the configuration file's words. A specs
-//! `*cpp_options` reaches the `-E` step alone: under `-O2 -D_FORTIFY_SOURCE=3` and a
-//! `*cpp_options` adding `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0`, gcc 16.1.1's `-dM -E`
-//! read level `0` and its compiled probe level `3`.
-//!
-//! The arms' listing is taken under the arms' selection (`measure::stand_in_selection`: the
-//! clean build's target and runtime selection, [`crate::measure::clean_flags`], and the
-//! header selection the arms carry and the clean build does not, the profile's own `-I`,
-//! `-isystem`, `-idirafter`, `-iquote`, `-include`, `-imacros`, `-undef` and `-pthread`,
-//! `toolchain::header_selecting_flags`), the profile's own optimisation
-//! words ([`optimization_words`]) and its own `-D` and `-U` words ([`macro_words`]). The
-//! macro words are how a profile asks for a macro-decided property, the positive and
-//! negative controls set it for themselves, and `macro-supplied-by-profile` reads them;
-//! what is left to differ is what reached the compile by another way. Fedora's
-//! `%build_cflags`, whose `-Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3` and
-//! `-Wp,-D_GLIBCXX_ASSERTIONS` the arms' listing takes in that way, and whose
-//! `redhat-hardened-cc1` adds `-fPIE`, a hardening flag and not a header or a macro
-//! operation, names the arms' headers and macros, and so does the clang toolchain's
-//! `redhat-hardened-clang.cfg`.
-//!
-//! The optimisation words are carried because a driver can add
-//! a macro operation by itself under an optimisation level. Ubuntu's gcc does: its specs
-//! hold `%{!O0:%{O*:%{!D_FORTIFY_SOURCE=*:%{!U_FORTIFY_SOURCE:-D_FORTIFY_SOURCE=3}}}}`, so
-//! every compile under an `-O` word other than a last `-O0` whose line names no
-//! `-D_FORTIFY_SOURCE=` or `-U_FORTIFY_SOURCE` (a `-Wp,` spelling of either is not seen,
-//! and the driver's `=3` goes beside it) carries the macro on both `cc1` commands, and
-//! nothing else in the listing moves with the level (Ubuntu 24.04 gcc 13.3.0 and 26.04 gcc
-//! 15.2.0, C and C++, every level from `-O1` to `-Ofast`, x86_64, 2026-10-15). What a
-//! driver adds that way is the toolchain's default at that level, which the
-//! `bare-optimized` profile exists to read. To a stand-in with no `-O` the driver adds
-//! nothing, and the difference withholds 17 checks per cell under `bare-optimized` on both
-//! Ubuntu releases, each over a triple that discriminates (positive present, negative
-//! absent): measured on 2026-10-15 in an Ubuntu 26.04 container, and in a fleet sweep of
-//! 2026-10-09 in the Ubuntu 24.04 and 26.04 guests, x86_64. (Ubuntu 20.04 and 22.04 set
-//! `_FORTIFY_SOURCE=2` inside `cc1` instead, which no listing shows, and are not withheld.)
-//!
-//! The arms do not all carry the profile's optimisation words, though: the fortify
-//! controls carry their own `-O2`, `optimization-enabled`'s negative `-O0`, and nine
-//! checks' controls none, so a stand-in at the profile's level speaks for an arm at
-//! another level only where the driver changes nothing with the level that the arm would
-//! read. `measure::unmatched_compile_inputs` therefore takes one more listing per class of
-//! optimisation words the probe's listed checks' arms carry and compares it with the
-//! stand-in ([`differences`], by kind): a difference in programs, header options, removed
-//! defaults or targets, or in a macro operation naming a macro no control arm of the
-//! corpus sets, withholds the checks of that class, since what the driver added with the
-//! level reached the measured compile and not those arms; a difference only in macro
-//! operations the controls set themselves (`_FORTIFY_SOURCE`, `_GLIBCXX_ASSERTIONS` and
-//! kin, [`macro_name`]) is admitted, which is what publishes Ubuntu's 17. That such a
-//! request macro decides no observable of a check whose arms do not set it is the register
-//! entry `optimization-level-defaults-decide-only-their-own-checks`, with the measurement
-//! it rests on. A file the profile names (`-specs=`, `--config=`) is still not carried, so
-//! a macro such a file adds under the same `-O` still differs; a `specs` in a prefix the
-//! profile selects (`-B`), which the arms carry, is answered by the class comparison like
-//! the driver's own. `tests/fake_driver.rs` holds the shapes: the driver's own macro
-//! read, the named file's withheld, a header the driver adds at the profile's level alone
-//! withheld for the arms at another, and a macro no control sets withheld for the arms
-//! that carry no `-O`.
-//!
-//! The compile's target is read with them (clang's `-triple`, gcc's `-m32` and kin), since
-//! it decides the architecture's predefined macros. Absolute paths compare after
-//! `fs::canonicalize` ([`crate::link_inputs`]'s rule), and any other path as written. The resolution
-//! rests on the assumption `driver-listing-names-the-compile-inputs` (`report::ASSUMPTIONS`):
-//! that the listing names every header directory, forced include and macro operation the
-//! profile can add, and that the directories a compile program searches without being
-//! told are a function of the program, which is compared, and the words that are.
 
 use std::path::Path;
 
-use crate::link_inputs::{is_command, resolved, words};
+use serde::{Deserialize, Serialize};
+
+use crate::link_inputs::{Resolve, is_command, words};
 use crate::toolchain::{Hand, read, spelled_alone};
 
+/// The code-model words gcc's `cc1` carries as written, which `report::lto_codegen_limitation`
+/// reads for gcc: the last of them is the model the compile asked for. clang's `-cc1` carries none
+/// of them, its model resolved into `-mrelocation-model`.
+pub const GCC_CODE_MODEL_WORDS: &[&str] = &[
+    "-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-PIC", "-fno-pic", "-fno-PIE", "-fno-pie",
+];
+
 /// What the compile commands of one listing read beyond the probe's source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileInputs {
     /// The compile programs (`cc1`, `cc1plus`, clang's own path before `-cc1`), as named,
     /// one per compile command.
@@ -127,7 +34,7 @@ pub struct CompileInputs {
     pub removals: Vec<String>,
     /// The target each command compiles for, which decides the architecture's predefined
     /// macros: clang's `-triple` value, and gcc's `-m16`, `-m32`, `-m64` and `-mx32`
-    /// words ([`TARGET_WORDS`]).
+    /// words (`TARGET_WORDS`).
     pub targets: Vec<String>,
     /// Every sanitizer word (`-fsanitize`, `-fno-sanitize`, `-fsanitize-trap`,
     /// `-fno-sanitize-trap` and kin), in order, as the compile command receives it: clang's
@@ -135,28 +42,22 @@ pub struct CompileInputs {
     /// arms carry none; read by `report::sanitizer_group_limitation`.
     pub sanitizers: Vec<String>,
     /// Every word that turns link-time optimization on or off (`-flto`, `-flto=<mode>`,
-    /// `-fno-lto`), in order, as the compile command receives it: clang's `-cc1` carries the
-    /// mode its driver resolved (`-flto=full` or `-flto=thin`, the last of the driver's `-flto`
-    /// and `-fno-lto` words, a configuration file's included), gcc's `cc1` the words as
-    /// written. `-flto-unit` and the `-flto-` tuning options are not among them. Not compared
-    /// by [`difference`], since the arms carry none; read by `report::lto_codegen_limitation`.
+    /// `-fno-lto`), in order, as the compile command receives it: clang's resolved mode,
+    /// gcc's words as written. `-flto-unit` and the `-flto-` tuning options are not among
+    /// them. Not compared by [`difference`], since the arms carry none; read by
+    /// `report::lto_codegen_limitation`.
     pub lto: Vec<String>,
     /// The code-model words the compile command carries, in order, as the driver resolved
     /// them: clang's `-mrelocation-model <model>` and `-pic-level <n>` with their values
-    /// joined by a space, and `-pic-is-pie`. Empty for gcc, whose `cc1` carries `-fPIC` as
-    /// written and is not asked. Not compared by [`difference`], since the arms are not
-    /// asked after it; read by `report::lto_codegen_limitation`, which holds a listing that
-    /// names one model, one level and no `-pic-is-pie` to be `-fPIC` or `-fpic` as the
-    /// driver resolved it.
+    /// joined by a space, and `-pic-is-pie`; gcc's `cc1` carries its own words as written
+    /// ([`GCC_CODE_MODEL_WORDS`]), and a default the driver configured (Ubuntu's PIE) as none.
+    /// Not compared by [`difference`]; read by `report::lto_codegen_limitation`.
     pub relocation: Vec<String>,
-    /// The exception model the compile command is told to use, as clang's `-cc1` receives
-    /// it: `-exception-model=<model>`, joined, or `-exception-model` and its value as the
-    /// next word, kept as the joined form, in order. Empty under the default model and for
-    /// gcc, whose `cc1` takes no such word. The driver's own spellings
-    /// ([`DRIVER_MODEL_WORDS`]) are read too, for a `-cc1` that takes them; clang 22.1.8's
-    /// rejects them. Not compared by [`difference`]; compared by
-    /// [`exception_model_difference`] for the checks `report::EXCEPTION_MODEL_READINGS`
-    /// names.
+    /// The exception model the compile command is told to use, in order: clang's
+    /// `-exception-model=<model>`, or `-exception-model` and its value kept joined, and the
+    /// driver's spellings (`DRIVER_MODEL_WORDS`). Empty under the default model and for gcc.
+    /// Not compared by [`difference`]; compared by [`exception_model_difference`] for the
+    /// checks `report::EXCEPTION_MODEL_READINGS` names.
     pub exception_models: Vec<String>,
 }
 
@@ -216,16 +117,6 @@ pub const HEADER_OPTIONS: [&str; 28] = [
 /// 2026-10-07 on Fedora 44 x86_64: under `--config=` such a file, clang 22.1.8's C
 /// listing named `-internal-isystem` a missing directory where the arms' named the host's
 /// equally missing one, and the two `-v -E` search lists were equal.
-///
-/// Only an absolute path is tested and left out. A directory written relative to the
-/// system root (`=dir`, `$SYSROOT/dir`) is never a directory as written, yet the compile
-/// searches it under the root, and a relative directory is searched from the probe's
-/// source directory, not chard's: each is compared as written, which errs toward
-/// withholding. Were every value tested as written, a specs `*cpp` adding `-isystem =dir`
-/// under `--sysroot=/` would be left out of the measured listing alone, and gcc 16.1.1's
-/// fortify checks would read `off` over arms that never read `dir`. A
-/// directory named relative to a prefix or a system root by its option (`-iwithprefix`,
-/// `-iwithsysroot`) is not in this list and is kept as written too.
 const SEARCH_DIRECTORY_OPTIONS: [&str; 14] = [
     "-I",
     "-F",
@@ -266,7 +157,7 @@ const TARGET_WORDS: [&str; 4] = ["-m16", "-m32", "-m64", "-mx32"];
 
 /// Whether a listing's command is a compile: gcc's `cc1`, `cc1plus` and kin, named by
 /// path, or clang's own path followed by `-cc1`.
-fn is_compile(words: &[String]) -> bool {
+pub(crate) fn is_compile(words: &[String]) -> bool {
     let Some(program) = words.first() else {
         return false;
     };
@@ -278,20 +169,12 @@ fn is_compile(words: &[String]) -> bool {
 }
 
 /// The compile inputs of a `-###` listing. `Err` carries the sentence saying why it could
-/// not be read: the listing holds no compile command, or a compile command ends at an
-/// option whose value it does not carry, which is a truncated listing and not an empty
-/// value.
-///
-/// A word is read where it is a [`REMOVALS`] word, a `-D` or `-U` (joined, or with its
-/// operand as the next word), a target word (clang's `-triple` and its value, or one of
-/// [`TARGET_WORDS`]), or begins with one of [`HEADER_OPTIONS`]. Every other word is left:
-/// code-generation and warning options, the input and the temporary outputs, gcc's
-/// `-iplugindir=`.
+/// not be read.
 ///
 /// # Errors
 ///
 /// Errors where the listing holds no compile command, or an option that takes a value is
-/// a command's last word.
+/// a command's last word, which is a truncated listing and not an empty value.
 pub fn parse(listing: &str) -> Result<CompileInputs, String> {
     let mut read = CompileInputs {
         programs: Vec::new(),
@@ -316,9 +199,9 @@ pub fn parse(listing: &str) -> Result<CompileInputs, String> {
         let mut rest = options.iter();
         while let Some(word) = rest.next() {
             let mut operand = || {
-                rest.next().cloned().ok_or_else(|| {
-                    format!("the compile command {program} ends at {word}, with no value after it")
-                })
+                rest.next()
+                    .cloned()
+                    .ok_or_else(|| format!("the compile command {program} ends at {word}"))
             };
             if REMOVALS.contains(&word.as_str()) {
                 read.removals.push(word.clone());
@@ -328,7 +211,7 @@ pub fn parse(listing: &str) -> Result<CompileInputs, String> {
                 read.lto.push(word.clone());
             } else if word == "-mrelocation-model" || word == "-pic-level" {
                 read.relocation.push(format!("{word} {}", operand()?));
-            } else if word == "-pic-is-pie" {
+            } else if word == "-pic-is-pie" || GCC_CODE_MODEL_WORDS.contains(&word.as_str()) {
                 read.relocation.push(word.clone());
             } else if TARGET_WORDS.contains(&word.as_str()) {
                 read.targets.push(word.clone());
@@ -399,19 +282,9 @@ pub fn macro_name(word: &str) -> Option<&str> {
 /// The profile's own `-D` and `-U` words, as written, for the arms' listing: a joined
 /// `-DNAME=v` or `-UNAME`, a split `-D NAME`, a `-Wp,` word every comma piece of which is
 /// a joined `-D` or `-U`, an `-Xpreprocessor` handing one, and gcc's long spellings of each
-/// (`--define-macro NAME`, `--define-macro=NAME=v`, `--def NAME`, `--undefine-macro`,
-/// `--un`; `toolchain::LONG_ALIASES` has the measurement). A `-include` or `-imacros` is
-/// the header selection's and reaches the listing that way. Anything else that defines a
-/// macro (`-Xclang -D`, a `-Wp,` word mixing other options) is not carried, so it differs
-/// in the comparison, which errs toward withholding.
-///
-/// The list is walked as the selection readers walk it, by the one classifier
-/// (`toolchain::read`): a word another reader takes as the value of its two-token option
-/// (`-L -DX`, a directory named `-DX`; `-isystem -D X`, a directory named `-D` and then
-/// `X`), the value of an option that selects nothing (`-u -DX`, a symbol), a word handed to
-/// another tool (`-Xclang -DX`) and a word clang applies for one architecture are passed
-/// over with the word that takes them, so the stand-in listing is asked under no macro the
-/// measured build never defined.
+/// (`toolchain::LONG_ALIASES`). Anything else that defines a macro (`-Xclang -D`, a `-Wp,`
+/// word mixing other options) is not carried, so it differs in the comparison, which errs
+/// toward withholding.
 #[must_use]
 pub fn macro_words(flags: &[String]) -> Vec<String> {
     let mut out = Vec::new();
@@ -421,8 +294,7 @@ pub fn macro_words(flags: &[String]) -> Vec<String> {
         let reading = read(flag, flags.get(one).map(String::as_str));
         let word = &*reading.word;
         let carried = match reading.hand {
-            // `-D NAME`, `--def NAME`: the operation and its name. A bare `-D` at the end
-            // names nothing and is left out, as the driver refuses it.
+            // `-D NAME`, `--def NAME`: the operation and its name.
             Hand::Value => (word == "-D" || word == "-U") && reading.span() == 2,
             Hand::Driver => {
                 joined_macro_op(word)
@@ -449,22 +321,12 @@ pub fn macro_words(flags: &[String]) -> Vec<String> {
     out
 }
 
-/// The profile's own optimisation words (`-O0`, `-O2`, `-Os`, `-Ofast` and kin, and gcc's
-/// long spelling `--optimize` and `--optimize=N`, which it reads as `-O` and `-ON`, or an
-/// abbreviation of it from `--op`, the shortest gcc 16.1.1 takes; `--o` and `--op=2` it
-/// refuses, and `--optimize 2` leaves `2` an input file, measured 2026-10-28 on Fedora 44
-/// x86_64 under `-###`, `toolchain::LONG_ALIASES`), as written and in order, for the arms'
-/// listing: every word the driver reads as its own beginning `-O`, so a `-Wl,-O1` (the
-/// linker's), a word handed to another tool or applied for one architecture, and a word
-/// taken as another option's value (`-L -O0`, `-B -O2`, `-u -O1`) are not: the list is
-/// walked as the selection readers walk it, by the one classifier (`toolchain::read`). All
-/// of them rather than the last alone, so the stand-in carries what the measured line
-/// carries and the driver resolves them as it did there: gcc keeps the last `-O` for its
-/// specs (Ubuntu's gcc adds its macro under `-O0 -O2` and not under `-O2 -O0`, measured
-/// 2026-10-15), and a driver that reads them otherwise is answered the same way too. A word
-/// beginning `-O` that is no optimisation level (`-ObjC`, a misspelling) is carried as
-/// well: it reaches both listings, and a difference it makes the driver make (another
-/// compile program for Objective-C) is one the comparison sees.
+/// The profile's own optimisation words, as written and in order, for the arms' listing:
+/// every word the driver reads as its own beginning `-O` (`-O2`, `-Ofast`, and gcc's
+/// `--optimize`, `--optimize=N` and their abbreviations, `toolchain::LONG_ALIASES`). A
+/// `-Wl,-O1`, a word handed to another tool or applied for one architecture, and a word
+/// taken as another option's value (`-L -O0`, `-u -O1`) are not: the list is walked by the
+/// one classifier (`toolchain::read`).
 #[must_use]
 pub fn optimization_words(flags: &[String]) -> Vec<String> {
     let mut out = Vec::new();
@@ -487,7 +349,7 @@ pub fn optimization_words(flags: &[String]) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Errors when the driver cannot be run, exits other than 0 ([`crate::link_inputs::listing`]),
+/// Errors when the driver cannot be run, exits other than 0 (`crate::link_inputs::listing`),
 /// or its listing holds no compile command.
 pub fn query(driver: &Path, flags: &[String], language: &str) -> Result<CompileInputs, String> {
     let mut args = flags.to_vec();
@@ -533,12 +395,17 @@ pub struct Differing {
 
 /// Where two listings differ, by kind, once resolved: the programs by canonical path, the
 /// header options with an absolute value by canonical path and with any other as written,
-/// an absolute search directory that does not exist left out ([`SEARCH_DIRECTORY_OPTIONS`]).
+/// an absolute search directory that does not exist left out (`SEARCH_DIRECTORY_OPTIONS`).
 /// Empty where they run the same programs for the same targets with the same headers,
 /// macro operations and removals, in the same order.
 #[must_use]
-pub fn differences(first: &CompileInputs, second: &CompileInputs) -> Vec<Differing> {
-    let resolve = |list: &[String]| -> Vec<String> { list.iter().map(|p| resolved(p)).collect() };
+pub fn differences(
+    first: &CompileInputs,
+    second: &CompileInputs,
+    paths: &dyn Resolve,
+) -> Vec<Differing> {
+    let resolve =
+        |list: &[String]| -> Vec<String> { list.iter().map(|p| paths.resolved(p)).collect() };
     let headers = |inputs: &CompileInputs| -> Vec<String> {
         inputs
             .headers
@@ -547,11 +414,11 @@ pub fn differences(first: &CompileInputs, second: &CompileInputs) -> Vec<Differi
                 let path = Path::new(value);
                 !SEARCH_DIRECTORY_OPTIONS.contains(&option.as_str())
                     || !path.is_absolute()
-                    || path.is_dir()
+                    || paths.is_dir(value)
             })
             .map(|(option, value)| {
                 if Path::new(value).is_absolute() {
-                    format!("{option} {}", resolved(value))
+                    format!("{option} {}", paths.resolved(value))
                 } else {
                     format!("{option} {value}")
                 }
@@ -626,23 +493,17 @@ pub fn sentence(differing: &[Differing]) -> String {
 /// Where the arms' compile differs from the measured one, as the [`sentence`] over
 /// [`differences`], or `None` where there is none.
 #[must_use]
-pub fn difference(measured: &CompileInputs, arms: &CompileInputs) -> Option<String> {
-    let differing = differences(measured, arms);
+pub fn difference(
+    measured: &CompileInputs,
+    arms: &CompileInputs,
+    paths: &dyn Resolve,
+) -> Option<String> {
+    let differing = differences(measured, arms, paths);
     (!differing.is_empty()).then(|| sentence(&differing))
 }
 
 /// Where the measured compile's exception model differs from the arms', as a sentence, or
 /// `None` where both name the same one (neither naming one is the default model).
-///
-/// On Fedora 44 x86_64 with clang 22.1.8 (2026-10-21), the `-###` compile line carried
-/// `-exception-model=sjlj`, `=dwarf` or `=seh` under the driver's `-fsjlj-exceptions`,
-/// `-fdwarf-exceptions` or `-fseh-exceptions` with or without `-fexceptions`, under a
-/// `--config=` file holding one of them, and under the frontend option handed through
-/// `-Xclang`, `-Wp,` or `-Xpreprocessor`, each of which built the model the word names; and
-/// none under the default model. The arms' listing is taken under their selection, which
-/// carries the driver's selectors (`toolchain::runtime_selecting_flags`), so a profile
-/// naming one reads the same word on both sides, and a model chosen any other way reads
-/// only on the measured side.
 #[must_use]
 pub fn exception_model_difference(
     measured: &CompileInputs,
@@ -675,10 +536,8 @@ pub fn exception_model_difference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link_inputs::Host;
 
-    /// The frontend's exception-model word is read joined and as two words, kept joined,
-    /// and compared alone: a listing naming none is the default model, two listings naming
-    /// the same model match, and a header or macro difference does not make one.
     #[test]
     fn the_exception_model_is_read_from_the_compile_line_and_compared_alone() {
         let line = |extra: &str| -> String {
@@ -693,7 +552,11 @@ mod tests {
         let joined = read("\"-exception-model=sjlj\"");
         let split = read("\"-exception-model\" \"sjlj\"");
         let dwarf = read("\"-exception-model=dwarf\" \"-D\" \"_EXTRA\"");
-        assert!(default.exception_models.is_empty());
+        assert!(
+            default.exception_models.is_empty(),
+            "a command with no exception-model word reads none: {:?}",
+            default.exception_models
+        );
         assert_eq!(
             joined.exception_models,
             vec!["-exception-model=sjlj".to_owned()]
@@ -735,7 +598,7 @@ mod tests {
         macro_only.macros.push("-D_EXTRA".to_owned());
         assert_eq!(exception_model_difference(&joined, &macro_only), None);
         assert!(
-            difference(&joined, &default).is_none(),
+            difference(&joined, &default, &Host::default()).is_none(),
             "the header and macro comparison does not read the exception model"
         );
     }
@@ -761,12 +624,6 @@ mod tests {
         \"/usr/bin/clang-22\" \"-cc1\" \"-emit-obj\" \"-resource-dir=/usr/bin/../lib/clang/22\" \
         \"-o\" \"/dev/null\" \"-x\" \"c++-cpp-output\" \"/tmp/null-1a.ii\"\n";
 
-    /// Each listing's programs, header options, macro operations and removals are read
-    /// whole and in order, the assembler and every other option left. Counted against the
-    /// listings handed in.
-    /// The compile command's sanitizer words are kept in order as written, and
-    /// [`difference`] does not compare them: the arms carry none, and the words are
-    /// `report::sanitizer_group_limitation`'s to read.
     #[test]
     fn sanitizer_words_are_kept_in_order_and_not_compared() {
         let listing = concat!(
@@ -792,16 +649,11 @@ mod tests {
             ..read.clone()
         };
         assert!(
-            difference(&read, &bare).is_none(),
+            difference(&read, &bare, &Host::default()).is_none(),
             "sanitizer words are not compared"
         );
     }
 
-    /// The compile command's link-time-optimization words are kept in order, `-flto-unit` and
-    /// the `-flto-` tuning options are not among them, and [`difference`] does not compare
-    /// them: the arms carry none, and the words are `report::lto_codegen_limitation`'s to read.
-    /// clang 22.1.8's `-cc1` line under `-O2 -flto -fno-lto -flto=thin` carries the resolved
-    /// mode once; gcc 16.1.1's carries the words as written.
     #[test]
     fn lto_words_are_kept_in_order_and_not_compared() {
         let clang = concat!(
@@ -824,15 +676,15 @@ mod tests {
             ..read.clone()
         };
         assert!(
-            difference(&read, &bare).is_none(),
+            difference(&read, &bare, &Host::default()).is_none(),
             "LTO words are not compared"
         );
-        assert!(parse(CLANG).expect("a compile command").lto.is_empty());
+        assert!(
+            parse(CLANG).expect("a compile command").lto.is_empty(),
+            "the clang command carries no LTO word"
+        );
     }
 
-    /// The code-model words clang's `-cc1` command carries are kept in order with their
-    /// values, and [`difference`] does not compare them. clang 22.1.8 prints `-flto -fPIC` as
-    /// `-mrelocation-model pic -pic-level 2` and `-fPIE` with `-pic-is-pie` after.
     #[test]
     fn relocation_words_are_kept_in_order_and_not_compared() {
         let clang = concat!(
@@ -850,15 +702,48 @@ mod tests {
             exception_models: Vec::new(),
             ..read.clone()
         };
-        assert!(difference(&read, &bare).is_none(), "not compared");
+        assert!(
+            difference(&read, &bare, &Host::default()).is_none(),
+            "not compared"
+        );
         let cut = " \"/usr/bin/clang-22\" \"-cc1\" \"-pic-level\"\n";
         assert!(parse(cut).is_err(), "a level with no value is not read");
         assert!(
             parse(CLANG)
                 .expect("a compile command")
                 .relocation
-                .is_empty()
+                .is_empty(),
+            "the clang command carries no relocation word"
         );
+    }
+
+    #[test]
+    fn gcc_code_model_words_are_kept_and_not_compared() {
+        let line = |words: &str| {
+            format!(
+                " /usr/libexec/gcc/x86_64-redhat-linux/16/cc1 -quiet probe.c -quiet -dumpbase \
+                 probe.c -mtune=generic -march=x86-64 -O2 {words} -o /tmp/ccX.s\n"
+            )
+        };
+        for (words, model) in [
+            ("-flto -fPIC", &["-fPIC"][..]),
+            ("-flto -fPIE", &["-fPIE"][..]),
+            ("-flto -fpic", &["-fpic"][..]),
+            ("-flto -fno-pie", &["-fno-pie"][..]),
+            ("-flto", &[][..]),
+        ] {
+            let read = parse(&line(words)).expect("a gcc compile command");
+            assert_eq!(read.relocation, model, "{words}");
+            assert_eq!(read.lto, ["-flto"], "{words}");
+            let bare = CompileInputs {
+                relocation: Vec::new(),
+                ..read.clone()
+            };
+            assert!(
+                difference(&read, &bare, &Host::default()).is_none(),
+                "{words}: not compared"
+            );
+        }
     }
 
     #[test]
@@ -876,7 +761,11 @@ mod tests {
             "-iplugindir= is not a header option"
         );
         assert_eq!(gcc.macros, ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3"]);
-        assert!(gcc.removals.is_empty());
+        assert!(
+            gcc.removals.is_empty(),
+            "the gcc command removes no word: {:?}",
+            gcc.removals
+        );
         assert!(gcc.targets.is_empty(), "-mtune= is not a target word");
 
         let clang = parse(CLANG).expect("the clang listing has compile commands");
@@ -901,8 +790,7 @@ mod tests {
         assert_eq!(clang.targets, ["-triple x86_64-redhat-linux-gnu"]);
 
         // The longest option a word begins with names it, and a joined value is read
-        // without the option. Only an option spelled `option=value` loses the `=`: gcc's
-        // `-isystem=dir` and `-I=dir` name a directory under the system root.
+        // without the option.
         let odd = parse(
             " /x/cc1 -isystem-after /a -include-pch /b.pch -I/c -iwithprefixbefore/d -DX -U Y \
              -isystem=/e -I=/f --sysroot=/g -m32\n",
@@ -937,9 +825,8 @@ mod tests {
             " /x/cc1 -E -U\n",
             " /x/clang -cc1 -triple\n",
         ];
-        for (listing, option) in truncated.iter().zip(["-isystem", "-U", "-triple"]) {
-            let why = parse(listing).expect_err("a truncated command");
-            assert!(why.contains(&format!("ends at {option},")), "{why}");
+        for listing in &truncated {
+            parse(listing).expect_err("a truncated command");
             read += 1;
         }
         assert_eq!(
@@ -949,8 +836,6 @@ mod tests {
         );
     }
 
-    /// The profile's own macro operations are carried as written and nothing else is.
-    /// Counted against the words handed in.
     #[test]
     fn the_profiles_macro_words_are_carried_and_nothing_else() {
         let line = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
@@ -1017,9 +902,6 @@ mod tests {
         assert_eq!(checked, cases.len());
     }
 
-    /// The profile's own optimisation words are carried as written, all of them in order,
-    /// and a word another program or target reads is not. Counted against the words
-    /// handed in.
     #[test]
     fn the_profiles_optimization_words_are_carried_in_order_and_nothing_else() {
         const HANDED: [&str; 8] = [
@@ -1080,8 +962,6 @@ mod tests {
         assert_eq!(checked, cases.len() + HANDED.len());
     }
 
-    /// A macro operation names its macro in each spelling a listing or a control arm uses,
-    /// and nothing else names one. Counted against the cases handed in.
     #[test]
     fn a_macro_operation_names_its_macro_and_nothing_else_names_one() {
         let cases: [(&str, Option<&str>); 9] = [
@@ -1103,11 +983,6 @@ mod tests {
         assert_eq!(checked, cases.len());
     }
 
-    /// Ubuntu 26.04's gcc 15.2.0, 2026-10-15, as recorded: its two `cc1` commands under
-    /// `-O2`, to which its specs add `-D_FORTIFY_SOURCE=3`, and under no flags. The
-    /// stand-in under the profile's `-O2` is the first listing and matches; the one without
-    /// it is the second and differs in the macro alone, by kind as by sentence, which is
-    /// what withheld the compile-input readings on Ubuntu until the words were carried.
     #[test]
     fn ubuntus_driver_adds_its_fortify_macro_under_o2_and_the_stand_in_under_o2_matches() {
         const TAIL: &str = "-fasynchronous-unwind-tables -fstack-protector-strong -Wformat \
@@ -1131,11 +1006,21 @@ mod tests {
             ["-D_FORTIFY_SOURCE=3", "-D_FORTIFY_SOURCE=3"],
             "the macro is added to both cc1 commands"
         );
-        assert!(stand_in_without.macros.is_empty());
-        assert_eq!(difference(&measured, &stand_in_with_o2), None);
-        assert_eq!(differences(&measured, &stand_in_with_o2), []);
+        assert!(
+            stand_in_without.macros.is_empty(),
+            "the stand-in without the macro carries none: {:?}",
+            stand_in_without.macros
+        );
         assert_eq!(
-            differences(&measured, &stand_in_without),
+            difference(&measured, &stand_in_with_o2, &Host::default()),
+            None
+        );
+        assert_eq!(
+            differences(&measured, &stand_in_with_o2, &Host::default()),
+            []
+        );
+        assert_eq!(
+            differences(&measured, &stand_in_without, &Host::default()),
             [Differing {
                 what: "macro operations",
                 only_first: vec![
@@ -1146,7 +1031,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            difference(&measured, &stand_in_without).as_deref(),
+            difference(&measured, &stand_in_without, &Host::default()).as_deref(),
             Some(
                 "its macro operations include -D_FORTIFY_SOURCE=3, -D_FORTIFY_SOURCE=3 where the \
                  arms' include none"
@@ -1154,13 +1039,12 @@ mod tests {
         );
     }
 
-    /// Two listings naming the same headers through other spellings are equal, and so are
-    /// two that differ only in an absolute search directory that does not exist; one adding
-    /// a directory (absolute, relative to the system root, or relative), a forced include,
-    /// a macro operation, a removal, another target or another program differs, and the
-    /// sentence names it. Counted against the cases handed in. Every path the equal case
-    /// resolves is in the test's scratch directory, so the case holds on any host.
-    #[allow(
+    /// Other spellings of the same headers and an absolute search directory that does not
+    /// exist make no difference; an added directory (absolute, relative to the system root,
+    /// or relative), forced include, macro operation, removal, target or program does, and
+    /// the sentence names it. Every path the equal case resolves is in the test's scratch
+    /// directory, so the case holds on any host.
+    #[expect(
         clippy::too_many_lines,
         reason = "one table of header-option shapes, each a literal of every field, read top to bottom"
     )]
@@ -1282,7 +1166,7 @@ mod tests {
     fn compared(cases: &[(CompileInputs, Option<String>)], base: &CompileInputs) -> usize {
         let mut compared = 0;
         for (measured, quoted) in cases {
-            let found = difference(measured, base);
+            let found = difference(measured, base, &Host::default());
             match quoted {
                 None => assert_eq!(found, None, "{measured:?}"),
                 Some(text) => {
@@ -1299,8 +1183,14 @@ mod tests {
     /// carried; one that names its macro is.
     #[test]
     fn a_preprocessor_piece_naming_no_macro_is_not_carried() {
-        assert!(macro_words(&["-Wp,-D".to_owned()]).is_empty());
-        assert!(macro_words(&["-Wp,-U".to_owned()]).is_empty());
+        assert!(
+            macro_words(&["-Wp,-D".to_owned()]).is_empty(),
+            "-Wp,-D names no macro, so the word is not carried"
+        );
+        assert!(
+            macro_words(&["-Wp,-U".to_owned()]).is_empty(),
+            "-Wp,-U names no macro, so the word is not carried"
+        );
         assert_eq!(macro_words(&["-Wp,-DX".to_owned()]), ["-Wp,-DX"]);
     }
 }

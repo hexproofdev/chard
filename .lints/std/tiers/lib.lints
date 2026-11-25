@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier lib: crates with a public API.
+rust.missing_docs = "deny"
+rust.unreachable_pub = "deny"
+rust.private_interfaces = "deny"
+rust.private_bounds = "deny"
+rust.exported_private_dependencies = "deny"
+rustdoc.missing_crate_level_docs = "deny"
+rustdoc.unescaped_backticks = "deny"
+clippy.print_stdout = "deny"                   # a library does not own the terminal
+clippy.print_stderr = "deny"
+clippy.error_impl_error = "deny"               # an error type is named for what failed, not `Error`

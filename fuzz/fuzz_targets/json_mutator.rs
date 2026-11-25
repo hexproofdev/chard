@@ -2,62 +2,114 @@
 //! A JSON-aware mutator for the targets whose input is JSON (`detect_evidence`, `predicate`,
 //! `report_render`, `attestation`, `report_digest`), installed through libFuzzer's
 //! `LLVMFuzzerCustomMutator`.
-//!
-//! libFuzzer's own mutations work on bytes, and over documents of hundreds of kilobytes
-//! most of them break the syntax: after a two-hour run on Fedora 44 x86_64 on 2026-09-29,
-//! 1244 of 2623 `detect_evidence` inputs, 1345 of 2438 `predicate` inputs and 907 of 1891
-//! `report_render` inputs did not parse as JSON, so their executions stopped in the parser.
-//! This mutator parses the input, applies one structural edit to a node chosen uniformly
-//! across the document, and writes it back, so the result is JSON and reaches the code
-//! behind the parser.
-//!
-//! The edits are the shapes a hostile or damaged report takes: a value replaced by another
-//! type, a boundary number, or a word chard gives meaning to (a verdict, an outcome, a store
-//! kind, a predicate key); a key or element removed; an element duplicated or the array
-//! cut; a subtree grafted from elsewhere in the document; a string mutated at the byte
-//! level or repeated long. One mutation in five, and every input that does not parse, goes
-//! to libFuzzer's byte mutator instead, so the parser's own refusals stay covered.
 
 use serde_json::{Value, json};
 
 /// Words chard's readers branch on, offered as replacement values and keys.
 const WORDS: &[&str] = &[
-    "on", "off", "partial", "unsupported", "not-applicable", "indeterminate", "probe-invalid",
-    "build-failed", "run-failed", "present", "absent", "elf", "elf-delta", "unreadable",
-    "macro-dump", "preprocessor", "compiled-artifact", "measured", "positive", "negative",
-    "regime", "chard_schema", "observations", "facts", "controls", "decoded", "decoders",
-    "predicates", "kind", "verdict", "level", "outcome", "gating", "rule", "check", "probe",
-    "channel", "macro", "elf-static", "runtime", "compiler-diag", "clauses", "when", "then",
-    "otherwise", "because", "tables", "defined", "c-int", "eq", "any", "all", "none-of",
-    "symbol", "word", "value", "truncations", "watched_symbols", "self_report", "base",
-    "elf_changes", "artifact_sha256", "stdout_sha256", "macro_source", "macro_dump", "run",
-    "build", "toolchain", "profile", "id", "environment", "composites", "coverage",
-];
-
-/// The attestation's keys and the digest kinds it knows, offered beside [`WORDS`] by
-/// `attestation` alone through [`mutate_with`], so the other targets mutate as they did
-/// before that target existed.
-#[allow(dead_code)] // Read by `attestation` alone; each target compiles this file anew.
-pub const ATTESTATION_WORDS: &[&str] = &[
-    "digest", "digest_kind", "digest_matched", "manifest_fetched", "origin", "signer",
-    "caveat", "installed_disk", "installed_at", "installed_from_digest", "sha256", "md5",
-    "sha1", "sha384", "sha512", "blake2b", "not-recorded",
+    "on",
+    "off",
+    "partial",
+    "unsupported",
+    "not-applicable",
+    "indeterminate",
+    "probe-invalid",
+    "build-failed",
+    "run-failed",
+    "present",
+    "absent",
+    "elf",
+    "elf-delta",
+    "unreadable",
+    "macro-dump",
+    "preprocessor",
+    "compiled-artifact",
+    "measured",
+    "positive",
+    "negative",
+    "regime",
+    "chard_schema",
+    "observations",
+    "facts",
+    "controls",
+    "decoded",
+    "decoders",
+    "predicates",
+    "kind",
+    "verdict",
+    "level",
+    "outcome",
+    "gating",
+    "rule",
+    "check",
+    "probe",
+    "channel",
+    "macro",
+    "elf-static",
+    "runtime",
+    "compiler-diag",
+    "clauses",
+    "when",
+    "then",
+    "otherwise",
+    "because",
+    "tables",
+    "defined",
+    "c-int",
+    "eq",
+    "any",
+    "all",
+    "none-of",
+    "symbol",
+    "word",
+    "value",
+    "truncations",
+    "watched_symbols",
+    "self_report",
+    "base",
+    "elf_changes",
+    "artifact_sha256",
+    "stdout_sha256",
+    "macro_source",
+    "macro_dump",
+    "run",
+    "build",
+    "toolchain",
+    "profile",
+    "id",
+    "environment",
+    "composites",
+    "coverage",
 ];
 
 /// Numbers at the edges an offset, count, width or digest length meets.
 const NUMBERS: &[&str] = &[
-    "0", "-1", "1", "255", "256", "65535", "65536", "4294967295", "4294967296",
-    "9223372036854775807", "18446744073709551615", "-9223372036854775808", "1e308", "0.5",
+    "0",
+    "-1",
+    "1",
+    "255",
+    "256",
+    "65535",
+    "65536",
+    "4294967295",
+    "4294967296",
+    "9223372036854775807",
+    "18446744073709551615",
+    "-9223372036854775808",
+    "1e308",
+    "0.5",
 ];
 
 /// xorshift64*, seeded by libFuzzer; no dependency, and deterministic for a given seed. It
-/// carries the target's own words, drawn from as if appended to [`WORDS`]; with none, every
-/// draw is the one it was before a target had its own.
+/// carries the target's own words, drawn from as if appended to [`WORDS`].
 struct Rng(u64, &'static [&'static str]);
 
 impl Rng {
     fn new(seed: u32, extra: &'static [&'static str]) -> Self {
-        Self(u64::from(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1, extra)
+        Self(
+            u64::from(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            extra,
+        )
     }
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
@@ -65,6 +117,10 @@ impl Rng {
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the remainder is below n, a usize, so the cast keeps every bit of it"
+    )]
     fn below(&mut self, n: usize) -> usize {
         if n == 0 {
             0
@@ -72,9 +128,16 @@ impl Rng {
             (self.next() % n as u64) as usize
         }
     }
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "i is below the two lists' summed length, and past WORDS where it is read"
+    )]
     fn word(&mut self) -> &'static str {
         let i = self.below(WORDS.len() + self.1.len());
-        WORDS.get(i).copied().unwrap_or_else(|| self.1[i - WORDS.len()])
+        WORDS
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.1[i - WORDS.len()])
     }
 }
 
@@ -100,12 +163,12 @@ fn nth(v: &Value, n: &mut usize) -> Option<Value> {
 
 /// A node reached by walking down from the root, stopping at each level with probability
 /// one in three.
-///
-/// Uniform choice over a report's nodes lands almost always on a leaf deep inside some
-/// observation's evidence, which the renderers and the replay never branch on: over a ten
-/// minute A/B on 2026-09-29 (Darwin arm64) it lost to byte mutation on `report_render`.
-/// A walk spends most edits on structure, the members of a report, an observation and its
-/// run, and still reaches any leaf.
+#[expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::unreachable,
+    reason = "i is below the child count read just above, and a scalar, which has none, returned there"
+)]
 fn descend<'a>(mut v: &'a mut Value, rng: &mut Rng) -> &'a mut Value {
     loop {
         let children = match &v {
@@ -129,7 +192,10 @@ fn scalar(rng: &mut Rng) -> Value {
     match rng.below(6) {
         0 => Value::Null,
         1 => Value::Bool(rng.below(2) == 0),
-        2 => serde_json::from_str(NUMBERS[rng.below(NUMBERS.len())]).unwrap_or(Value::Null),
+        2 => NUMBERS
+            .get(rng.below(NUMBERS.len()))
+            .and_then(|n| serde_json::from_str(n).ok())
+            .unwrap_or(Value::Null),
         3 => json!({}),
         4 => json!([]),
         _ => Value::String(rng.word().to_owned()),
@@ -148,7 +214,11 @@ fn edit(node: &mut Value, graft: Option<Value>, rng: &mut Rng) {
         }
         _ => match node {
             Value::Object(o) if !o.is_empty() => {
-                let key = o.keys().nth(rng.below(o.len())).cloned().unwrap_or_default();
+                let key = o
+                    .keys()
+                    .nth(rng.below(o.len()))
+                    .cloned()
+                    .unwrap_or_default();
                 if rng.below(2) == 0 {
                     o.remove(&key);
                 } else {
@@ -163,8 +233,9 @@ fn edit(node: &mut Value, graft: Option<Value>, rng: &mut Rng) {
                 }
                 1 => {
                     let i = rng.below(a.len());
-                    let copy = a[i].clone();
-                    a.insert(i, copy);
+                    if let Some(copy) = a.get(i).cloned() {
+                        a.insert(i, copy);
+                    }
                 }
                 _ => {
                     let keep = rng.below(a.len());
@@ -203,13 +274,13 @@ fn bytes_only() -> bool {
 }
 
 /// libFuzzer's mutator entry: `data[..size]` is the input, `max_size` the room there is.
-#[allow(dead_code)] // `attestation` calls `mutate_with`; each target compiles this file anew.
-pub fn mutate(data: &mut [u8], size: usize, max_size: usize, seed: u32) -> usize {
-    mutate_with(data, size, max_size, seed, &[])
-}
-
-/// [`mutate`], offering `extra` beside [`WORDS`] as replacement values and keys.
-pub fn mutate_with(
+/// `extra` is the target's own words, offered beside [`WORDS`] as replacement values and
+/// keys; a target with none passes `&[]` and draws from [`WORDS`] alone.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "libfuzzer-sys 0.4's fuzz_mutator! hands a buffer of max(size, max_size) bytes, and an edit is written back only where it fits in max_size"
+)]
+pub fn mutate(
     data: &mut [u8],
     size: usize,
     max_size: usize,

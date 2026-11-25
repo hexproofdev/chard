@@ -1,23 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The seed, the case count and the generator every generated-input test draws from.
-//!
-//! A generated test is a property over a space, and it is worth only what a failure in it
-//! can be acted on for: the seed that produced the failing input is printed with every
-//! run and with every failure, and `CHARD_TEST_SEED` replays it. The default seed is
-//! fixed, so the gate is deterministic; a run under another seed explores inputs the gate
-//! never drew, and one that fails is a reproduction, not a flake. `CHARD_TEST_CASES`
-//! raises or lowers how many inputs each test draws, for a longer run by hand.
-//!
-//! Both variables are read here and nowhere in `src/`: chard itself reads no
-//! configuration from the environment beyond `PATH`, and a test's knob is the test's.
-//!
-//! The generator is splitmix64, written out rather than taken from a crate: the four
-//! direct dependencies are a hard constraint, and a test needs a sequence it can replay,
-//! not a statistically strong one.
 
-// Each test binary that declares this module uses a different subset of it.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary that declares this module uses a different subset of it"
+)]
 
 use std::io::Write as _;
 
@@ -83,8 +71,11 @@ pub fn announce(test: &str, seed: u64, from_env: bool, cases: usize, coverage: &
     let origin = if from_env { SEED_VAR } else { "default" };
     let line = format!("\nchard: {test}: seed {seed:#x} ({origin}), {cases} cases; {coverage}\n");
     let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(line.as_bytes());
-    let _ = stderr.flush();
+    chard::error::best_effort(
+        stderr
+            .write_all(line.as_bytes())
+            .and_then(|()| stderr.flush()),
+    );
 }
 
 /// splitmix64.

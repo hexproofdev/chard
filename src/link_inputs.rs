@@ -4,68 +4,19 @@
 //! the program it runs for the link, every input it names by path (the startup objects and
 //! archives, whatever their names), the library directories it searches and the system
 //! root it hands the linker, and the linkage form (`-pie`, `-shared`, `-static`).
-//!
-//! The control arms carry the profile's target, runtime, header and linker selection and
-//! nothing else of it (`measure::arm_flags`), because a later flag cannot switch off what a gcc
-//! `-specs=` file or a clang `--config=` file injects: carried, Fedora's
-//! `redhat-hardened-cc1` put its hardening into every negative control. The same two
-//! files can also choose the startup objects, through a specs file's `*startfile` or
-//! `*endfile` or a configuration file's `--gcc-install-dir=`, and where they do the
-//! measured build links objects no arm links, so the triple validates a detector on
-//! another link. Neither carrying nor refusing the file serves: refusing it refuses
-//! Fedora's own `%build_cflags`. What chard can do is ask the driver, for the measured
-//! build's flags and for the arms' selection, which inputs it would hand the linker, and
-//! compare. `measure` withholds the checks whose observable the startup objects decide
-//! (`report::LINK_INPUT_READINGS`) under `link-inputs-unmatched-by-arms` where the two
-//! listings differ, or where either could not be read.
-//!
-//! The linkage form is normalised, not compared: the arms do not carry `-pie`, `-shared`
-//! or `-static` (`toolchain::runtime_selecting_flags` says why), and Fedora's
-//! `redhat-hardened-ld` turns a link into a PIE through its `*self_spec`, so the measured
-//! link names `Scrt1.o` and `crtbeginS.o` where an arm's names `crt1.o` and `crtbegin.o`.
-//! The arms' listing is therefore taken under the measured link's own form
-//! ([`LinkageForm::driver_flag`]), and what is compared is which files and directories
-//! the driver chose for that form. Equal therefore does not mean that the arms linked
-//! these objects: under `redhat-hardened-ld` the measured link names `Scrt1.o` and
-//! `crtbeginS.o` and the arms, linked without `-pie`, combine `crt1.o` and `crtbegin.o`.
-//! It means the profile chose no startup object the driver would not have chosen for that
-//! form on its own, and the gap between one form's objects and another's is the one the
-//! arms have without this comparison. Measured on 2026-10-06 on Fedora 44 x86_64 (gcc
-//! 16.1.1, clang 22.1.8, glibc 2.43, binutils 2.46.1): under Fedora's `%build_cflags` and
-//! `%build_ldflags` the two gcc listings name the same objects, archives and directories
-//! once the arms' takes `-pie`, and so do the clang ones under the clang toolchain's
-//! `--config=` files; under a specs file whose `*startfile` names a copy of `crtbegin*.o`
-//! without the x86 feature note, and under a configuration file holding
-//! `--gcc-install-dir=` a copy of the install directory with such objects, they differ in
-//! exactly those objects (and, for the second, the install's library directory).
-//!
-//! Equal means equal after resolution: each path is read through `fs::canonicalize`, so
-//! clang's `/usr/bin/../lib/gcc/...` and gcc's `/usr/lib/gcc/...` spellings of one file
-//! compare equal, and a path that does not resolve is compared as written. The link
-//! program is compared the same way, so a configuration file's `--ld-path=` or a specs
-//! `*linker` naming another program differs even where the inputs do not. The listing is
-//! taken over an empty C input (`-x c /dev/null`), and the object the compile step writes
-//! for it, a temporary file named anew on every run, is recognised as the `-o` of an
-//! earlier command of the same listing and left out. The resolution rests on the
-//! assumption `driver-listing-names-the-link-inputs` (`report::ASSUMPTIONS`): that the
-//! listing names every input the profile can choose for the link. A linker script the link
-//! reads (glibc's `libc.so` names `libc_nonshared.a`) is chosen through the library
-//! directories, which are compared, and not named itself.
-//!
-//! The checks that read the clean build are the other way round: their subject is the
-//! clean build, so it is that build's link that is held to the measured one, on the link
-//! program, the `-L` directories and the system root of the listing and on the program and
-//! library lists of the driver's `-print-search-dirs` ([`SearchDirs`]), which name a `-B`
-//! prefix gcc's listing does not ([`clean_link_difference`]; the rule is
-//! `report::clean_link_limitation`, resting on `driver-answers-name-the-clean-link`).
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::compile;
 
 /// The output kind a link line produces, read from the words the driver handed the
 /// linker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LinkageForm {
     /// `-shared`.
     Shared,
@@ -80,6 +31,15 @@ pub enum LinkageForm {
 }
 
 impl LinkageForm {
+    /// Every form, which `listings.*.form` in the report schema is pinned to.
+    pub const ALL: [Self; 5] = [
+        Self::Shared,
+        Self::StaticPie,
+        Self::Static,
+        Self::Pie,
+        Self::NoPie,
+    ];
+
     /// The driver flag that asks for this form, which the arms' listing is taken under.
     #[must_use]
     pub const fn driver_flag(self) -> &'static str {
@@ -109,16 +69,14 @@ impl LinkageForm {
 }
 
 /// What one link line combines beyond the program's own objects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkInputs {
     /// The program the driver runs for the link (`collect2`, `ld`, `ld.lld`), as named.
     pub program: String,
     /// Every input the line names by path, in order: each word that is neither an option
-    /// nor the value of one ([`VALUED_OPTIONS`]), whatever its name. These are the startup
-    /// objects (`crt1.o`, `Scrt1.o`, `rcrt1.o`, `crti.o`, `crtbegin*.o`, `crtend*.o`,
-    /// `crtn.o`, `clang_rt.crtbegin.o`), any archive named whole
-    /// (`libclang_rt.builtins.a`), and any other file a specs or configuration file hands
-    /// the linker, which ld reads as an input whatever its extension.
+    /// nor the value of one ([`VALUED_OPTIONS`]), whatever its name: the startup objects,
+    /// any archive named whole, and any other file a specs or configuration file hands the
+    /// linker.
     pub objects: Vec<String>,
     /// The `-L` directories, in search order, each once.
     pub library_dirs: Vec<String>,
@@ -188,16 +146,6 @@ pub const VALUED_OPTIONS: [&str; 14] = [
 
 /// The link inputs of a `-###` listing's link line, or `None` where the listing holds
 /// none.
-///
-/// The link line is the last command naming its program by path, quoted or not, which is
-/// how `toolchain::link_line` finds it. A word is an input where it does not begin with
-/// `-`, is not the value of one of [`VALUED_OPTIONS`], and is not the `-o` of an earlier
-/// command, which is the compile step's temporary object for the empty input. Its name is
-/// not consulted: ld takes a file named `unmarked`, `x.lo` or `X.O` as an input object as
-/// readily as `x.o`, and a reading by suffix let a specs `*startfile` naming one through
-/// unseen. The value of an option missing from the list is read as an input, so it
-/// compares as one, which errs toward withholding. `-L` is read joined, as both drivers
-/// write it, and as two words.
 #[must_use]
 pub fn parse(listing: &str) -> Option<LinkInputs> {
     let lines: Vec<&str> = listing.lines().filter(|l| is_command(l)).collect();
@@ -255,7 +203,7 @@ pub fn parse(listing: &str) -> Option<LinkInputs> {
 ///
 /// # Errors
 ///
-/// Errors when the driver cannot be run, exits other than 0 ([`listing`]), or its listing
+/// Errors when the driver cannot be run, exits other than 0 (`listing`), or its listing
 /// holds no command line.
 pub fn query(driver: &Path, flags: &[String]) -> Result<LinkInputs, String> {
     let mut args = flags.to_vec();
@@ -274,11 +222,9 @@ pub fn query(driver: &Path, flags: &[String]) -> Result<LinkInputs, String> {
 }
 
 /// The flags a query ran under, as the sentences name them: `under -O2 -fPIE`, or `under
-/// no flags` where the query ran under none, so a `bare` cell's sentence does not run two
-/// spaces together around a word it has nothing to say. For a query handed the whole of
-/// a build's flags, as the two input comparisons' are; a query handed a named subset of
-/// them says which subset through [`under_named`], since `under no flags` would be read
-/// as a claim about the profile.
+/// no flags` where the query ran under none. For a query handed the whole of a build's
+/// flags; a query handed a named subset of them says which subset through
+/// [`under_named`], since `under no flags` would be read as a claim about the profile.
 pub(crate) fn under(flags: &[String]) -> String {
     if flags.is_empty() {
         "under no flags".to_owned()
@@ -290,10 +236,7 @@ pub(crate) fn under(flags: &[String]) -> String {
 /// [`under`] for a query that ran under a named subset of a build's flags, `what` naming
 /// the subset in the singular: `under the link-selection flag -fuse-ld=lld`, `under the
 /// link-selection flags -fuse-ld=lld -B/opt/bin`, or `with no link-selection flag` where
-/// the subset is empty. The empty case names the subset rather than saying `no flags`,
-/// because the profile may well have flags that are not of this kind: `under no flags` for
-/// an `openssf-tldr` profile whose listing the driver rejected would read as a claim about
-/// the profile.
+/// the subset is empty, since the profile may have flags of another kind.
 pub(crate) fn under_named(flags: &[String], what: &str) -> String {
     match flags {
         [] => format!("with no {what}"),
@@ -305,22 +248,9 @@ pub(crate) fn under_named(flags: &[String], what: &str) -> String {
 /// Run `driver` over `args` (a `-###` query: the flags it ran under and the query's own
 /// words) and return the listing it printed to stderr, or the sentence saying why it is
 /// not one to read. `under` is the phrase naming those flags in the sentence, rendered by
-/// the caller through [`under`] or [`under_named`], since only the caller knows whether
-/// the flags are a build's whole list or a named part of one. Shared with
-/// [`crate::compile_inputs::query`] and `toolchain::read_link_line`, so the three readers
-/// read a listing under one rule.
-///
-/// A driver that exits other than 0 has rejected the command it was asked to list, so the
-/// listing describes a build that would not run, and it is not read whatever it holds. The
-/// exit status decides and not the wording of a diagnostic, because no wording is common to
-/// every driver. In a fleet sweep, clang 3.4 and 3.8 (Ubuntu 14.04 and 16.04) exit 1 on the
-/// arms' `-no-pie`, an argument neither knows, and still print a link line, which a reader
-/// that ignored the status would compare.
-///
-/// `workdir` is [`diagnostic_line`]'s, for the driver's words the sentence quotes: the
-/// two comparisons hand an empty path, since their sentence becomes a gating's reason and
-/// `measure::publish` makes it relative there; the linker detection hands the
-/// measurement's, since nothing rewrites `toolchain.linker.detection` after it.
+/// the caller through [`under`] or [`under_named`]. Shared with
+/// [`crate::compile_inputs::query`], [`crate::overridden::query`] and
+/// `toolchain::read_link_line`, so the four readers read a listing under one rule.
 ///
 /// # Errors
 ///
@@ -346,22 +276,12 @@ pub(crate) fn listing(
     ))
 }
 
-/// The line of a failed query's stderr the sentence quotes, ready for publication: the first line
-/// holding `error:`, the word with its colon, as gcc, clang, tcc and the linkers all shape a
-/// diagnostic (`cc: error: ...`, `cc: fatal error: ...`, `ld.lld: error: ...`). The colon is what
-/// keeps a command-line word out: a listing echoes the query's own `-Werror=format` on every
-/// command it prints, so without the colon a match on the bare word `error` could quote one of
-/// those commands as the diagnostic. Where no line has the shape, `None`, and the sentence says so
-/// rather than quoting the first line of stderr, which on a `-###` listing is the driver's version
-/// banner or its first command and not what the driver objected to.
-///
-/// The line passes through [`crate::measure::publish_text`] against `workdir` before the
-/// 200-character cut, as `compile::BuildRecord::first_stderr_line` does, so a path under
-/// the work directory is made relative, a temporary name is scrubbed, and the budget is
-/// spent on what is kept. The sentence lands in `toolchain.linker.detection` as well as in
-/// a gating's reason, and this one quote is published there rather than as the driver
-/// wrote it. Only the quote is published so: the flags the sentence names are the profile's, and
-/// stay spelled as `profile_flags` spells them.
+/// The line of a failed query's stderr the sentence quotes, ready for publication: the first
+/// line holding `error:`, the word with its colon, as gcc, clang, tcc and the linkers all
+/// shape a diagnostic (`cc: error: ...`, `ld.lld: error: ...`). The colon keeps out the
+/// commands a listing prints, which echo the query's own `-Werror=format`. Where no line has
+/// the shape, `None`, rather than the version banner or first command a `-###` listing
+/// begins with.
 fn diagnostic_line(stderr: &str, workdir: &Path) -> Option<String> {
     stderr
         .lines()
@@ -375,17 +295,68 @@ fn diagnostic_line(stderr: &str, workdir: &Path) -> Option<String> {
         })
 }
 
-/// A path as the comparison reads it: resolved, or as written where it does not resolve.
-pub(crate) fn resolved(path: &str) -> String {
-    std::fs::canonicalize(path).map_or_else(|_| path.to_owned(), |p| p.display().to_string())
+/// How a comparison reads the paths a listing names: the two questions it asks of the
+/// filesystem, and nothing else of it.
+pub trait Resolve {
+    /// The path as the comparison reads it: resolved, or as written where it does not
+    /// resolve.
+    fn resolved(&self, path: &str) -> String;
+    /// Whether the path names a directory.
+    fn is_dir(&self, path: &str) -> bool;
+}
+
+/// What the comparisons of one probe read of the filesystem, each path as the listing wrote
+/// it: what it resolved to ([`Resolve::resolved`]), and whether it is a directory
+/// ([`Resolve::is_dir`]), for each path the question was asked of.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathAnswers {
+    pub resolved: BTreeMap<String, String>,
+    pub directories: BTreeMap<String, bool>,
+}
+
+/// The host's filesystem, read through `fs::canonicalize` and `Path::is_dir`, each answer
+/// kept: [`Host::answers`] is the record a replay reads in its place.
+#[derive(Debug, Default)]
+pub struct Host {
+    answers: RefCell<PathAnswers>,
+}
+
+impl Host {
+    /// Every answer given, by path.
+    #[must_use]
+    pub fn answers(self) -> PathAnswers {
+        self.answers.into_inner()
+    }
+}
+
+impl Resolve for Host {
+    fn resolved(&self, path: &str) -> String {
+        let answer = std::fs::canonicalize(path)
+            .map_or_else(|_| path.to_owned(), |p| p.display().to_string());
+        self.answers
+            .borrow_mut()
+            .resolved
+            .insert(path.to_owned(), answer.clone());
+        answer
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        let answer = Path::new(path).is_dir();
+        self.answers
+            .borrow_mut()
+            .directories
+            .insert(path.to_owned(), answer);
+        answer
+    }
 }
 
 /// Where the arms' link differs from the measured one, as a sentence naming each side's
 /// files, or `None` where they run the same link program over the same inputs,
-/// directories and system root once resolved. The forms are not compared: the arms' listing is taken under the
-/// measured one's.
+/// directories and system root once resolved. The forms are not compared: the arms'
+/// listing is taken under the measured one's.
 #[must_use]
-pub fn difference(measured: &LinkInputs, arms: &LinkInputs) -> Option<String> {
+pub fn difference(measured: &LinkInputs, arms: &LinkInputs, paths: &dyn Resolve) -> Option<String> {
+    let resolve_all = |list: &[String]| resolve_all(list, paths);
     let sides = [
         (
             "link program",
@@ -411,10 +382,10 @@ pub fn difference(measured: &LinkInputs, arms: &LinkInputs) -> Option<String> {
     describe_sides(sides, "its", "the arms'")
 }
 
-/// Each path of `list` [`resolved`], each once, in order.
-fn resolve_all(list: &[String]) -> Vec<String> {
+/// Each path of `list` [`Resolve::resolved`], each once, in order.
+fn resolve_all(list: &[String], paths: &dyn Resolve) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for path in list.iter().map(|p| resolved(p)) {
+    for path in list.iter().map(|p| paths.resolved(p)) {
         if !out.contains(&path) {
             out.push(path);
         }
@@ -468,17 +439,7 @@ fn describe_sides<const N: usize>(
 /// The directories a driver searches for the programs it runs and for the files it links,
 /// as its `-print-search-dirs` answer names them: the `programs:` and `libraries:` lists,
 /// each in order, with the `=` both gcc and clang print before a list left off.
-///
-/// A `-B` or `--prefix` prefix is the first entry of both lists under gcc and of the first
-/// under clang, and it is where gcc's `collect2` finds the `ld` it runs, which gcc's
-/// `-###` link line does not name: it names `collect2`. Measured on Fedora 44 x86_64 with
-/// gcc 16.1.1 and clang 22.1.8: under `-B<dir>/` gcc's answer begins both lists with
-/// `<dir>/<triple>/16/` and `<dir>/`, clang's begins `programs:` with `<dir>/`, and its
-/// `-###` link line names `<dir>/ld` where `<dir>` holds one; without the prefix neither
-/// list names it. An answer that lacks either list is not read as an empty one, which two
-/// such answers would share and so agree on without naming a directory: it is no answer
-/// ([`parse_search_dirs`]), and the comparison withholds.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchDirs {
     pub programs: Vec<String>,
     pub libraries: Vec<String>,
@@ -486,9 +447,7 @@ pub struct SearchDirs {
 
 /// The two lists of a `-print-search-dirs` answer ([`SearchDirs`]): each line `programs:`
 /// or `libraries:` followed by its entries, separated by `:`, the first line of each key
-/// read. `None` where the answer lacks either line: gcc and clang print both, and a list
-/// the answer does not hold is no list, which two such answers would agree on without
-/// naming a directory.
+/// read. `None` where the answer lacks either line ([`SearchDirs`] says why).
 #[must_use]
 pub fn parse_search_dirs(answer: &str) -> Option<SearchDirs> {
     let list = |key: &str| -> Option<Vec<String>> {
@@ -537,8 +496,7 @@ pub fn query_search_dirs(driver: &Path, flags: &[String]) -> Result<SearchDirs, 
     }
     parse_search_dirs(&record.stdout).ok_or_else(|| {
         format!(
-            "the driver's -print-search-dirs answer {} lacks its programs: or its libraries: \
-             list",
+            "the driver's -print-search-dirs answer {} lacks its programs",
             under(flags)
         )
     })
@@ -547,30 +505,14 @@ pub fn query_search_dirs(driver: &Path, flags: &[String]) -> Result<SearchDirs, 
 /// Where the clean build's link would run another linker program, or search another
 /// directory for programs or libraries, than the measured build's, as a sentence naming
 /// each side's entries, or `None` where the two agree once resolved.
-///
-/// `measured` is the measured build's `-###` link line and its `-print-search-dirs` answer;
-/// `clean` is the link line of the clean build's flags with the measured line's linker
-/// program selection (`toolchain::linker_program_flags`), the line the default-asking
-/// check's arms link with, and the clean build's own answer. From each link line the
-/// program, the `-L` directories and the system root are compared, and from each answer
-/// its two lists: a `-L` directory reaches neither list (gcc 16.1.1 and clang 22.1.8 answer
-/// the same lists with and without one, Fedora 44 x86_64), and through a `libc.so` script
-/// there a directory chooses what the link reads. The link line is that one rather than the
-/// clean build's own because the clean build leaves a program selection off on purpose
-/// (`measure::clean_flags`): it links with the driver's default linker, and the measured
-/// line's `-fuse-ld=lld` would otherwise differ by design; so where the profile selects a
-/// program, the program the clean build itself runs is not compared (the assumption
-/// `driver-answers-name-the-clean-link` names it). The search lists are read from the
-/// clean build's own answer, since no program selection moves them. The inputs the link
-/// lines name by path are not compared: the clean build links the toolchain's own startup
-/// objects for its target and runtime, the default the check asks about, and an object the
-/// profile names is not its subject.
 #[must_use]
 pub fn clean_link_difference(
     measured: (&LinkInputs, &SearchDirs),
     clean: (&LinkInputs, &SearchDirs),
+    paths: &dyn Resolve,
 ) -> Option<String> {
     let ((measured_link, measured_dirs), (clean_link, clean_dirs)) = (measured, clean);
+    let resolve_all = |list: &[String]| resolve_all(list, paths);
     let sides = [
         (
             "link program",
@@ -630,9 +572,6 @@ mod tests {
         \"/usr/lib/clang/22/lib/x86_64-redhat-linux-gnu/libclang_rt.builtins.a\" \"-lc\" \
         \"/srv/fake gcc/16/crtend.o\" \"/lib/../lib64/crtn.o\"\n";
 
-    /// Each listing's objects, directories, root and form are read whole, with the compile
-    /// step's temporary object left out and every quoted path one word. The cases are
-    /// counted against the inputs handed in.
     #[test]
     fn a_listing_names_the_startup_objects_directories_and_form_of_its_link() {
         let mut read = 0;
@@ -690,7 +629,7 @@ mod tests {
 
         // An input is read by position, not by name: a specs `*startfile` naming a file
         // with no extension, a `.lo`, an upper-case `.O` or a shared object by path hands
-        // ld an input as surely as `crtbegin.o` does. Each option's value is not one.
+        // ld an input as surely as `crtbegin.o` does.
         let odd = [
             "/srv/s.ld",
             "/srv/start/unmarked",
@@ -713,9 +652,6 @@ mod tests {
         assert_eq!(read, 9, "every listing handed in was read");
     }
 
-    /// Two listings combining the same files through other spellings are equal; one
-    /// naming another startup object, directory or root differs, and the sentence names
-    /// the file on each side. Counted against the cases handed in.
     #[test]
     fn listings_differ_exactly_where_a_resolved_input_does() {
         let dir = std::env::temp_dir().join(format!("chard-link-inputs-{}", std::process::id()));
@@ -783,7 +719,7 @@ mod tests {
         ];
         let mut compared = 0;
         for (arms, quoted) in &cases {
-            let found = difference(&base, arms);
+            let found = difference(&base, arms, &Host::default());
             match quoted {
                 None => assert_eq!(found, None, "{arms:?}"),
                 Some(path) => {
@@ -802,7 +738,8 @@ mod tests {
             ..base.clone()
         };
         assert!(
-            difference(&reordered, &swapped).is_some_and(|s| s.contains("another order")),
+            difference(&reordered, &swapped, &Host::default())
+                .is_some_and(|s| s.contains("another order")),
             "the same files in another order differ"
         );
         compared += 1;
@@ -810,11 +747,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("removing the scratch directory");
     }
 
-    /// A driver that prints a listing and exits 1 gives no listing to read, to either
-    /// comparison: the shape of clang 3.4 and 3.8 under `-no-pie`, which they reject and
-    /// still list (a fleet sweep, Ubuntu 14.04 and 16.04). The same listing under
-    /// exit 0 is read by both, so what the refusal turns on is the status and not the text.
-    /// Counted against the drivers handed in.
     #[test]
     fn a_driver_that_exits_other_than_0_gives_no_listing_to_read() {
         let dir = std::env::temp_dir().join(format!("chard-listing-status-{}", std::process::id()));
@@ -855,8 +787,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("removing the scratch directory");
     }
 
-    /// A static link reads as static-pie from `-pie` or from `--no-dynamic-linker`, either
-    /// alone, and as static from neither.
     #[test]
     fn a_static_link_reads_as_static_pie_from_either_word() {
         let form = |words: &[&str]| {
@@ -870,7 +800,6 @@ mod tests {
         assert_eq!(form(&["-static"]), LinkageForm::Static);
     }
 
-    /// A listing a signal ended is refused in `BuildRecord::ended`'s words, never "exited -1".
     #[test]
     fn a_listing_a_signal_ended_names_the_signal() {
         let dir = std::env::temp_dir().join(format!("chard-listing-signal-{}", std::process::id()));
@@ -888,10 +817,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("removing the scratch directory");
     }
 
-    /// The two phrases naming a query's flags: `under` for a build's whole list, which says
-    /// `no flags` where the list is empty, and `under_named` for a named part of one, which
-    /// names the part in the empty case too, since `no flags` there would be read as a
-    /// claim about the profile.
     #[test]
     fn the_flags_a_query_ran_under_are_named_for_what_they_are() {
         let none: [String; 0] = [];
@@ -914,12 +839,6 @@ mod tests {
         );
     }
 
-    /// The line a rejected query's sentence quotes is the first shaped as a diagnostic,
-    /// `error:` with its colon, not the first holding the word: a `-###` listing echoes a
-    /// `-Werror=` flag on every command, and a match on the bare word could quote a command
-    /// as the diagnostic. Where no line has the shape there is no
-    /// quote, rather than the banner or the first command. A temporary name is scrubbed
-    /// before the 200-character cut.
     #[test]
     fn the_quoted_line_is_a_diagnostic_or_nothing() {
         let listing_with_werror = "clang version 22.1.8\n \
@@ -973,9 +892,6 @@ mod tests {
         );
     }
 
-    /// gcc 16.1.1's and clang 22.1.8's `-print-search-dirs` answers on Fedora 44 x86_64 under
-    /// `-B/srv/px/`, trimmed, and an answer holding neither list: each list is read in order
-    /// without the leading `=`, and an answer without a list reads it empty.
     #[test]
     fn a_search_dirs_answer_names_its_program_and_library_lists() {
         let gcc = "install: /usr/lib/gcc/x86_64-redhat-linux/16/\nprograms: =/srv/px/x86_64-redhat-linux/16/:/srv/px/:/usr/libexec/gcc/x86_64-redhat-linux/16/\nlibraries: =/srv/px/x86_64-redhat-linux/16/:/srv/px/:/usr/lib/gcc/x86_64-redhat-linux/16/:/lib/\n";
@@ -1011,10 +927,6 @@ mod tests {
         }
     }
 
-    /// The clean build's link is held to the measured one on the program, the `-L`
-    /// directories and the system root of the link line and on both search lists, each in
-    /// order: equal answers agree, the inputs the lines name decide nothing, and each other
-    /// field on one side alone, or a list in another order, is named with the side it is on.
     #[test]
     fn the_clean_link_is_held_to_the_measured_program_and_search_directories() {
         let link =
@@ -1037,16 +949,24 @@ mod tests {
         );
         let other_objects = link(ld, &["/srv/b.o"], &["/srv/nowhere/lib"], None);
         assert_eq!(
-            clean_link_difference((&host_link, &host), (&other_objects, &host)),
+            clean_link_difference(
+                (&host_link, &host),
+                (&other_objects, &host),
+                &Host::default()
+            ),
             None,
             "the inputs are not compared"
         );
         // Two spellings of one directory agree once resolved: `/usr/..` is `/` on any host
         // that has a `/usr`, and an unresolved comparison reads them apart.
-        if std::path::Path::new("/usr").is_dir() {
+        if Path::new("/usr").is_dir() {
             let spelled = |root: &str| link(ld, &[], &["/srv/nowhere/lib"], Some(root));
             assert_eq!(
-                clean_link_difference((&spelled("/"), &host), (&spelled("/usr/.."), &host)),
+                clean_link_difference(
+                    (&spelled("/"), &host),
+                    (&spelled("/usr/.."), &host),
+                    &Host::default()
+                ),
                 None,
                 "a system root is compared resolved"
             );
@@ -1099,8 +1019,9 @@ mod tests {
             ),
         ];
         for (clean_link, clean, said) in &cases {
-            let found = clean_link_difference((&host_link, &host), (clean_link, clean))
-                .unwrap_or_else(|| panic!("{said}: no difference found"));
+            let found =
+                clean_link_difference((&host_link, &host), (clean_link, clean), &Host::default())
+                    .unwrap_or_else(|| panic!("{said}: no difference found"));
             assert_eq!(found, *said);
         }
     }

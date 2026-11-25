@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# tier std: crates that link std (libraries, CLIs, services).
+rust.missing_debug_implementations = "deny"    # secret types write a redacting Debug by hand
+clippy.exit = "deny"                           # fires outside main only: return an error to main
+clippy.negative_feature_names = "deny"         # features are additive; no `no-std` feature

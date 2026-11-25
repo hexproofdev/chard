@@ -4,23 +4,6 @@
 //! recorded truncation, never an index out of bounds or an overflowing offset. The facts a
 //! parse yields survive the JSON round trip a report puts them through unchanged, so what
 //! the store publishes is what the reader read.
-//!
-//! The code reader's two lists (`elf::code`) agree with each other and with
-//! its tables: every `code_scanned` entry names a listed function and a pattern of that
-//! function's list and of the object's machine, once, with a count; every `code_matches` entry names a searched
-//! function and pattern; and each pair has exactly `min(count, MATCHES_KEPT)` offsets, all
-//! distinct.
-//!
-//! A table of fixed-size records is read at the record size whatever its `sh_entsize`
-//! declares (`record_stride`), so the same bytes with every symbol and relocation section
-//! header's `sh_entsize` rewritten to its record size read the same facts,
-//! less the `ignored` records naming the declared sizes. A reader that let a declared size
-//! above the record choose the stride fails that comparison on an input where the
-//! declared stride reads other bytes (a planted `declared.max(record)` did, 2026-10-20; the
-//! input it failed on is `crashes/elf_parse/stride-symtab-entsize.elf`, replayed with the
-//! corpus).
-//! Where a rewritten header lies inside a section's or a segment's bytes, the rewrite changes
-//! data some other table holds, and the comparison is not made.
 
 #![no_main]
 
@@ -41,10 +24,17 @@ fn facts_machine(facts: &ElfFacts) -> u16 {
 }
 
 /// The code reader's oracle, over one parse's facts.
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn code_lists_agree(facts: &ElfFacts) {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for entry in &facts.code_scanned {
-        let (key, count) = entry.split_once('=').expect("a scanned entry carries a count");
+        let (key, count) = entry
+            .split_once('=')
+            .expect("a scanned entry carries a count");
         let (function, pattern) = key.split_once(':').expect("function:pattern");
         let scan = SCANS
             .iter()
@@ -57,22 +47,35 @@ fn code_lists_agree(facts: &ElfFacts) {
         let machine = CODE_PATTERNS
             .iter()
             .find(|p| p.name == pattern)
-            .map(|p| p.machine)
-            .unwrap_or_else(|| panic!("{entry}: unknown pattern"));
-        assert_eq!(machine, facts_machine(facts), "{entry}: another machine's pattern");
+            .map_or_else(|| panic!("{entry}: unknown pattern"), |p| p.machine);
+        assert_eq!(
+            machine,
+            facts_machine(facts),
+            "{entry}: another machine's pattern"
+        );
         let count: usize = count.parse().expect("a count is a number");
-        assert!(counts.insert(key, count).is_none(), "{entry}: searched twice");
+        assert!(
+            counts.insert(key, count).is_none(),
+            "{entry}: searched twice"
+        );
     }
     let mut kept: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for entry in &facts.code_matches {
         let (key, offset) = entry.split_once('@').expect("a match carries an offset");
-        assert!(counts.contains_key(key), "{entry}: matched where nothing was searched");
+        assert!(
+            counts.contains_key(key),
+            "{entry}: matched where nothing was searched"
+        );
         assert!(offset.starts_with("0x"), "{entry}: offset in hex");
         kept.entry(key).or_default().push(offset);
     }
     for (key, count) in &counts {
         let offsets = kept.get(key).map_or(&[][..], Vec::as_slice);
-        assert_eq!(offsets.len(), (*count).min(MATCHES_KEPT), "{key}: kept offsets");
+        assert_eq!(
+            offsets.len(),
+            (*count).min(MATCHES_KEPT),
+            "{key}: kept offsets"
+        );
         let mut distinct = offsets.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
@@ -131,7 +134,11 @@ fn entsize_rewritten(data: &[u8]) -> Option<Vec<u8>> {
     };
     let w = if elf64 { 8 } else { 4 };
     // (type, offset, size, entsize) field offsets within one header.
-    let (type_at, off_at, size_at, ent_at) = if elf64 { (4, 24, 32, 56) } else { (4, 16, 20, 36) };
+    let (type_at, off_at, size_at, ent_at) = if elf64 {
+        (4, 24, 32, 56)
+    } else {
+        (4, 16, 20, 36)
+    };
     // Byte ranges a rewrite must not touch, each with the section header it belongs to where
     // it is one: the ELF header, the program-header table, every segment's and section's
     // file bytes, and every section header but the one whose field is rewritten.
@@ -140,13 +147,24 @@ fn entsize_rewritten(data: &[u8]) -> Option<Vec<u8>> {
     for i in 0..shnum {
         let h = shoff.checked_add(i.checked_mul(shent)?)?;
         let start = u64::try_from(h).ok()?;
-        occupied.push((start, start.saturating_add(u64::try_from(shent).ok()?), Some(i)));
+        occupied.push((
+            start,
+            start.saturating_add(u64::try_from(shent).ok()?),
+            Some(i),
+        ));
         let kind = get(h.saturating_add(type_at), 4)?;
-        let (off, size) = (get(h.saturating_add(off_at), w)?, get(h.saturating_add(size_at), w)?);
+        let (off, size) = (
+            get(h.saturating_add(off_at), w)?,
+            get(h.saturating_add(size_at), w)?,
+        );
         if kind != 8 {
             // SHT_NOBITS holds no file bytes.
             occupied.push((off, off.saturating_add(size), None));
         }
+        #[expect(
+            clippy::match_same_arms,
+            reason = "one arm per section type and class, as the ELF specification tabulates the record sizes"
+        )]
         let record = match (kind, elf64) {
             (2 | 11, true) => 24,
             (2 | 11, false) => 16,
@@ -165,7 +183,11 @@ fn entsize_rewritten(data: &[u8]) -> Option<Vec<u8>> {
     } else {
         (get(28, 4)?, get(42, 2)?, get(44, 2)?)
     };
-    occupied.push((phoff, phoff.saturating_add(phnum.saturating_mul(phent)), None));
+    occupied.push((
+        phoff,
+        phoff.saturating_add(phnum.saturating_mul(phent)),
+        None,
+    ));
     for i in 0..phnum {
         let h = usize::try_from(phoff.checked_add(i.checked_mul(phent)?)?).ok()?;
         let (off, filesz) = if elf64 {
@@ -187,6 +209,11 @@ fn entsize_rewritten(data: &[u8]) -> Option<Vec<u8>> {
         {
             return None;
         }
+        #[expect(
+            clippy::indexing_slicing,
+            clippy::cast_possible_truncation,
+            reason = "each field's w bytes were read above through get, so they lie inside out; the cast keeps the byte the shift brought down"
+        )]
         for i in 0..w {
             let shift = if little { i } else { w - 1 - i };
             out[at + i] = (record >> (8 * shift)) as u8;
@@ -202,9 +229,13 @@ fn without_stride_records(mut facts: ElfFacts) -> ElfFacts {
 }
 
 fuzz_target!(|data: &[u8]| {
+    #![expect(
+        clippy::expect_used,
+        reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+    )]
     match Elf::parse(data) {
         Err(e) => {
-            let _ = e.to_string();
+            let _: String = e.to_string();
         }
         Ok(elf) => {
             let facts = elf.facts();
@@ -215,7 +246,10 @@ fuzz_target!(|data: &[u8]| {
             // Several walks read one section, and the facts keep its stride record once.
             let mut strides = std::collections::BTreeSet::new();
             for t in facts.truncations.iter().filter(|t| is_stride_record(t)) {
-                assert!(strides.insert((t.table, &t.detail)), "a stride record twice: {t:?}");
+                assert!(
+                    strides.insert((t.table, &t.detail)),
+                    "a stride record twice: {t:?}"
+                );
             }
             if let Some(rewritten) = entsize_rewritten(data) {
                 let honest = Elf::parse(&rewritten)

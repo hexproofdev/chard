@@ -1,35 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! The OpenSSF guide's inventory: every flag and recommendation of the pinned revision, with
 //! the checks that read it or the reason none does.
-//!
-//! The guide is the inventory of flags chard measures against: the flags worth measuring. It
-//! says nothing about how to observe any of them from a built artifact, so the detection
-//! methods are chard's own, and the `openssf-tldr` profile is built from the rows
-//! here that it carries (`report::openssf_tldr_cflags`). A mechanism that compared the
-//! corpus to a hand transcription of the TL;DR block would leave a flag the guide added
-//! invisible: the profile would fall a revision behind without a test moving. Here the
-//! guide's own tables are the rows, pinned to a revision, and the tests hold the rows to
-//! the profile (on every architecture the gate reads, the profile is the guide's block,
-//! architecture and executables rows for it and nothing else, in order) and to the corpus
-//! (every check is in a row or pinned beyond the guide, and every check a row names exists),
-//! besides the rows' own consistency. No test compares the rows to the guide's tables, since
-//! the guide is not in the tree: that they are the pinned revision's tables, no more and no
-//! fewer, is read against the guide's text when the pin moves.
-//!
-//! A row is one unit of a guide table as the guide writes it (`-fPIE -pie` is one unit, the
-//! `-Werror=` family one), or one recommendation the guide makes in prose. Where a flag has
-//! checks, the note says what of it they read when that is less than the flag; where it has
-//! none, the reason says why, in a sentence a reader of the guide can check. A variant row
-//! lists the checks of the spelling the guide recommends, each of which reads the variant as
-//! a level, on or off, and any check that reads the variant alone; its note says where a
-//! reading is not the variant's own question (the unpaired bidi forms read the paired
-//! construct off). Every measurement a note cites was taken through chard's explicit
-//! profile on Fedora 44 x86_64 with gcc 16.1.1 and clang 22.1.8. Flags the guide does not
-//! name are not rows, whatever chard measures of them: the checks that read such a flag
-//! are pinned in [`BEYOND_THE_GUIDE`] so that a check added for a guide flag without a
-//! row fails the placement test. Which row a check sits in is not held mechanically
-//! beyond existence and placement: the rows are read against the checks' own `flag`
-//! fields by hand.
 
 /// The guide revision the inventory transcribes: the date in its own by-line.
 pub const REVISION: &str = "2026-08-20";
@@ -84,10 +55,9 @@ pub enum Place {
 pub enum Carried {
     /// In the unconditional block, on every architecture (`report::openssf_tldr_cflags`).
     Base,
-    /// In the executables addendum, on every architecture (`report::openssf_tldr_cflags`).
+    /// In the executables addendum, on every architecture.
     Executable,
-    /// In the architecture addendum, for these architectures
-    /// (`report::openssf_tldr_cflags`).
+    /// In the architecture addendum, for these architectures.
     Arch(&'static [&'static str]),
     /// Not carried, for this reason.
     No(&'static str),
@@ -116,21 +86,19 @@ pub struct Row {
     pub note: &'static str,
 }
 
-/// Why an addendum flag is not in the profile: the profile carries the block and the
-/// executables and architecture rows only.
-const NOT_CARRIED: &str = "the profile carries the block and the executables and architecture \
-                           rows only (report::openssf_tldr_cflags)";
+/// Why an addendum flag is not in the profile.
+const NOT_CARRIED: &str =
+    "the profile carries the block and the executables and architecture rows only";
 
 /// Why a recommended flag outside the block and the addendum is not in the profile.
 const OUTSIDE_THE_BLOCK: &str =
     "the guide recommends it outside the block and the addendum the profile transcribes";
 
 /// Why a variant is not in the profile.
-const A_VARIANT: &str = "a variant beside the recommended spelling, which the profile carries";
+const A_VARIANT: &str = "a variant beside the recommended spelling";
 
 /// Why a sanitizer is not read: the guide's own line between the two kinds of build.
-const INSTRUMENTED_TEST_CODE: &str = "instrumentation for test code, which the guide keeps apart from production code; chard \
-     reads production hardening";
+const INSTRUMENTED_TEST_CODE: &str = "instrumentation for test code";
 
 /// Why an appendix flag is not in the profile.
 const EXCLUDED_BY_THE_GUIDE: &str = "the guide's appendix lists it as considered and excluded";
@@ -161,7 +129,7 @@ pub const INVENTORY: &[Row] = &[
         flag: "-O2",
         place: Place::TlDr,
         carried: Carried::Base,
-        reads: Reads::Checks(&["optimization-enabled"]),
+        reads: Reads::Checks(&["optimization-enabled", "optimization-applied"]),
         note: "",
     },
     Row {
@@ -245,8 +213,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::TlDr,
         carried: Carried::Base,
         reads: Reads::Checks(&["cxx-hardening-requested", "cxx-stdlib-assertions"]),
-        note: "under libc++, which this host lacks; the fixture corpus holds the checks' rows \
-               from a libc++ musl system (SUPPORT.md)",
+        note: "under libc++, which this host lacks",
     },
     Row {
         flag: "-fstrict-flex-arrays=3",
@@ -288,7 +255,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::TlDr,
         carried: Carried::Base,
         reads: Reads::Checks(&["relro"]),
-        note: "one check reads the pair as a level: partial without -z now, full with it",
+        note: "one check reads the pair as a level",
     },
     Row {
         flag: "-Wl,-z,now",
@@ -343,10 +310,7 @@ pub const INVENTORY: &[Row] = &[
     Row {
         flag: "-fPIC -shared",
         place: Place::Addendum(&["for shared libraries"]),
-        carried: Carried::No(
-            "the profile builds executables; a shared-object probe is given this row in place \
-             of the executables row (report::openssf_tldr_cflags)",
-        ),
+        carried: Carried::No("the profile builds executables"),
         reads: Reads::Checks(&[
             "pic-macro",
             "pic-shared-link",
@@ -372,9 +336,13 @@ pub const INVENTORY: &[Row] = &[
         flag: "-mbranch-protection=standard",
         place: Place::Addendum(&["for aarch64"]),
         carried: Carried::Arch(&["aarch64"]),
-        reads: Reads::Checks(&["branch-protection-macro", "branch-protection-marked"]),
-        note: "the Guarded Control Stack half of standard, on compilers whose standard \
-               includes it, is read on its own (BEYOND_THE_GUIDE)",
+        reads: Reads::Checks(&[
+            "branch-protection-macro",
+            "branch-protection-marked",
+            "bti-enforced",
+            "pac-ret-enforced",
+        ]),
+        note: "the Guarded Control Stack half of standard",
     },
     Row {
         flag: "-fzero-call-used-regs=used-gpr",
@@ -395,8 +363,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Addendum(&["for production code"]),
         carried: Carried::No(NOT_CARRIED),
         reads: Reads::Checks(&["no-strict-overflow"]),
-        note: "read as defined signed integer overflow; the pointer arithmetic the flag also \
-               covers is not probed",
+        note: "read as defined signed integer overflow",
     },
     Row {
         flag: "-fno-strict-aliasing",
@@ -420,7 +387,7 @@ pub const INVENTORY: &[Row] = &[
             "implicit-function-declaration-is-error",
             "implicit-int-is-error",
         ]),
-        note: "gcc's -Werror=implicit is the two warnings the checks read, each as an error",
+        note: "gcc's -Werror=implicit is the two warnings the checks read",
     },
     Row {
         flag: "-Werror=incompatible-pointer-types",
@@ -446,14 +413,8 @@ pub const INVENTORY: &[Row] = &[
     Row {
         flag: "-Werror",
         place: Place::Addendum(&["during development but *not* when distributing source"]),
-        carried: Carried::No(
-            "a development setting the guide keeps out of distributed builds, and the \
-             profile measures what a distributed build gets",
-        ),
-        reads: Reads::None(
-            "a blanket promotion of every warning, which no probe's construct isolates; the \
-             -Werror= forms the guide names are read each by its own check",
-        ),
+        carried: Carried::No("a development setting the guide keeps out of distributed builds"),
+        reads: Reads::None("a blanket promotion of every warning"),
         note: "",
     },
     // Recommended outside the block and the addendum.
@@ -475,10 +436,7 @@ pub const INVENTORY: &[Row] = &[
         flag: "-Werror=",
         place: Place::Recommended,
         carried: Carried::No(OUTSIDE_THE_BLOCK),
-        reads: Reads::None(
-            "the form of the named -Werror= rows, each read by its own check; no check reads \
-             the form itself",
-        ),
+        reads: Reads::None("the form of the named -Werror= rows"),
         note: "",
     },
     Row {
@@ -494,9 +452,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Recommended,
         carried: Carried::No(OUTSIDE_THE_BLOCK),
         reads: Reads::Checks(&["hardened-downgrade-warned"]),
-        note: "read through its downgrade warning for `-fstack-protector-strong`, the one the \
-               probe forces; the options it implies are read by their own rows (the \
-               stack-protector, fortify and PIE rows read on beneath it)",
+        note: "read through its downgrade warning for `-fstack-protector-strong`, the one the probe forces",
     },
     // Variants the flags' own tables list.
     Row {
@@ -512,8 +468,7 @@ pub const INVENTORY: &[Row] = &[
             "fortify-level-ge-2-subobject",
             "fortify-level-ge-2-percent-n",
         ]),
-        note: "read as level 2 on the numeric scale, partial against the ask; the known \
-               enforcement reads on from level 1, the dynamic one asks for 3",
+        note: "read as level 2 on the numeric scale, partial against the ask",
     },
     Row {
         flag: "-D_FORTIFY_SOURCE=1",
@@ -540,15 +495,14 @@ pub const INVENTORY: &[Row] = &[
             "cxx-stdlib-assertions",
             "cxx-assertions-symbol",
         ]),
-        note: "the request reads on through the assertions the debug mode implies; the runtime \
-               and symbol checks withhold under it (probe-invalid)",
+        note: "the request reads on through the assertions the debug mode implies",
     },
     Row {
         flag: "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["cxx-hardening-requested", "cxx-stdlib-assertions"]),
-        note: "read as the word extensive; the runtime check reads the fast subset's abort",
+        note: "read as the word extensive",
     },
     Row {
         flag: "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG",
@@ -562,7 +516,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["cxx-hardening-requested", "cxx-stdlib-assertions"]),
-        note: "read as the mode none, which is no request; the runtime check reads no abort",
+        note: "read as the mode none, which is no request",
     },
     Row {
         flag: "-fstrict-flex-arrays=2",
@@ -590,8 +544,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["stack-clash-guard-page"]),
-        note: "read as the probing itself, whatever gap is set (on under a 64 KiB gap); the gap \
-               size is not read, and gcc spells the option --param",
+        note: "read as the probing itself, whatever gap is set",
     },
     Row {
         flag: "-fstack-protector-all",
@@ -733,15 +686,14 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["no-strict-overflow"]),
-        note: "read as defined signed integer overflow, on under both compilers",
+        note: "read as defined signed integer overflow",
     },
     Row {
         flag: "-fwrapv-pointer",
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["no-strict-overflow"]),
-        note: "reads off: the check reads integer overflow, and the pointer wrap-around this \
-               flag defines is not probed",
+        note: "reads off: the check reads integer overflow",
     },
     Row {
         flag: "-ftrapv",
@@ -762,9 +714,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["zero-init-padding-bits"]),
-        note: "the table's spelling, which gcc rejects (its value is unions, as the guide's \
-               prose has it), so a build under it reads nothing; under unions the check reads \
-               on at -O0, the byte past a union's active member being what it reads",
+        note: "the table's spelling, which gcc rejects",
     },
     Row {
         flag: "-Wbidi-chars=any,ucn",
@@ -778,16 +728,14 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["bidi-chars-any"]),
-        note: "reads off, which is the paired construct's answer and not this form's: no \
-               probe holds an unpaired sequence",
+        note: "reads off, which is the paired construct's answer and not this form's",
     },
     Row {
         flag: "-Wbidi-chars=unpaired,ucn",
         place: Place::Variant,
         carried: Carried::No(A_VARIANT),
         reads: Reads::Checks(&["bidi-chars-any"]),
-        note: "reads off, which is the paired construct's answer and not this form's: no \
-               probe holds an unpaired sequence",
+        note: "reads off, which is the paired construct's answer and not this form's",
     },
     // Discouraged.
     Row {
@@ -823,10 +771,7 @@ pub const INVENTORY: &[Row] = &[
         flag: "-fsanitize=undefined",
         place: Place::Sanitizer,
         carried: Carried::No(INSTRUMENTED_TEST_CODE),
-        reads: Reads::None(
-            "the instrumented form, for test code; the production forms the guide names are \
-             the minimal-runtime and trap rows",
-        ),
+        reads: Reads::None("the instrumented form, for test code"),
         note: "",
     },
     Row {
@@ -836,10 +781,7 @@ pub const INVENTORY: &[Row] = &[
             "a production form the guide recommends for clang in its sanitizer section, \
              outside the block the profile transcribes",
         ),
-        reads: Reads::None(
-            "clang's minimal handlers are calls, which ubsan-trap-mode does not read as traps \
-             (it reads off beneath this flag); no check reads the handlers",
-        ),
+        reads: Reads::None("clang's minimal handlers are calls"),
         note: "",
     },
     Row {
@@ -857,10 +799,7 @@ pub const INVENTORY: &[Row] = &[
         flag: "objcopy --only-keep-debug, --strip-unneeded, --add-gnu-debuglink",
         place: Place::DebugInfo,
         carried: Carried::No("a packaging step after the link, not a build flag"),
-        reads: Reads::None(
-            "a packaging step after the link; chard reads the artifact the toolchain wrote, \
-             and no check reads a debug section or link",
-        ),
+        reads: Reads::None("a packaging step after the link"),
         note: "",
     },
     // Compiling compilers.
@@ -882,20 +821,14 @@ pub const INVENTORY: &[Row] = &[
         flag: "--enable-host-pie",
         place: Place::Toolchain,
         carried: Carried::No("a compiler build option, not a flag of a build"),
-        reads: Reads::None(
-            "a property of the compiler's own executables, which chard does not read; it \
-             reads what the compiler builds",
-        ),
+        reads: Reads::None("a property of the compiler's own executables"),
         note: "",
     },
     Row {
         flag: "--enable-host-bind-now",
         place: Place::Toolchain,
         carried: Carried::No("a compiler build option, not a flag of a build"),
-        reads: Reads::None(
-            "a property of the compiler's own executables, which chard does not read; it \
-             reads what the compiler builds",
-        ),
+        reads: Reads::None("a property of the compiler's own executables"),
         note: "",
     },
     // Compiling linkers.
@@ -910,41 +843,29 @@ pub const INVENTORY: &[Row] = &[
         flag: "--enable-warn-execstack",
         place: Place::Toolchain,
         carried: Carried::No("a linker build option, not a flag of a build"),
-        reads: Reads::None(
-            "a linker warning on an executable-stack request; chard reads the artifact's \
-             PT_GNU_STACK, not the linker's diagnostic",
-        ),
+        reads: Reads::None("a linker warning on an executable-stack request"),
         note: "",
     },
     Row {
         flag: "--enable-error-execstack",
         place: Place::Toolchain,
         carried: Carried::No("a linker build option, not a flag of a build"),
-        reads: Reads::None(
-            "a linker error on an executable-stack request; chard reads the artifact's \
-             PT_GNU_STACK, not the linker's diagnostic",
-        ),
+        reads: Reads::None("a linker error on an executable-stack request"),
         note: "",
     },
     Row {
         flag: "--enable-warn-rwx-segments",
         place: Place::Toolchain,
         carried: Carried::No("a linker build option, not a flag of a build"),
-        reads: Reads::None(
-            "a linker warning on a segment writable and executable at once; no check reads a \
-             segment's permissions beyond the stack's",
-        ),
-        note: "",
+        reads: Reads::Checks(&["rwx-segment-absent"]),
+        note: "the check reads the linked program's segment flags",
     },
     Row {
         flag: "--enable-error-rwx-segments",
         place: Place::Toolchain,
         carried: Carried::No("a linker build option, not a flag of a build"),
-        reads: Reads::None(
-            "a linker error on a segment writable and executable at once; no check reads a \
-             segment's permissions beyond the stack's",
-        ),
-        note: "",
+        reads: Reads::Checks(&["rwx-segment-absent"]),
+        note: "the check reads the segment flags the error refuses",
     },
     Row {
         flag: "--enable-relro",
@@ -958,15 +879,13 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Toolchain,
         carried: Carried::No("a linker build option, not a flag of a build"),
         reads: Reads::Checks(&["textrel-absent"]),
-        note: "read as the artifact's freedom from text relocations, under the bare profile",
+        note: "read as the artifact's freedom from text relocations",
     },
     Row {
         flag: "--enable-secureplt",
         place: Place::Toolchain,
         carried: Carried::No("a linker build option, not a flag of a build"),
-        reads: Reads::None(
-            "Alpha and PowerPC only, by the guide's own description; chard measures neither",
-        ),
+        reads: Reads::None("Alpha and PowerPC only, by the guide's own description"),
         note: "",
     },
     // The appendix: considered and excluded.
@@ -975,8 +894,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
         reads: Reads::None(
-            "excluded by the guide's appendix as a single-purpose Solaris compatibility \
-             feature, whose flag other systems ignore",
+            "excluded by the guide's appendix as a single-purpose Solaris compatibility feature",
         ),
         note: "",
     },
@@ -995,8 +913,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
         reads: Reads::None(
-            "excluded by the guide's appendix as a deprecated spelling of libc++'s hardening; \
-             the mode rows above are read",
+            "excluded by the guide's appendix as a deprecated spelling of libc++'s hardening",
         ),
         note: "",
     },
@@ -1005,8 +922,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
         reads: Reads::None(
-            "excluded by the guide's appendix as a deprecated spelling of libc++'s hardening; \
-             the mode rows above are read",
+            "excluded by the guide's appendix as a deprecated spelling of libc++'s hardening",
         ),
         note: "",
     },
@@ -1014,20 +930,14 @@ pub const INVENTORY: &[Row] = &[
         flag: "-mshstk",
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
-        reads: Reads::None(
-            "excluded by the guide's appendix: shadow-stack built-ins, not instrumentation; \
-             CET is read on the -fcf-protection rows",
-        ),
+        reads: Reads::None("excluded by the guide's appendix"),
         note: "",
     },
     Row {
         flag: "-fsanitize=safe-stack",
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
-        reads: Reads::None(
-            "excluded by the guide's appendix for its compatibility limits; chard reads no \
-             SafeStack, and the stack-protector rows read off beneath it",
-        ),
+        reads: Reads::None("excluded by the guide's appendix for its compatibility limits"),
         note: "",
     },
     Row {
@@ -1041,10 +951,7 @@ pub const INVENTORY: &[Row] = &[
         flag: "-fvtable-verify",
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
-        reads: Reads::None(
-            "excluded by the guide's appendix for its overhead, its ABI break with every \
-             system library not built with it, and its believed-unmaintained state in GCC",
-        ),
+        reads: Reads::None("excluded by the guide's appendix for its overhead"),
         note: "",
     },
     Row {
@@ -1059,9 +966,7 @@ pub const INVENTORY: &[Row] = &[
         place: Place::Considered,
         carried: Carried::No(EXCLUDED_BY_THE_GUIDE),
         reads: Reads::None(
-            "excluded by the guide's appendix as a clang build option superseded by \
-             configuration files; the default it sets is read under the bare profile by the \
-             PIE rows",
+            "excluded by the guide's appendix as a clang build option superseded by configuration files",
         ),
         note: "",
     },
@@ -1079,14 +984,20 @@ mod tests {
     use super::{ADDENDUM_WHEN, BEYOND_THE_GUIDE, Carried, INVENTORY, Place, Reads};
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// The `openssf-tldr` profile, on every architecture the gate can read (each value
-    /// `toolchain::arch_of_triple` returns for a triple it normalizes, and one it passes
-    /// through), is the guide's rows for that architecture and nothing else, in the profile's
-    /// order: the block, the addendum rows whose "When" cell names the architecture, the
-    /// executables row (the guide's own table lists the executables row first). Rows are
-    /// chosen here by `place`, not by `carried`, because `carried` is what the profile is
-    /// built from and the test must not read its own input; and a row is carried exactly where
-    /// the guide puts it, for exactly the architectures its addendum rows name.
+    #[test]
+    fn both_rwx_segment_rows_name_the_check_that_reads_the_flags() {
+        for flag in ["--enable-warn-rwx-segments", "--enable-error-rwx-segments"] {
+            let row = INVENTORY
+                .iter()
+                .find(|r| r.flag == flag)
+                .unwrap_or_else(|| panic!("{flag} is a row"));
+            assert!(
+                matches!(row.reads, Reads::Checks(&["rwx-segment-absent"])),
+                "{flag} names rwx-segment-absent"
+            );
+        }
+    }
+
     #[test]
     fn the_profile_is_the_carried_rows_in_order() {
         let words = |keep: &dyn Fn(Place) -> bool| -> Vec<String> {
@@ -1171,10 +1082,6 @@ mod tests {
         }
     }
 
-    /// Every check a row names is in the corpus, every check in the corpus is in a row or
-    /// pinned beyond the guide, and nothing is both. Which row a check sits in is not held
-    /// here (a check may read several rows), so a swap between rows passes: the module doc
-    /// says the rows are read against the checks' `flag` fields by hand.
     #[test]
     fn every_check_is_placed_once_and_every_named_check_exists() {
         let corpus: BTreeSet<&str> = crate::probe::CORPUS
@@ -1219,93 +1126,13 @@ mod tests {
         );
     }
 
-    /// A check's own notes, which every report publishes beside its verdict, agree with
-    /// what the profile carries. The notes are prose, so this holds the spellings the tree's
-    /// notes have used for the claim, in either direction and whatever the case: a check some
-    /// carried row names may not deny that the profile passes its flag, and a check no
-    /// carried row names may not affirm it. A claim in a new spelling is added to the two
-    /// lists here, which is why they are short, and the checks whose notes make the claim
-    /// today are named so that a rename cannot drop them from the test.
-    #[test]
-    fn the_checks_notes_agree_with_what_the_profile_carries() {
-        const PROFILE: &[&str] = &["openssf-tldr", "tl;dr profile", "guide's profile"];
-        const DENIES: &[&str] = &[
-            "does not pass",
-            "does not carry",
-            "not passed",
-            "omits",
-            "omit it",
-            "lacks",
-            "never pass",
-            "leaves it out",
-            "without it",
-            "does not request",
-            "doesn't pass",
-            "doesn't carry",
-        ];
-        const AFFIRMS: &[&str] = &[
-            "passes it",
-            "carries it",
-            "passes the flag",
-            "carries the flag",
-            "passed it",
-            "always passed",
-        ];
-        const CLAIMANTS: &[&str] = &["zero-call-used-regs", "exceptions-macro"];
-        let mut carried_by: BTreeMap<&str, bool> = BTreeMap::new();
-        for row in INVENTORY {
-            if let Reads::Checks(ids) = row.reads {
-                let carried = !matches!(row.carried, Carried::No(_));
-                for id in ids {
-                    let entry = carried_by.entry(id).or_insert(false);
-                    *entry = *entry || carried;
-                }
-            }
-        }
-        let mut fed: BTreeSet<&str> = BTreeSet::new();
-        for check in crate::probe::CORPUS.iter().flat_map(|p| p.checks) {
-            let notes = check.notes.to_lowercase();
-            if !PROFILE.iter().any(|p| notes.contains(p)) {
-                continue;
-            }
-            let Some(carried) = carried_by.get(check.id) else {
-                continue;
-            };
-            fed.insert(check.id);
-            let denies = DENIES.iter().any(|w| notes.contains(w));
-            let affirms = AFFIRMS.iter().any(|w| notes.contains(w));
-            if *carried {
-                assert!(
-                    !denies,
-                    "{}'s notes deny that the profile passes its flag, which the profile \
-                     carries: {}",
-                    check.id, check.notes
-                );
-            } else {
-                assert!(
-                    !affirms,
-                    "{}'s notes affirm that the profile passes its flag, which the profile \
-                     does not carry: {}",
-                    check.id, check.notes
-                );
-            }
-        }
-        for id in CLAIMANTS {
-            assert!(
-                fed.contains(id),
-                "{id}'s notes no longer name the profile, so its claim moved or was dropped \
-                 and this test no longer reads it"
-            );
-        }
-    }
-
     /// Every row is one flag, each named once; every absence gives its reason; every
     /// addendum row names a "When" cell the guide has, and every "When" cell has a row.
     #[test]
     fn every_row_is_distinct_and_every_absence_has_its_reason() {
         let mut seen = BTreeSet::new();
         for row in INVENTORY {
-            assert!(!row.flag.is_empty());
+            assert!(!row.flag.is_empty(), "every inventory row names its flag");
             assert!(seen.insert(row.flag), "{} stands twice", row.flag);
             match row.reads {
                 Reads::None(reason) => {

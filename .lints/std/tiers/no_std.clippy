@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: BSD-3-Clause
+stack-size-threshold = 4096                    # a default for MCU task stacks; a repo may lower it (local)

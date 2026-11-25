@@ -3,58 +3,19 @@
 //! The reader against `readelf`, over the checked-in fixtures, a sample of the host's
 //! own objects, and objects drawn from a printed seed
 //! (`generated_objects_agree_with_readelf`).
-//!
-//! Every other ELF test in this suite asserts the reader against itself or against a
-//! record the reader wrote. This one asks an independent implementation the same
-//! questions and diffs the answers, fact by fact, and it is the only test that can say
-//! the reader is right; every other can say only that it agrees with itself. `readelf` is an oracle here and nowhere
-//! else: `src/elf.rs` parses the bytes itself, for the reasons its header gives, and
-//! nothing in `src/` runs a binutils program.
-//!
-//! Two oracles are accepted, in this order: GNU `readelf`, and `llvm-readelf`, whose
-//! default output style is GNU's. The parser below reads the GNU layout with `-W`. The
-//! fixtures were compared against `llvm-readelf` while it was written, and the parser is
-//! pinned on a captured GNU `readelf` transcript; `eu-readelf` prints a different layout
-//! and is not read.
-//!
-//! ## What is compared
-//!
-//! Class, type and machine from the file header; `PT_INTERP`, `PT_GNU_RELRO` and the
-//! `PT_GNU_STACK` flags from the program headers; the set of dynamic tags and the
-//! `NEEDED`, `RPATH` and `RUNPATH` strings; `BIND_NOW` in its three spellings,
-//! `DF_1_NOOPEN`, `DF_1_PIE`, `TEXTREL` in both spellings, `DT_RELR`, `DT_DEBUG`, which the
-//! link classification reads, and `DT_SONAME`, which it records and does not consult; the
-//! x86 and aarch64 feature bits from the property note; the section names; the presence,
-//! tables and definedness of every watched symbol in both directions; the distinct
-//! symbol count; and the lines of `.comment`, from a second oracle run with `-p`, which
-//! is what `toolchain.linker.artifact` reads. A relocatable object's code relocations
-//! (`ElfFacts::code_relocations`) are compared in their own test,
-//! `code_relocations_agree_with_readelf`, from a `-r` run over x86_64, i386 and aarch64
-//! objects the builder writes and the host's `cc` compiles, and RISC-V objects the builder
-//! writes. Each comparison is counted, and the total
-//! is printed with the number of files it ran over, because a differential over zero
-//! files is the clean-looking zero this project refuses.
-//!
-//! ## Both states, or no discrimination
-//!
-//! Agreement on a fact that was false in every file compared says nothing about a reader
-//! that answers false unconditionally. A synthetic corpus that never showed the oracle a
-//! linked object without `PT_GNU_STACK`, a `TEXTREL` spelled only as `DF_TEXTREL`, or a
-//! watched symbol that is defined would compare `gnu_stack_present`, the second `textrel`
-//! spelling and the definedness of every watched symbol in one state only, and the checks
-//! that read them would be held to the reader's own consistency in the other. Each fact in
-//! [`DISCRIMINATED`] is tallied by the
-//! state the oracle read, and the synthetic arm (the fixtures plus [`discriminators`])
-//! must show the oracle each one both ways, with the reader agreeing both times. The
-//! tallies are printed for the system arm as well, and asserted only for the synthetic
-//! arm, whose contents do not depend on the host.
-//!
-//! ## Skips
-//!
-//! On a host whose `cc` emits ELF the oracle is required, through `common::refuse`, and
-//! the system sample must be non-empty. On any other host a missing oracle is announced
-//! as an arm not exercised and the test returns; the fixtures still run wherever an
-//! oracle is on `PATH`, since `llvm-readelf` reads any ELF on any host.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -135,6 +96,8 @@ struct Seen {
     gnu_relro: bool,
     /// `Some(executable)` when a `PT_GNU_STACK` was printed.
     gnu_stack: Option<bool>,
+    /// A `LOAD` or `TLS` row printed with both `W` and `E` in its flags.
+    rwx_segment: bool,
     dyn_tags: BTreeSet<u64>,
     needed: Vec<String>,
     rpath: Vec<String>,
@@ -147,6 +110,10 @@ struct Seen {
     /// Every x86 feature word printed, one per note; the loader's view is their AND.
     x86_words: Vec<u32>,
     aarch64_words: Vec<u32>,
+    /// The aarch64 feature word `-A` prints from an `aeabi_feature_and_bits` subsection, one
+    /// `Tag_Feature_BTI`, `_PAC` or `_GCS` line each; `None` where it printed none, which a
+    /// readelf without `AArch64` build attributes v2 does for a section it holds.
+    aarch64_attributes: Option<u32>,
     sections: BTreeSet<String>,
     /// bare name -> (tables, defined)
     symbols: BTreeMap<String, (Vec<String>, bool)>,
@@ -169,23 +136,6 @@ fn bracketed(rest: &str) -> String {
 }
 
 /// The feature word a property line prints, read from its comma-separated items.
-///
-/// Each item reads as bits or fails the test. A named bit reads as its value, and a bit the
-/// oracle has no name for reads from the number it prints in the name's place: GNU's
-/// `<unknown: 4>` (hexadecimal, no prefix) and llvm's `<unknown flags: 0x30>` (every
-/// unnamed bit at once). The list ends at the line's end or at the next property: with
-/// `-W` GNU prints every property of a note on one line (`x86 feature: IBT, SHSTK, x86 ISA
-/// needed: x86-64-baseline`), so an item that does not begin with `<` and carries a colon
-/// is the next property's label. A bracketed item is never a label: `<corrupt length:
-/// 0x8>`, which GNU 2.42, GNU 2.46.1 and llvm-readelf 22.1.8 all print for a feature
-/// property whose data size is not 4, is an oracle stating no feature word, read as a
-/// word of zero, since the reader reads no bit from such a property; any other bracketed
-/// item it cannot read is a panic. An empty list is a word of zero (GNU's `AArch64
-/// feature: ` for 0; x86 and llvm print `<None>`). Any other item is a panic naming it,
-/// since a bit the parser cannot read would otherwise compare as a bit the oracle said was
-/// clear. Dropping such an item is wrong: GNU readelf 2.42 (Ubuntu 24.04) has no name for GCS
-/// and prints `AArch64 feature: BTI, <unknown: 4>` for a word of 5, which would read as an
-/// oracle saying GCS is clear where the reader, and readelf 2.46.1's `BTI, GCS`, say set.
 fn feature_word(list: &str, names: &[(&str, u32)]) -> u32 {
     if list.trim().is_empty() {
         return 0;
@@ -219,10 +169,7 @@ fn feature_word(list: &str, names: &[(&str, u32)]) -> u32 {
         if !item.starts_with('<') && item.contains(':') {
             break;
         }
-        panic!(
-            "the oracle printed the feature {item:?} in {list:?}, which this parser cannot \
-             read as bits"
-        );
+        panic!("the parser cannot read the oracle's feature {item:?} in {list:?}");
     }
     word
 }
@@ -250,13 +197,7 @@ impl Seen {
         }
 
         // `[ 1] .interp PROGBITS ...`: a numbered row of the section table, whose name is
-        // the token after the bracket, whatever it begins with. The reader lists every
-        // non-empty name, so the oracle records every one: glibc carries
-        // `__libc_freeres_ptrs`, a kernel module `__ksymtab_gpl` and `__param`, and a
-        // parser that kept only names beginning with `.` reported each as a section the
-        // reader had invented. The null section's row has no name, so after the bracket
-        // and its one space the next character is another space, and the type is left
-        // where it is; the header row's bracket holds `Nr`, and is no row.
+        // the token after the bracket, whatever it begins with.
         if let Some(rest) = trimmed.strip_prefix('[')
             && let Some((index, rest)) = rest.split_once(']')
             && index.trim().parse::<u32>().is_ok()
@@ -267,8 +208,22 @@ impl Seen {
             self.sections.insert(name.to_owned());
         }
 
+        // `Tag_Feature_BTI:\t1 (0x1)`, binutils 2.46's `-A` for an aarch64 attributes section.
+        for (tag, bit) in [("BTI", 1), ("PAC", 2), ("GCS", 4)] {
+            if let Some(value) = trimmed
+                .strip_prefix("Tag_Feature_")
+                .and_then(|t| t.strip_prefix(tag))
+                .and_then(|t| t.strip_prefix(':'))
+            {
+                let word = self.aarch64_attributes.get_or_insert(0);
+                if value.split_whitespace().next() == Some("1") {
+                    *word |= bit;
+                }
+            }
+        }
+
         // `x86 feature: IBT, SHSTK`, `AArch64 feature: BTI, PAC` (GNU) or
-        // `aarch64 feature: ...` (llvm). `<None>` is a word of zero.
+        // `aarch64 feature: ...` (llvm).
         if let Some(idx) = trimmed.find("feature:") {
             let head = trimmed[..idx].to_ascii_lowercase();
             let list = &trimmed[idx + "feature:".len()..];
@@ -304,10 +259,13 @@ impl Seen {
             "GNU_RELRO" => self.gnu_relro = true,
             "GNU_STACK" => {
                 // Wide format: Type Offset VirtAddr PhysAddr FileSiz MemSiz Flg Align.
-                // With no flags at all the Flg column is empty and the row is one token
-                // short.
                 let flags = if tokens.len() >= 8 { tokens[6] } else { "" };
                 self.gnu_stack = Some(flags.contains('E'));
+            }
+            "LOAD" | "TLS" => {
+                // The same columns; a row with an empty Flg column carries neither flag.
+                let flags = if tokens.len() >= 8 { tokens[6] } else { "" };
+                self.rwx_segment |= flags.contains('W') && flags.contains('E');
             }
             _ => {}
         }
@@ -352,18 +310,6 @@ impl Seen {
     }
 
     /// A symbol row of `table`. `false` when the line is not one, which ends the block.
-    ///
-    /// The columns are `Num: Value Size Type Bind Vis Ndx Name`, and two of them are not
-    /// where counting from the left puts them. The oracle prints any number of bracketed
-    /// annotations between `Vis` and `Ndx`, and appends a parenthesised version index
-    /// after `Name`. Read at a fixed `tokens[7]`, an `AArch64` row carrying `[VARIANT_PCS]`
-    /// yields `UND` as the symbol's name and loses the name itself: measured on Fedora 44
-    /// aarch64, 4 of 4758 rows of one `.dynsym` shift that way, which published `UND` as a
-    /// name and dropped `_ZGVnN2v_cos`, `_ZGVnN2v_log`, `_ZGVnN4v_cosf` and
-    /// `_ZGVnN4v_logf`. The reader had all four and the oracle did not, so the differential
-    /// reported the reader as wrong. x86_64 never prints the annotation, so the same test
-    /// passed there. `Ndx` is therefore found by skipping the annotations, and the name is
-    /// the token after it.
     fn symbol_row(&mut self, table: &str, trimmed: &str) -> bool {
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
         if tokens.first() == Some(&"Num:") {
@@ -381,8 +327,7 @@ impl Seen {
             .find(|i| !tokens[*i].starts_with('['))
             .unwrap_or(tokens.len());
         let ndx = tokens.get(ndx_at).copied().unwrap_or("");
-        // The name follows `Ndx` when there is one. A row that ends at `Ndx` is the null
-        // symbol, and a trailing `(N)` is the version index rather than a name.
+        // The name follows `Ndx` when there is one.
         let raw = tokens
             .get(ndx_at.saturating_add(1))
             .copied()
@@ -404,12 +349,6 @@ impl Seen {
 }
 
 /// Parse the oracle's `-h -l -S -d -n -s -W` output.
-///
-/// A block ends at the first line that is not one of its rows, and a blank line does not
-/// end it:
-/// the oracle prints the dynamic section and the notes of a section-header-stripped file
-/// back to back, and a parser waiting for a blank line would swallow the `x86 feature:`
-/// line and report a disagreement with a reader that is right.
 fn parse(text: &str) -> Seen {
     let mut seen = Seen::default();
     let mut block = Block::Other;
@@ -446,9 +385,6 @@ fn parse(text: &str) -> Seen {
 /// The strings the oracle printed for `-p .comment`: each `[ off] text` row, trimmed,
 /// non-empty, first occurrence kept. `None` when no dump header appeared, which is how
 /// both oracles answer for a section that is not there.
-///
-/// GNU `readelf` indents the rows and puts two spaces after the bracket; `llvm-readelf`
-/// puts one and no indent. Both print the header line first.
 fn parse_comment_dump(text: &str) -> Option<Vec<String>> {
     let mut seen_header = false;
     let mut lines: Vec<String> = Vec::new();
@@ -474,10 +410,6 @@ fn parse_comment_dump(text: &str) -> Option<Vec<String>> {
 }
 
 /// The machine names the oracle prints for the ones the reader names.
-///
-/// GNU readelf and llvm-readelf print the same ten strings for these values; an object
-/// of any other machine is skipped here, since the reader renders it as unrecognised
-/// with its number and the two oracles spell that differently.
 fn machine_name(oracle: &str) -> Option<&'static str> {
     match oracle {
         "Intel 80386" => Some("i386"),
@@ -600,8 +532,9 @@ impl Diff<'_> {
             let their_bind_now =
                 seen.dyn_tags.contains(&DT_BIND_NOW) || seen.flags_bind_now || seen.flags1_now;
             self.check("bind_now", facts.bind_now, Some(their_bind_now));
+            self.check("rwx_segment", facts.rwx_segment, Some(seen.rwx_segment));
         } else {
-            self.skipped += 4;
+            self.skipped += 5;
         }
     }
 
@@ -609,9 +542,7 @@ impl Diff<'_> {
         self.check("dynamic tags", reader_tags(facts), &seen.dyn_tags);
         self.check("needed", &facts.needed, &seen.needed);
         // `readelf -d` lists every `DT_RPATH` and `DT_RUNPATH` entry; the loader keeps the
-        // last of each, and so does the reader, which records the repeat `unread`. The
-        // differential is held to that: the reader's list is readelf's last entry, and a
-        // repeat is a truncation (the generated corpus writes several, so both hold).
+        // last of each, and so does the reader, which records the repeat `unread`.
         let last = |all: &[String]| all.last().cloned().into_iter().collect::<Vec<_>>();
         self.check("rpath", &facts.rpath, last(&seen.rpath));
         self.check("runpath", &facts.runpath, last(&seen.runpath));
@@ -651,25 +582,35 @@ impl Diff<'_> {
             .copied()
             .reduce(|a, b| a & b)
             .unwrap_or(0);
-        let arm = seen
-            .aarch64_words
-            .iter()
-            .copied()
-            .reduce(|a, b| a & b)
-            .unwrap_or(0);
+        let noted = seen.aarch64_words.iter().copied().reduce(|a, b| a & b);
+        // An unlinked aarch64 object's marking is its build attributes' where it carries no
+        // property note, and the AND of the two where it carries both; a linked file's is the
+        // note's alone.
+        let object = facts.elf_type == "ET_REL" && facts.machine == "aarch64";
+        let holds_attributes = seen.sections.contains(".ARM.attributes");
+        let arm = match (object, noted, seen.aarch64_attributes) {
+            (true, None, Some(stated)) => Some(stated),
+            (true, Some(word), Some(stated)) => Some(word & stated),
+            (true, None, None) if holds_attributes => None,
+            (_, word, _) => Some(word.unwrap_or(0)),
+        };
         self.check("x86_ibt", facts.x86_ibt, x86 & 1 != 0);
         self.check("x86_shstk", facts.x86_shstk, x86 & 2 != 0);
-        self.check("aarch64_bti", facts.aarch64_bti, arm & 1 != 0);
-        self.check("aarch64_pac", facts.aarch64_pac, arm & 2 != 0);
-        self.check("aarch64_gcs", facts.aarch64_gcs, arm & 4 != 0);
+        if let Some(arm) = arm {
+            self.check("aarch64_bti", facts.aarch64_bti, arm & 1 != 0);
+            self.check("aarch64_pac", facts.aarch64_pac, arm & 2 != 0);
+            self.check("aarch64_gcs", facts.aarch64_gcs, arm & 4 != 0);
+        } else {
+            self.skipped += 3;
+        }
     }
 
     fn sections_and_symbols(&mut self, facts: &ElfFacts, seen: &Seen) {
         // Reached by section header on both sides; with none, the reader says so and
         // the oracle prints nothing, and the comparison would be of two absences.
         let no_headers = facts.truncations.iter().any(|t| {
-            t.table == chard::elf::ElfTable::Symbols
-                && t.kind == chard::elf::TruncationKind::Unread
+            t.table == elf::ElfTable::Symbols
+                && t.kind == elf::TruncationKind::Unread
                 && t.detail.starts_with("no section-header table")
         });
         if no_headers {
@@ -708,11 +649,6 @@ impl Diff<'_> {
     }
 
     /// `.comment`, as the reader lists it against the oracle's string dump.
-    ///
-    /// Compared as sets: the reader keeps first occurrences in file order and the oracle
-    /// prints every string, and the field's consumer reads membership. Two absences (no
-    /// section on either side) are a skip, and so is a section the reader recorded as
-    /// unreadable, since the oracle would then be compared against a truncation.
     fn comment_lines(&mut self, facts: &ElfFacts, oracle: Option<Vec<String>>) {
         if facts.comment_truncation().is_some() {
             self.skipped += 1;
@@ -830,8 +766,11 @@ fn system_sample() -> Sample {
 
 fn announce(text: &str) {
     let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(text.as_bytes());
-    let _ = stderr.flush();
+    chard::error::best_effort(
+        stderr
+            .write_all(text.as_bytes())
+            .and_then(|()| stderr.flush()),
+    );
 }
 
 /// What the oracle says about `path`: the tables, and the `.comment` string dump from a
@@ -839,7 +778,7 @@ fn announce(text: &str) {
 /// the oracle's stderr when it could not read the file.
 fn ask_oracle(oracle: &Oracle, path: &Path) -> Result<(Seen, Option<Vec<String>>), String> {
     let out = Command::new(oracle.program)
-        .args(["-h", "-l", "-S", "-d", "-n", "-s", "-W"])
+        .args(["-h", "-l", "-S", "-d", "-n", "-s", "-A", "-W"])
         .arg(path)
         .output()
         .expect("running the oracle");
@@ -904,9 +843,6 @@ fn discriminators() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// `object` built, with each named section's `sh_entsize` set to `entsize` (ELF64 only).
-///
-/// The builder writes the record size; a declared size that differs is a forged header
-/// (2026-10-20), which the loader and readelf read past at the record size.
 fn with_declared_entsize(object: &elf_builder::Object, sections: &[&str], entsize: u64) -> Vec<u8> {
     assert!(object.class64, "the patch reads an ELF64 header");
     let mut d = object.build();
@@ -995,9 +931,6 @@ fn inputs(work: &common::Work) -> Inputs {
     }
 }
 
-/// Each discriminator differs from the catalogue's control in the fact it names, as the
-/// reader sees it. The oracle is not needed, so this runs on every host; it keeps the
-/// synthetic arm's second state from resting on the tally alone.
 #[test]
 fn the_discriminators_differ_from_the_control_where_they_claim() {
     let work = common::Work::new("elf", "discriminators");
@@ -1101,8 +1034,6 @@ fn differential(oracle: &Oracle, inputs: &Inputs) -> Totals {
     }
 }
 
-/// The reader agrees with `readelf` on every fact both report, over every fixture and a
-/// sample of the host's objects.
 #[test]
 fn the_reader_agrees_with_readelf_on_every_fact_both_report() {
     let verifies = "that the ELF reader agrees with readelf on the facts both report";
@@ -1151,8 +1082,7 @@ fn the_reader_agrees_with_readelf_on_every_fact_both_report() {
     ));
     assert!(
         !(common::ELF_HOST && inputs.system == 0),
-        "no ELF object sampled under {SYSTEM_ROOTS:?} on an ELF host ({} skipped as over \
-         {MAX_SYSTEM_OBJECT} bytes); the system arm ran over nothing",
+        "no ELF object under {SYSTEM_ROOTS:?} on an ELF host ({} over {MAX_SYSTEM_OBJECT} bytes)",
         inputs.oversized
     );
     if inputs.system == 0 {
@@ -1193,8 +1123,7 @@ fn the_reader_agrees_with_readelf_on_every_fact_both_report() {
         .collect();
     assert!(
         one_state.is_empty(),
-        "the synthetic arm showed {} fact(s) in one state only, so agreement on them does \
-         not tell the reader from one that answers that state unconditionally:\n  {}",
+        "the synthetic arm showed {} fact(s) in one state only:\n  {}",
         one_state.len(),
         one_state.join("\n  ")
     );
@@ -1288,18 +1217,6 @@ fn shrink(oracle: &Oracle, spec: Spec, path: &Path, failure: String) -> (Spec, S
     }
 }
 
-/// The reader agrees with `readelf` over objects drawn from a seed.
-///
-/// The fixtures are thirteen shapes someone listed. This arm draws widths, byte orders,
-/// machines, object types, dynamic tags in every `BIND_NOW` and `TEXTREL` spelling and in
-/// rotated order, zero to two property notes of either feature type on any machine,
-/// versioned and bare symbols, section names with and without a leading dot, a
-/// `.comment`, and stripped section headers, through `tests/elf_builder/generate.rs`,
-/// and compares every fact [`Diff`] compares. A failure is shrunk to the smallest spec
-/// that still fails and printed with the seed that replays it. The coverage buckets are
-/// tallied, printed, and held to [`REQUIRED_BUCKETS`] on a default-sized run, so a
-/// generator that stopped drawing a shape fails here rather than passing over fewer
-/// shapes than this comment names.
 #[test]
 fn generated_objects_agree_with_readelf() {
     let verifies = "that the ELF reader agrees with readelf over generated objects";
@@ -1338,8 +1255,7 @@ fn generated_objects_agree_with_readelf() {
         };
         let (small, why, steps) = shrink(&oracle, spec, &path, failure);
         panic!(
-            "{} ({}) disagrees with the reader on a generated object ({}).\n\
-             Shrunk in {steps} steps to:\n{small:#?}\n  {why}",
+            "{} ({}) and the reader disagree ({}); shrunk in {steps} steps:\n{small:#?}\n  {why}",
             oracle.program,
             oracle.version,
             seeded::replay(seed, case)
@@ -1389,13 +1305,6 @@ struct SeenRelocations {
 type RelocationRow = (String, u64, String);
 
 /// Parse `readelf -S -s -r -W` for [`code_relocations_agree_with_readelf`].
-///
-/// A section row is `[Nr] Name Type Address Off Size ES Flg Lk Inf Al`, with the `Flg`
-/// column empty (one token short) where a section has no flags. A `.symtab` row is read
-/// for its index, `Type` and `Vis` only. A relocation row is `Offset Info Type`, then for a
-/// symbol other than index 0 its value and the name column, which for a section symbol
-/// both oracles fill with the section's name; the symbol index comes from `Info`, by the
-/// class's split, rather than from the columns.
 fn parse_relocations(text: &str, elf64: bool) -> SeenRelocations {
     let mut seen = SeenRelocations::default();
     let mut in_symtab = false;
@@ -1624,24 +1533,6 @@ fn relocation_inputs(
     (files, written.len(), compiled)
 }
 
-/// `ElfFacts::code_relocations` against the oracle's `-r` listing, over the builder's
-/// relocatable objects for x86_64, i386 and aarch64 (a GOT reference, on x86_64 a
-/// second one through a section symbol, and on x86_64 and i386 a direct one against a
-/// hidden anchor) and for RISC-V (gcc's GOT and PLT call shapes), and, where `cc` emits
-/// ELF, over `probes/pic_object_relocs.c` compiled `-c` under -fPIC, -fPIE and -fno-pic,
-/// and under -m32 where `cc` builds it. Only objects of [`RELOCATION_MACHINES`] are
-/// compared, the machines the reader names types for; any other is counted as skipped
-/// and printed, and every builder object is compared.
-///
-/// A test asserting that every input was compared while skipping every machine but x86_64,
-/// i386 and aarch64 would fail on a riscv64 host through its own `cc` arm. A compiled object
-/// of another machine is a counted skip, and only the builder's objects, whose machines are
-/// fixed, must all be compared.
-///
-/// One difference is not the reader's and is normalised: GNU as names RISC-V's local
-/// labels `.L0 `, with a trailing space, and both oracles print the name in a
-/// whitespace-separated column that drops it. The reader's entry is compared with its
-/// trailing whitespace trimmed.
 #[test]
 fn code_relocations_agree_with_readelf() {
     let verifies = "that the ELF reader's code relocations agree with readelf -r";
@@ -1868,8 +1759,7 @@ Symbol table '.symtab' contains 2 entries:
             .iter()
             .map(|s| (*s).to_owned())
             .collect::<BTreeSet<_>>(),
-        "every name the oracle prints, whatever it begins with; the null section's row \
-         contributes none and the header row is no row"
+        "every name the oracle prints is read, and the null and header rows add none"
     );
     assert_eq!(
         seen.symbols.get("__stack_chk_fail"),
@@ -1887,20 +1777,6 @@ Symbol table '.symtab' contains 2 entries:
     assert_eq!(seen.symbols.len(), 2);
 }
 
-/// A feature bit the oracle prints by number reads as that bit, in either oracle's
-/// spelling, and an item the parser cannot read fails rather than reading as clear.
-///
-/// Most lines are captured from GNU readelf 2.42 (Ubuntu 24.04), GNU readelf 2.46.1 and
-/// llvm-readelf 22.1.8 over objects `elf_builder` wrote with one property note each: an
-/// aarch64 word of 5 (BTI and GCS; the shrunk case 16 of seed 0xc4a4d020260928, which
-/// readelf 2.42 failed on CI's pinned runner), aarch64 words of 0, 12 and 16, x86 words of
-/// 15 and 0x31, and aarch64 feature properties of data size 8 and 2, which all three print
-/// as `<corrupt length: 0x8>` and `<corrupt length: 0x2>`; the four-property x86 line is
-/// GNU readelf 2.46.1's over Fedora 44's `/usr/bin/ls`, verbatim. Three are composed, not
-/// captured: `AArch64 feature: GCS, <unknown flags: 0x8>` and `AArch64 feature: <unknown
-/// flags: 0x10>` put llvm's item spelling after GNU's prefix, so the parser is held to
-/// either spelling under either prefix, and `x86 feature: SHSTK, x86 ISA needed:
-/// x86-64-baseline` is the four-property line's shape cut to two properties.
 #[test]
 fn the_oracle_parser_reads_a_feature_bit_it_has_no_name_for() {
     let notes = [
@@ -1964,20 +1840,11 @@ fn the_oracle_parser_reads_a_feature_bit_it_has_no_name_for() {
             .unwrap_or_default();
         assert!(
             message.contains(says),
-            "{line}: an item the parser cannot read fails naming it, not a clear bit: \
-             {message:?}"
+            "{line}: the panic does not name the unread item: {message:?}"
         );
     }
 }
 
-/// The `.comment` dump parser reads both oracles' layouts, and reads no rows without
-/// the header.
-///
-/// GNU `readelf -p` (binutils 2.46.1) indents each row and separates the bracket from
-/// the text with two spaces; `llvm-readelf` (22.1.8) uses one and no indent. A section
-/// that is not there produces no header on either, and a parser that returned an empty
-/// list for that would compare an absence to the reader's absence as agreement on
-/// content.
 #[test]
 fn the_comment_dump_parser_reads_both_oracle_layouts() {
     let gnu = "\nString dump of section '.comment':\n  [     0]  GCC: (GNU) 16.2.1 20260610 (Red Hat 16.2.1-1)\n  [    2f]  Linker: LLD 22.1.8\n  [    42]  GCC: (GNU) 16.2.1 20260610 (Red Hat 16.2.1-1)\n\n";

@@ -2,41 +2,11 @@
 
 //! Kani proofs that the ELF reader's bounded reads are **total**: for every offset,
 //! every length, and every buffer, they return rather than panic.
-//!
-//! ## Why no-panic is the claim here, and not a tautology
-//!
-//! A bare no-panic harness proves nothing about arithmetic that cannot overflow. It
-//! proves something specific about *this* code, because `THREAT_MODEL.md` lists safe
-//! Rust, a size refusal, fuzzing above `Cursor` and a proof that the bounded reads are
-//! total among a crafted ELF's defences against a crash, and names the misreadings
-//! measured so far, which none of them stops, as register entries. `unsafe_code =
-//! "deny"` already rules out memory unsafety. A panic is the residual, and `Cursor` is
-//! where it would live: these four methods are the reader's only contact with
-//! attacker-chosen offsets and lengths.
-//!
-//! The existing evidence is `elf::tests::fuzz_corrupted_objects`, a seeded xorshift over
-//! mutated real binaries. That is a sample from a distribution chosen by the author. This
-//! is the ∀ the sample gestures at, over a bounded buffer.
-//!
-//! ## What the bound costs, measured
-//!
-//! `slice` is proved over a 16-byte buffer with fully symbolic `off` and `len`; both
-//! `u64`, so the whole range including the `usize` conversion failures and the
-//! `checked_add` overflow are reachable, not just in-range reads. The buffer length is the
-//! only bound, and it is small because the *interesting* structure is the arithmetic on
-//! `off`/`len`, which is unbounded here. Widening the buffer adds cases the arithmetic
-//! already covers.
-//!
-//! These proofs were only possible after `Cursor` stopped returning `anyhow::Result`. With
-//! `anyhow` on the path a proof of a four-line arithmetic helper in this file was killed at
-//! 480s having unwound `core::slice::memchr::memchr_naive` 6,687 times, while a proof
-//! touching no chard code verified in seconds. `ReadError` constructs without formatting,
-//! which is what makes the model checker's job finite.
 
 use super::{Cursor, ReadError};
 
-/// Every `(off, len)` over a fixed buffer either yields a slice of exactly `len` bytes or
-/// an error. Never a panic, never a short read.
+/// Every `(off, len)` over a fixed buffer either yields the `len` bytes of the buffer at `off`
+/// or an error. Never a panic, never a short read, never a window from elsewhere.
 #[kani::proof]
 fn slice_is_total() {
     let data: [u8; 16] = kani::any();
@@ -51,30 +21,29 @@ fn slice_is_total() {
 
     match cur.slice(off, len) {
         // The postcondition that makes this more than a no-panic check: a successful read
-        // returns exactly the width asked for. A reader that returned a short slice would
-        // feed truncated bytes to `from_le_bytes` and publish a wrong ELF fact.
+        // returns exactly the width asked for.
         Ok(got) => {
             assert!(u64::try_from(got.len()) == Ok(len));
             assert!(got.len() <= data.len());
+            // And it is the window at `off`, the same address and length, compared as pointers
+            // so no byte loop is unwound: every value clause in this file decodes the bytes
+            // `slice` returns, so a slice of the right width from another offset would pass
+            // them all.
+            let at = usize::try_from(off)
+                .ok()
+                .and_then(|start| start.checked_add(got.len()).map(|end| (start, end)));
+            let window = at.and_then(|(start, end)| data.get(start..end));
+            assert!(window.is_some_and(|w| core::ptr::eq(w, got)));
         }
         Err(_) => {}
     }
+    // `make kani` fails unless some execution reaches this line, so no assumption can leave this
+    // harness with no execution.
+    kani::cover!(true, "the end of this harness is reached");
 }
 
 /// The fixed-width readers are total, servable exactly when `slice` is, **and decode the
 /// bytes they read** under the endianness they were given.
-///
-/// The last clause is the one that makes this a proof rather than a shape check, and it was
-/// missing. This harness once asserted only the `is_ok()` agreement below, which a reader
-/// that discarded its bytes entirely, `{ self.slice(off, N)?; Ok(0) }`, satisfies. That
-/// mutant was built and run against this file: both this harness and
-/// `addr_at_follows_its_width` reported SUCCESSFUL over it, 285 checks between them. A
-/// wrong-endianness reader passed too, because `little` was symbolic and nothing depended
-/// on it.
-///
-/// The value clauses also discharge the `unwrap_or([0; N])` fallbacks in `u16_at`/`u32_at`/
-/// `u64_at`: a zero substitution cannot equal `from_le_bytes` of non-zero input, so the
-/// arm those `unwrap_or`s guard is now proved unreachable rather than assumed so.
 #[kani::proof]
 fn fixed_width_reads_are_total() {
     let data: [u8; 16] = kani::any();
@@ -121,6 +90,9 @@ fn fixed_width_reads_are_total() {
             }
         );
     }
+    // `make kani` fails unless some execution reaches this line, so no assumption can leave this
+    // harness with no execution.
+    kani::cover!(true, "the end of this harness is reached");
 }
 
 /// `addr_at` is `u64_at` on ELF64 and a widened `u32_at` on ELF32, including in the error
@@ -139,9 +111,7 @@ fn addr_at_follows_its_width() {
     assert!(cur.addr_at(off, true) == cur.u64_at(off));
     assert!(cur.addr_at(off, false) == cur.u32_at(off).map(u64::from));
 
-    // Tied to the bytes, not only to its siblings. The equalities above hold for any
-    // reader whose three functions are wrong the same way, including one that returns
-    // zero for every read.
+    // Tied to the bytes, not only to its siblings.
     if let (Ok(v), Ok(b)) = (cur.addr_at(off, false), cur.slice(off, 4)) {
         let a: [u8; 4] = [b[0], b[1], b[2], b[3]];
         let want = if little {
@@ -153,19 +123,13 @@ fn addr_at_follows_its_width() {
         // ELF32 widening never fabricates high bits.
         assert!(v <= u64::from(u32::MAX));
     }
+    // `make kani` fails unless some execution reaches this line, so no assumption can leave this
+    // harness with no execution.
+    kani::cover!(true, "the end of this harness is reached");
 }
 
 /// A refusal is a function of `(off, len, data.len())`: the same inputs always give the
 /// same classification, and each variant states the condition that produced it.
-///
-/// The classification is stated as a condition rather than asserted per variant, because a
-/// per-variant match is vacuous on a 64-bit target: `usize::try_from(u64)` cannot fail
-/// there, so `OffsetTooLarge` and `LengthTooLarge` are unreachable (`cover` on those two
-/// arms is UNSATISFIABLE) and an assertion of `usize::try_from(off).is_ok()` in the
-/// surviving arm is a tautology. Such a harness reduces to "slice returns", which
-/// `slice_is_total` already proves. On a 32-bit target the first two arms become live and
-/// these implications still hold; the `cover` calls below are what would say so rather than
-/// leaving it to be assumed.
 #[kani::proof]
 fn refusals_are_classified() {
     let data: [u8; 16] = kani::any();
@@ -206,9 +170,7 @@ fn refusals_are_classified() {
         }
     }
 
-    // Which refusals this target can actually produce. A `cover` that cannot be satisfied
-    // is reported, so an arm going dead (or coming alive on a 32-bit target) shows up
-    // here instead of silently turning an assertion into a tautology.
+    // Which refusals a 64-bit host can actually produce.
     kani::cover!(cur.slice(off, len).is_ok(), "a read is servable");
     kani::cover!(
         matches!(cur.slice(off, len), Err(ReadError::EndOverflows { .. })),
@@ -218,4 +180,51 @@ fn refusals_are_classified() {
         matches!(cur.slice(off, len), Err(ReadError::OutOfBounds { .. })),
         "the window lies outside the object"
     );
+    // `make kani` fails unless some execution reaches this line, so no assumption can leave this
+    // harness with no execution.
+    kani::cover!(true, "the end of this harness is reached");
+}
+
+/// `cstr_at`, `Cursor`'s sixth method, reads a name from inside its table: no NUL in it, at
+/// `base + off`, never past the table's declared end, and cut only by a NUL, the table's end
+/// or the buffer's end.
+#[kani::proof]
+#[kani::unwind(18)]
+fn cstr_at_reads_inside_its_table() {
+    let data: [u8; 16] = kani::any();
+    let cur = Cursor {
+        data: &data,
+        little: kani::any(),
+    };
+    let base: u64 = kani::any();
+    let off: u32 = kani::any();
+    let table_len: u64 = kani::any();
+
+    let got = cur.cstr_at(base, off, table_len);
+    assert!(got.is_ok());
+    let name = got.unwrap_or(&[]);
+    assert!(name.iter().all(|&c| c != 0));
+
+    let room = table_len.checked_sub(u64::from(off));
+    let start = usize::try_from(base.saturating_add(u64::from(off))).ok();
+    let stop = start.and_then(|s| s.checked_add(name.len()));
+    if !name.is_empty() {
+        let window = start.zip(stop).and_then(|(s, e)| data.get(s..e));
+        assert!(window.is_some_and(|w| core::ptr::eq(w, name)));
+        assert!(room.is_some_and(|room| u64::try_from(name.len()).is_ok_and(|l| l <= room)));
+    }
+    if let (Some(room), Some(s), Some(e)) = (room, start, stop) {
+        if room > 0 && s < data.len() {
+            let at_nul = data.get(e) == Some(&0);
+            let at_table_end = u64::try_from(name.len()) == Ok(room);
+            assert!(at_nul || at_table_end || e == data.len());
+        }
+    }
+    kani::cover!(
+        !name.is_empty() && stop.is_some_and(|e| data.get(e).is_some_and(|&c| c != 0)),
+        "a name cut at its table's declared end, before a NUL, is read"
+    );
+    // `make kani` fails unless some execution reaches this line, so no assumption can leave this
+    // harness with no execution.
+    kani::cover!(true, "the end of this harness is reached");
 }

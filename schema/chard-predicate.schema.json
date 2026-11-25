@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hexproofdev/chard/schema/chard-predicate.schema.json",
   "title": "chard decoder predicate",
-  "description": "A decoder for one check, written as data in the language named by $defs/language. The evaluation rules are normative in the module documentation of src/predicate/mod.rs; this schema declares the shape only. Enumerations are serde's externally tagged form: a unit variant is a string, a variant with data is a one-member object whose key is the variant's name. tests/predicate_language.rs holds every closed vocabulary here to the code and validates every conformance vector's predicate, and generated ones, against this schema. Two rules are validate's in src/predicate/mod.rs and not this schema's: clause ids are unique within a predicate, and a symbol term names a symbol on elf::WATCHED_SYMBOLS.",
+  "description": "A decoder for one check, written as data in the language named by $defs/language, whose evaluation rules are normative in src/predicate/mod.rs; an enumeration is serde's externally tagged form, a unit variant a string and a variant with data a one-member object keyed by its name. This schema declares the shape only: chard's validation also requires unique clause ids, a symbol term naming a watched symbol, and a macro or c-int term naming a valid macro name.",
   "$ref": "#/$defs/predicate",
   "$defs": {
     "language": {
-      "const": "chard-predicate/1"
+      "const": "chard-predicate/2"
     },
     "predicate": {
       "type": "object",
@@ -156,7 +156,9 @@
     },
     "elf_field": {
       "description": "The ElfFacts keys a predicate may read, as $defs/elf_facts in chard-report.schema.json spells them.",
-      "enum": [
+      "anyOf": [
+        {
+          "enum": [
         "elf_class",
         "elf_type",
         "machine",
@@ -172,6 +174,7 @@
         "bind_now",
         "gnu_stack_present",
         "gnu_stack_executable",
+        "rwx_segment",
         "df_1_noopen",
         "textrel",
         "dt_relr",
@@ -196,6 +199,11 @@
         "code_scanned",
         "code_matches",
         "function_entries"
+          ]
+        },
+        {
+          "type": "string"
+        }
       ]
     }
   }

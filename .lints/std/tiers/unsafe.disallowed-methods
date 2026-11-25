@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+{ path = "core::mem::transmute", reason = "use a typed conversion; transmute needs a reviewed #[expect]" },
+{ path = "core::mem::zeroed", reason = "use MaybeUninit or a constructor" },
+{ path = "core::str::from_utf8_unchecked", reason = "use from_utf8" },
+{ path = "core::option::Option::unwrap_unchecked", reason = "undefined behaviour on None" },
+{ path = "core::result::Result::unwrap_unchecked", reason = "undefined behaviour on Err" },
+{ path = "std::process::abort", reason = "return an error, or panic under the profile's policy" },

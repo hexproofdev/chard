@@ -1,49 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Whether a set of reports may be compared with each other at all.
-//!
-//! Every report identifies the dataset it belongs to by the pair
-//! (`run.probe_corpus_sha256`, `run.harness_revision`), the revision read with the source that
-//! named it and the rustflags the harness was built under ([`revision_key`]). The corpus hash
-//! covers the declared corpus (probe sources, control flags, gates) and the decoders that
-//! read it (`run.decoders_sha256`, folded in: the predicates and the decoder source). The
-//! revision covers the rest of the code that interprets it, which the hash cannot reach:
-//! which code decoder a check names, the triple, the gating. A refusal over differing
-//! corpora says whether the decoders moved.
-//!
-//! Both fields are recorded on every report, and a reader that ignored them would be the
-//! failure this module exists to prevent: the identity is available, the constraint is
-//! known, and without a check the only thing enforcing it would be an operator remembering
-//! it. A `table` that rendered an archived report beside a current one and said nothing
-//! would be saying nothing because saying something was nobody's job.
-//!
-//! ## Why absence is not permission
-//!
-//! A report that carries no revision at all is not evidence that it matches the others.
-//! It is a report built from a tree none of `build.rs`'s sources names a commit for (no git,
-//! no filled `REVISION`, no crate archive's `.cargo_vcs_info.json`), so it is *unknown*, and
-//! mixing an unknown with a known is exactly as unjoinable as mixing two knowns. Absence is
-//! tracked as its own value rather than skipped.
-//!
-//! ## What is deliberately not cautioned
-//!
-//! Whether the compiler measured is the one its distribution ships is not checked. A
-//! wrapper on `PATH` can make a published comparison wrong: a Wolfi row that reported
-//! `cflags: []` with fortify 3, CET and full RELRO had all of them injected by
-//! `exec /usr/bin/gcc -specs openssf.spec` from a script the sweep's own `PATH` reached
-//! first, so every column in that row was a statement about a spec file, presented as the
-//! distribution's compiler defaults.
-//!
-//! A caution keyed on what the package manager says owns the driver would fire on every
-//! report, including a stock distribution gcc. A warning that cannot be satisfied is worse
-//! than none: it trains a reader to skip the line where the attestation and dirty-tree
-//! cautions also appear.
-//!
-//! Nothing here can be re-derived from what a report carries. `configure_args` is the
-//! real driver's, so a wrapper is invisible to it, and matching it against a table of known
-//! distribution builds would be a list of its own to maintain. The facts are in the
-//! report: `toolchain.driver` is the path that was actually invoked and `profile.cflags` is
-//! what chard passed it, and reading them is the caller's, which the README says.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -60,11 +17,6 @@ pub struct Identity {
     /// Distinct `probe_corpus_sha256` values seen, mapped to the reports carrying them.
     pub corpora: BTreeMap<String, Vec<String>>,
     /// Distinct `decoders_sha256` values seen, mapped to the reports carrying them.
-    ///
-    /// Not a join key of its own: the corpus hash folds it in, so decoders that differ
-    /// already differ the corpora. It is read to say which of the two moved when the
-    /// corpora differ, since a moved decoder means the same evidence may read differently
-    /// and a moved declaration alone does not.
     pub decoders: BTreeMap<String, Vec<String>>,
     /// Distinct revision keys seen ([`revision_key`]), mapped to the reports carrying them.
     pub revisions: BTreeMap<String, Vec<String>>,
@@ -79,21 +31,9 @@ pub struct Identity {
     pub rustflags: Vec<String>,
     /// Distinct `environment.execution.mode` values seen, mapped to the reports
     /// carrying them.
-    ///
-    /// A container shares the host's kernel, so a kernel-enforced verdict from one is
-    /// not the distribution's. The field is recorded on every report, and four of the
-    /// rows in this project's own dataset are containers; `matrix` carries execution as an
-    /// axis, and the README says container and VM results "are not compared".
     pub executions: BTreeMap<String, Vec<String>>,
     /// Reports whose image was named on an operator's word, with nothing carried in to
     /// support the name.
-    ///
-    /// Not a conflict: two unattested rows are as comparable with each other as two
-    /// attested ones, because the property is about what justifies the *label* rather
-    /// than about what was measured. It is a caution because a table is read as a claim
-    /// about distributions, and a row whose distribution rests on a typed string is a
-    /// weaker claim than one whose image matched a signed manifest — a difference that
-    /// must be visible in the rendering rather than discoverable in the JSON.
     pub unattested: Vec<String>,
 }
 
@@ -119,11 +59,10 @@ pub const TREE_SOURCES: [&str; 3] = ["git", "archive", "cargo-vcs"];
 /// The revision a report joins on: `run.harness_revision`, with `[<source>]` after it unless
 /// a tree source named it, and `[rustflags <digest>]` where the harness was built under
 /// rustflags. One commit read from a clone, an archive or a crate archive is one key; the same
-/// hash asserted with `CHARD_REVISION` is another, as a `-dirty` one is, since an asserted
-/// label is the builder's word and a modified tree built under a clean hash carries no
-/// `-dirty`; so is a revision whose report names no source (written before the field, or
-/// with it removed), since absence is not permission. Reports asserted alike join among
-/// themselves, as a fleet built from one `git archive` under `CHARD_REVISION=<hash>` does.
+/// hash asserted with `CHARD_REVISION` is another, since an asserted label is the builder's
+/// word and a modified tree built under a clean hash carries no `-dirty`; so is a revision
+/// whose report names no source, since absence is not permission. Reports asserted alike
+/// join among themselves.
 pub fn revision_key(report: &Value) -> String {
     let run = report.get("run");
     let get = |key: &str| run.and_then(|r| r.get(key)).and_then(Value::as_str);
@@ -207,10 +146,9 @@ impl Identity {
                 .and_then(|e| e.get("image_attestation"))
                 .and_then(|a| a.get("status"))
                 .and_then(Value::as_str);
-            // Compared against `AttestationStatus`'s own spellings rather than against a
-            // second copy of them here. A status this does not recognise — a rename, a
-            // typo, a field from a newer schema — counts as unattested, which is the safe
-            // direction: it says less than the report claimed rather than more.
+            // Matched against `AttestationStatus`'s own spellings; a status it does not
+            // recognise counts as unattested, which says less than the report claimed rather
+            // than more.
             let established = crate::env::AttestationStatus::ALL
                 .iter()
                 .find(|s| Some(s.as_str()) == status)
@@ -229,17 +167,14 @@ impl Identity {
         id
     }
 
-    /// True when every report came from one corpus and one harness revision.
+    /// True when every report came from one corpus, one harness revision and one execution
+    /// mode.
     pub fn is_joinable(&self) -> bool {
         self.corpora.len() <= 1 && self.revisions.len() <= 1 && self.executions.len() <= 1
     }
 
     /// Why these reports are not joinable, one line per differing field. Empty when
     /// they are.
-    ///
-    /// The values are named rather than counted. "2 corpora" tells a reader they have a
-    /// problem; naming both, with the reports carrying each, tells them which pile is
-    /// the old one.
     pub fn conflicts(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.corpora.len() > 1 {
@@ -270,13 +205,12 @@ impl Identity {
     }
 
     /// Whether the decoders moved between the differing corpora, in the words a refusal
-    /// carries: the corpus hash folds `run.decoders_sha256` in, so a reader of the refusal
-    /// is told which of the declared corpus and the code that reads it changed.
+    /// carries, so its reader is told which of the declared corpus and its decoders changed.
     fn decoder_movement(&self) -> String {
         if self.decoders.contains_key(UNKNOWN) {
             format!(
-                "run.decoders_sha256 is absent from some of them (a report written before \
-                 2026-09-29 carries none), so whether the decoders moved is not stated: {}",
+                "run.decoders_sha256 is absent from some of them (a report an earlier chard \
+                 wrote carries none), so whether the decoders moved is not stated: {}",
                 describe(&self.decoders)
             )
         } else if self.decoders.len() > 1 {
@@ -287,8 +221,7 @@ impl Identity {
             )
         } else {
             format!(
-                "the decoders did not move (run.decoders_sha256 {} throughout), so the \
-                 declared corpus did",
+                "the decoders did not move (run.decoders_sha256 {} throughout)",
                 self.decoders.keys().next().map_or(UNKNOWN, String::as_str)
             )
         }
@@ -364,66 +297,13 @@ fn describe(groups: &BTreeMap<String, Vec<String>>) -> String {
         .join(" | ")
 }
 
-/// Which checks a report's own corpus contained, for telling "this corpus never had
-/// that check" apart from "that check was not measured here".
-///
-/// Read from the observations rather than from the corpus hash, because the hash
-/// identifies a corpus without describing it. Two reports from one corpus list the same
-/// flags whatever their verdicts, so a flag present in one and absent from another with a
-/// *different* hash is a corpus difference rather than a measurement gap.
-///
-/// The set is the check keys of each report's observations, and it is worth naming
-/// what it feeds, because an empty answer here is not visibly wrong: `corpus_flags` in
-/// `table` decides the `~` glyph, which distinguishes "this corpus never had that check"
-/// from "not measured here". Silently returning nothing would print the second where the
-/// first is true.
 /// Reports whose own copies of a verdict disagree with each other.
-///
-/// `measure` refuses to write a self-contradicting report to the path the operator asked
-/// for: it quarantines it to `<output>.contradicted` and exits 3, because a derived field
-/// disagreeing with the observations under it is a defect in chard rather than a finding
-/// about the toolchain. A report reaching a renderer should therefore contain no such
-/// disagreement, but a report edited after `measure` wrote it can (34 verdicts
-/// hand-flipped from `off` to `on`, say), so the renderers refuse the set
-/// ([`refuse_self_contradicted`]).
-///
-/// It names a report with no `consistency` block, one whose `contradictions` list is not
-/// empty, and one whose `consistency.status` disagrees with that list, is neither word, or
-/// stands beside no list or no rule in `rules_applied`. Each finding carries its
-/// [`FindingKind`], which the refusal's hint is chosen by.
-///
-/// It reads the copies a report carries, and re-runs only the rules in
-/// [`crate::report::REREAD_RULES`]. Those are re-run on read by
-/// [`crate::report::reread_contradictions`] through the same functions `measure` calls,
-/// over read structs that carry only the fields those rules read, so an edit to
-/// `defect_coverage[].status`, `fortify_ratchet` or `coverage.withholding` alone is named
-/// by the rule it breaks; a subtree those rules cannot read is named too. One of them,
-/// `coverage-disagrees-with-observations`, is re-run in part: its statements over
-/// `coverage.verdict_counts`, which recount the observations' verdicts key by key, so a
-/// tally relabelled between two verdicts with its sum kept is named as well. The remaining
-/// rules, `composite_agrees` and every one that reads the binary's own corpus or the
-/// profile's expansion, are not re-run: a report's `Report` type is not deserialized on
-/// read, and porting those rules to the JSON would be their second implementation.
-///
-/// What makes that checkable without re-deriving anything is that the report already
-/// carries each verdict twice: `composites[].constituents[]` copies the verdict of the
-/// observation it names. Comparing the two copies is an equality test on redundant data,
-/// not a second implementation of `composite_agrees` — the rule lives in one place still,
-/// and this only asks whether the file is internally consistent with itself.
-///
-/// **Not an integrity control, and it must not be read as one.** It catches an edit that
-/// touched one copy and not the other, a truncated or merged file, a report assembled by
-/// hand. Anyone who edits both copies defeats it, and nothing inside a self-describing
-/// file can do better. Integrity of a report in transit is the caller's: sign it, or
-/// obtain it over a channel you trust. `THREAT_MODEL.md` carries the row this makes visible.
 pub fn self_contradicted(reports: &[(String, Value)]) -> Vec<Finding> {
     let mut out = Vec::new();
     for (name, report) in reports {
-        // The derived-field rules that need nothing outside the file, re-run over it as
-        // written. A report `measure` published passes them by construction, so a finding
-        // here is an edit, a file assembled elsewhere, or a report held to a rule whose
-        // contract changed since it was written; an older shape is typed as that where it is
-        // made ([`crate::report::Reread::older`]).
+        // A report `measure` published passes the re-run rules by construction, so a finding
+        // is an edit, a file assembled elsewhere, or a rule whose contract changed since; an
+        // older shape is typed as that where it is made (`report::Reread::older`).
         let reread = crate::report::reread_contradictions(report);
         let mut found = Vec::new();
         contradictions_of(name, report, &reread, &mut found);
@@ -487,10 +367,7 @@ fn contradictions_of(
     out: &mut Vec<String>,
 ) {
     if report.get("consistency").is_none() {
-        out.push(format!(
-            "{name} carries no `consistency` block, so whether its derived fields agree \
-             with its observations is unknown — every chard report has one"
-        ));
+        out.push(format!("{name} carries no `consistency` block"));
     }
     let consistency = report.get("consistency");
     let listed = consistency
@@ -499,23 +376,17 @@ fn contradictions_of(
         .map_or(0, Vec::len);
     if listed > 0 {
         out.push(format!(
-            "{name} reports {listed} contradiction(s) of its own; `measure` quarantines \
-             such a report rather than writing it here"
+            "{name} reports {listed} contradiction(s) of its own"
         ));
     }
-    // The status word `measure` derives from that list, read for what the list alone
-    // does not show: `contradicted` beside an empty list (a quarantined file edited and
-    // renamed), a word that is neither, and a worded block missing the list or naming
-    // no rule, which `measure` never writes. A report written before the word existed
-    // carries none, and its list is read as above.
+    // The status word, for what the list alone does not show (`status_disagrees`).
     if let Some(consistency) = consistency {
         out.extend(status_disagrees(name, consistency));
     }
 
     for c in &reread.contradictions {
         out.push(format!(
-            "{name} fails `{}` when the rule is re-run on read ({}: {}); `measure` \
-             refuses a report that fails it",
+            "{name} fails `{}` when the rule is re-run on read ({}: {})",
             c.rule,
             c.property,
             c.claims.join(" vs ")
@@ -525,12 +396,8 @@ fn contradictions_of(
         out.push(format!("{name}: {u}"));
     }
 
-    // Explicitly, rather than defaulting an absent list to an empty map: with no
-    // observations there is nothing to compare the composites against, and a silent
-    // empty map would make that read as "checked, and consistent". The read
-    // ([`refuse_unread`]) refuses a document with no observations list before it
-    // reaches here, and the renderers refuse one for a caller that skipped it, so skipping is
-    // right — leaving it implicit is what would not be.
+    // Returned from explicitly rather than defaulted to an empty map, which would read as
+    // checked and consistent.
     let Some(observations) = report.get("observations").and_then(Value::as_array) else {
         return;
     };
@@ -588,6 +455,8 @@ pub fn moved_rule_notes(reports: &[(String, Value)]) -> Vec<String> {
         .collect()
 }
 
+/// The `flag` of each of a report's observations: the flags its own corpus contained, for
+/// telling "this corpus never had that flag" apart from "not measured here" (`table`'s `~`).
 pub fn flags_of(report: &Value) -> BTreeSet<String> {
     report
         .get("observations")
@@ -602,11 +471,6 @@ pub fn flags_of(report: &Value) -> BTreeSet<String> {
 }
 
 /// A file the caller handed `table` or `matrix` that is not a chard measurement report.
-///
-/// One constructor for both commands, so the class and the hint agree. It is the
-/// caller's invocation to correct: a text file, an empty object or a report of some other
-/// tool's are all things `chard measure -o` never wrote, and sending them to `INTERNAL`
-/// would tell a sweep across dozens of images to file a bug for a wrong path.
 pub fn not_a_report(name: &str, why: &str) -> UserError {
     UserError::with_hint(
         format!("{name} is not a chard measurement report: {why}"),
@@ -616,28 +480,6 @@ pub fn not_a_report(name: &str, why: &str) -> UserError {
 
 /// The bytes of a file the caller handed `table` or `matrix`, refused from its metadata
 /// when no `read` could turn it into a report.
-///
-/// A directory, a device or a socket is refused before the open: none carries a report,
-/// and a `read` on a socket answers with an errno (`ENOTSUP`, `ENXIO`) the envelope can
-/// only report as chard's own. A FIFO is read, since a report piped in (`chard table
-/// <(...)`) is a legitimate source, and a path that does not exist is left to the read,
-/// so its errno reaches the envelope under the same context as any other io failure.
-///
-/// A file named as chard names a report it did not publish, `<output>.contradicted` or
-/// `<output>.previous`, is refused by its name before anything is read. The name is
-/// chard's own statement about the file: the first is a refused report kept as evidence
-/// for a bug report, the second an earlier run's report set aside by a run that has not
-/// published. Neither is a current measurement, and the case that matters is a glob such
-/// as `dir/*` that sweeps one in beside the reports; the content check
-/// ([`refuse_self_contradicted`]) catches a quarantine renamed to look published, and this
-/// catches one edited to look consistent and an earlier report that is consistent and
-/// stale. An operator who means to read one as a measurement renames it, which is a
-/// decision on the record rather than a glob's accident. A third name is refused the same
-/// way, `<output>.partial`: `report::write_output` writes a publication
-/// there and renames it into place, so one is found only where a run stopped between the
-/// two, and it may hold part of a report. That name carries the writing process's id and a
-/// counter, `<output>.partial.<pid>.<n>`, so two runs sharing one `-o` do not share it, and
-/// both forms are refused (`report::is_partial_name`).
 ///
 /// # Errors
 ///
@@ -651,8 +493,7 @@ pub fn read_report_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
         return Err(unpublished(
             path,
             "it is the quarantine `measure` writes for a report that contradicts itself",
-            "it is evidence for a chard bug report, readable as JSON, not a measurement: \
-             leave it out of the set",
+            "it is evidence for a chard bug report, readable as JSON",
         )
         .into());
     }
@@ -660,8 +501,7 @@ pub fn read_report_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
         return Err(unpublished(
             path,
             "it is an earlier report a later run set aside and has not replaced",
-            "the run that set it aside did not publish; re-run it, or rename the file to \
-             read it as the earlier measurement it is",
+            "the run that set it aside did not publish",
         )
         .into());
     }
@@ -670,7 +510,7 @@ pub fn read_report_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
             path,
             "it is the temporary file a publication writes before renaming it into place, \
              left by a run that stopped between the two",
-            "it may be truncated and was never published; re-run the measurement",
+            "it may be truncated and was never published",
         )
         .into());
     }
@@ -689,20 +529,12 @@ pub fn read_report_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
 /// Read and parse every path of a `table` or `matrix` input set, each through
 /// [`read_report_bytes`], into the `(name, value)` pairs the renderers judge.
 ///
-/// Reading is the invocation's own validation and comes before `main` sets an earlier
-/// output aside: a path that is missing, unreadable, not JSON or named as unpublished is
-/// the operator's line to fix, and refusing it here leaves the earlier output untouched,
-/// where judging the set (its identity, a report that contradicts itself) happens after
-/// the set-aside, so a refused set leaves no earlier output at `-o`.
-///
 /// # Errors
 ///
 /// Those of [`read_report_bytes`], [`not_a_report`] for bytes that are not JSON, and those
 /// of [`refuse_unread`]. The `UserError` is the context object, so the parser's own text
 /// stays in the chain and `error::classify` still finds the marker above it.
-pub fn read_reports(
-    paths: &[std::path::PathBuf],
-) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+pub fn read_reports(paths: &[std::path::PathBuf]) -> anyhow::Result<Vec<(String, Value)>> {
     paths.iter().map(|p| read_report(p)).collect()
 }
 
@@ -712,15 +544,14 @@ pub fn read_reports(
 /// # Errors
 ///
 /// Those of [`read_reports`].
-pub fn read_report(path: &Path) -> anyhow::Result<(String, serde_json::Value)> {
+pub fn read_report(path: &Path) -> anyhow::Result<(String, Value)> {
     use anyhow::Context as _;
-    // Refused from the metadata for a shape no read could turn into a report, then bytes
-    // rather than a `String`, so a file that is not UTF-8 (an object handed to `table` by
-    // mistake) is the parser's refusal and the caller's input, where a `read_to_string`
-    // would have failed with `InvalidData` that the envelope can only report as chard's own.
+    // Bytes rather than a `String`, so a file that is not valid Unicode text is the parser's
+    // refusal and the caller's input, where `read_to_string`'s `InvalidData` would read as
+    // chard's own.
     let bytes = read_report_bytes(path)?;
     let name = path.display().to_string();
-    let value: serde_json::Value =
+    let value: Value =
         serde_json::from_slice(&bytes).with_context(|| not_a_report(&name, "it is not JSON"))?;
     refuse_unread(&name, &value)?;
     Ok((name, value))
@@ -728,40 +559,34 @@ pub fn read_report(path: &Path) -> anyhow::Result<(String, serde_json::Value)> {
 
 /// A report this chard does not read, refused before any rule runs over it: first one
 /// whose `chard_schema` is not [`crate::report::SCHEMA_VERSION`] ([`refuse_other_schema`]),
-/// then a document with no `observations` list, which is not a report at all (chard's
-/// matrix, probe listing, `detect` output and error envelope carry the version and no list,
-/// and are named as what they are rather than as a report that lost its digest), then one
-/// whose `digest` is absent or not an object ([`missing_digest`]).
-///
-/// The version is the file's own statement of which shape it has, and a binary that reads
-/// one shape cannot say what another's fields mean: a later version may rename a key this
-/// reader then finds absent, or give a value a meaning this reader takes for its own. So the
-/// comparison comes first, before the digest's presence and before every consistency rule,
-/// and a report that is both of another version and digest-forged is named for its version.
-/// It compares the file with the binary, not the file with itself, so it is a refusal like
-/// the quarantine's above and joins neither `report::RULES` nor `report::REREAD_RULES`.
-///
-/// The digest is required because every report `measure` publishes leads with it and the
-/// shipped schema requires it, and because without it `table` and `matrix` would read
-/// verdicts from fields no digest restates: an edit to a row, its digest removed, read as
-/// written. A development build wrote reports without one before the digest existed; chard
-/// is unpublished until 0.1.0, so no published chard did. A `digest` that is present and
-/// not an object (`null` among them) is refused the same way, by its presence check and not
-/// by the digest rule that would name it later.
-///
-/// Both are refusals of the read: `main` makes them before it sets an earlier output aside,
-/// so an earlier output at `-o` is left in place and no `.previous` is written, since
-/// nothing was read as a report. `chard detect` makes the version comparison alone over a
-/// report it replays (`detect::decode_evidence`).
+/// then a document with no `observations` list, which is not a report at all (chard's other
+/// documents carry the version and no list), then one whose `decoders.language` is not
+/// [`crate::predicate::LANGUAGE`], which the schema holds that version to, then one whose
+/// `digest` is absent or not an object ([`missing_digest`]).
 ///
 /// # Errors
 ///
 /// A [`UserError`] naming the file's version and the binary's, a document that is not a
-/// report, or the missing digest.
+/// report, a predicate language this chard does not read, or the missing digest.
 pub fn refuse_unread(name: &str, report: &Value) -> Result<(), UserError> {
     refuse_other_schema(name, report)?;
     if !report.get("observations").is_some_and(Value::is_array) {
         return Err(not_a_report(name, "it carries no observations"));
+    }
+    if let Some(decoders) = report.get("decoders") {
+        let language = decoders.get("language");
+        if language.and_then(Value::as_str) != Some(crate::predicate::LANGUAGE) {
+            let carries = language.map_or_else(|| "no `language`".to_owned(), bounded);
+            return Err(UserError::with_hint(
+                format!(
+                    "{name} carries `chard_schema` \"{}\" and `decoders.language` {carries}, \
+                     where a report at that version names \"{}\"",
+                    crate::report::SCHEMA_VERSION,
+                    crate::predicate::LANGUAGE
+                ),
+                "pass the JSON that `chard measure -o` wrote with this chard",
+            ));
+        }
     }
     match report.get("digest") {
         Some(digest) if digest.is_object() => Ok(()),
@@ -771,8 +596,7 @@ pub fn refuse_unread(name: &str, report: &Value) -> Result<(), UserError> {
                  publishes leads with",
                 bounded(other)
             ),
-            "pass the JSON that `chard measure -o` wrote, or run `chard measure` again with \
-             this build",
+            "pass the JSON that `chard measure -o` wrote",
         )),
         None => Err(missing_digest(name)),
     }
@@ -793,19 +617,106 @@ fn bounded(value: &Value) -> String {
 /// How much of a file's own value a refusal quotes.
 const SHOWN: usize = 64;
 
+/// A report version a published chard wrote and this one does not read.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedReportVersion {
+    /// The `chard_schema` the release wrote reports at.
+    pub version: &'static str,
+    /// The release.
+    pub release: &'static str,
+    /// The release's `run.decoders_sha256`, which every report it wrote carries. A
+    /// development build near that release wrote the same version, and where its decoders
+    /// differ its reports carry another digest.
+    pub decoders_sha256: &'static str,
+}
+
+/// Each report version a published chard wrote and this one does not read, so a refusal of a
+/// report at one can name the chard that reads it (`published_version_hint`).
+pub const PUBLISHED_REPORT_VERSIONS: &[PublishedReportVersion] = &[PublishedReportVersion {
+    version: "1",
+    release: "0.1.0",
+    decoders_sha256: "eb6b19cbc50e65139c2c085658d067b5e504223cb2400378b6c1bc61f650c07f",
+}];
+
+/// The hint for a report-shaped file at a version [`PUBLISHED_REPORT_VERSIONS`] names: the
+/// release, where the file's `run.decoders_sha256` is the release's; a development build or an
+/// edit, where it carries another digest; and neither where it carries none, since nothing in
+/// the file then says which chard wrote it. The development build's hint names
+/// `run.harness_revision` only where the file carries one.
+fn published_version_hint(
+    report: &Value,
+    at: &Value,
+    published: &PublishedReportVersion,
+) -> String {
+    let release = published.release;
+    let run = report.get("run");
+    let decoders = run
+        .and_then(|run| run.get("decoders_sha256"))
+        .and_then(Value::as_str);
+    match decoders {
+        Some(digest) if digest == published.decoders_sha256 => format!(
+            "`chard_schema` {} is the version chard {release} published reports at, and this report's `run.decoders_sha256` is chard {release}'s: read this one with chard {release}",
+            bounded(at)
+        ),
+        Some(_) => {
+            let build = if run
+                .and_then(|run| run.get("harness_revision"))
+                .is_some_and(Value::is_string)
+            {
+                "the build its `run.harness_revision` names"
+            } else {
+                "the build that wrote it"
+            };
+            format!(
+                "`chard_schema` {} with a `run.decoders_sha256` that is not chard {release}'s: chard {release} did not write this report as it stands, so a development build did, under rules chard {release} may not apply, or it was edited; read it with {build}",
+                bounded(at)
+            )
+        }
+        None => format!(
+            "`chard_schema` {} is the version chard {release} and the development builds around it wrote reports at",
+            bounded(at)
+        ),
+    }
+}
+
+/// The `chard_schema` of each document this chard writes that is not a report: a matrix,
+/// `detect`'s output, the probe listing and the error envelope.
+const OTHER_DOCUMENT_VERSIONS: [&str; 4] = [
+    crate::matrix::MATRIX_SCHEMA_VERSION,
+    crate::detect::SCHEMA_VERSION,
+    crate::probe::LISTING_SCHEMA_VERSION,
+    crate::error::SCHEMA_VERSION,
+];
+
 /// The version half of [`refuse_unread`]: `report`'s `chard_schema` absent, not a string,
 /// or a string other than [`crate::report::SCHEMA_VERSION`] (`"1 "` among them) is refused,
-/// the message naming what the file carries, as JSON so a number reads apart from a
-/// string (cut by [`bounded`]), beside the version this chard reads.
+/// naming what the file carries as JSON, so a number reads apart from a string.
 ///
 /// # Errors
 ///
-/// A [`UserError`] for any `chard_schema` but this binary's.
+/// A [`UserError`] for any `chard_schema` but this binary's, except another document's
+/// version on a file that is not report-shaped.
 pub fn refuse_other_schema(name: &str, report: &Value) -> Result<(), UserError> {
     let reads = crate::report::SCHEMA_VERSION;
+    let report_shaped = report.get("observations").is_some_and(Value::is_array);
+    let mut hint = "pass the JSON that `chard measure -o` wrote with this chard".to_owned();
     let carries = match report.get("chard_schema") {
         Some(Value::String(version)) if version == reads => return Ok(()),
-        Some(other) => format!("it carries `chard_schema` {}", bounded(other)),
+        Some(Value::String(version))
+            if !report_shaped && OTHER_DOCUMENT_VERSIONS.contains(&version.as_str()) =>
+        {
+            return Ok(());
+        }
+        Some(other) => {
+            if let Some(published) = other.as_str().filter(|_| report_shaped).and_then(|v| {
+                PUBLISHED_REPORT_VERSIONS
+                    .iter()
+                    .find(|published| published.version == v)
+            }) {
+                hint = published_version_hint(report, other, published);
+            }
+            format!("it carries `chard_schema` {}", bounded(other))
+        }
         None => "it carries no `chard_schema`".to_owned(),
     };
     Err(UserError::with_hint(
@@ -813,8 +724,7 @@ pub fn refuse_other_schema(name: &str, report: &Value) -> Result<(), UserError> 
             "{name} is not a report this chard reads: {carries}, and this chard reads \
              `chard_schema` \"{reads}\" alone"
         ),
-        "pass the JSON that `chard measure -o` wrote with this chard, or read the file with \
-         the chard that wrote it",
+        hint,
     ))
 }
 
@@ -822,13 +732,8 @@ pub fn refuse_other_schema(name: &str, report: &Value) -> Result<(), UserError> 
 #[must_use]
 pub fn missing_digest(name: &str) -> UserError {
     UserError::with_hint(
-        format!(
-            "{name} carries no `digest`: every report chard publishes leads with one, so this \
-             one was edited after it was written, was written by a development build from \
-             before the digest, or is not a report"
-        ),
-        "pass the JSON that `chard measure -o` wrote, or run `chard measure` again with this \
-         build",
+        format!("{name} carries no `digest`: every report chard publishes leads with one"),
+        "pass the JSON that `chard measure -o` wrote",
     )
 }
 
@@ -851,8 +756,7 @@ fn status_disagrees(name: &str, consistency: &Value) -> Option<String> {
     let status = consistency.get("status")?;
     let Some(list) = consistency.get("contradictions").and_then(Value::as_array) else {
         return Some(format!(
-            "{name} carries `consistency.status` {status} and no `contradictions` list; \
-             `measure` writes the list beside the word, `[]` when empty"
+            "{name} carries `consistency.status` {status} and no `contradictions` list"
         ));
     };
     let rules = consistency
@@ -861,8 +765,7 @@ fn status_disagrees(name: &str, consistency: &Value) -> Option<String> {
         .map_or(0, Vec::len);
     if rules == 0 {
         return Some(format!(
-            "{name} carries `consistency.status` {status} and no rule in `rules_applied`, \
-             so neither word is true of it"
+            "{name} carries `consistency.status` {status} and no rule in `rules_applied`"
         ));
     }
     let derived = if list.is_empty() {
@@ -879,29 +782,11 @@ fn status_disagrees(name: &str, consistency: &Value) -> Option<String> {
         format!("{} contradiction(s)", list.len())
     };
     Some(format!(
-        "{name} carries `consistency.status` {status} beside {beside}; `measure` writes \
-         `consistent` beside an empty list and `contradicted` beside a non-empty one"
+        "{name} carries `consistency.status` {status} beside {beside}"
     ))
 }
 
 /// Refuse a set of reports any one of which [`self_contradicted`] names.
-///
-/// Rendering such a report with a `CONTRADICTED` note and exit 0 would be the shape
-/// `report::publish` refuses for `measure`: a job that ignores the note, as one ignoring an
-/// exit status does, would read the verdicts as measured. A note travels with the output only
-/// as far as a reader looks. So the set is refused, whole, as the caller's
-/// input (`USER_INPUT`, exit 2): the action next is theirs, to leave the file out of the set,
-/// and the contradiction is a chard defect only in the run that wrote it, which is not this
-/// one; exit 3 says this run disagreed with itself. The rest of the set is not
-/// rendered without it, since a column silently dropped from a sweep is a clean-looking
-/// absence.
-///
-/// The hint opens with the action the findings call for, by their [`FindingKind`]: a report
-/// every finding of which is [`FindingKind::Older`] is from another revision, to be read with
-/// that revision or measured again, and a set holding only such reports is told that first,
-/// where the contradiction advice would send its reader to file a bug that is not one. A set
-/// holding a contradiction opens with the contradiction advice and names its older reports
-/// after it. Either way the set is refused with exit 2.
 ///
 /// # Errors
 ///
@@ -927,9 +812,7 @@ pub fn refuse_self_contradicted(reports: &[(String, Value)]) -> Result<(), UserE
 /// What to do about the reports `found` names, opening with the action they call for
 /// ([`refuse_self_contradicted`]).
 fn refusal_hint(found: &[Finding]) -> String {
-    const CONTRADICTION: &str = "leave out of the set a report that contradicts itself, which \
-                                 is evidence for a chard bug report, readable as JSON, not a \
-                                 measurement";
+    const CONTRADICTION: &str = "leave out of the set a report that contradicts itself";
     // In the order the set named them; a report is older when every finding naming it is.
     let mut named: Vec<&str> = Vec::new();
     for f in found {
@@ -1002,8 +885,6 @@ fn remedies(reports: usize) -> String {
 mod tests {
     use super::*;
 
-    /// A report naming no revision keys on the revision word alone, whatever source it
-    /// names beside it.
     #[test]
     fn a_report_without_a_revision_keys_on_no_source() {
         let bare = revision_key(&serde_json::json!({"run": {}}));
@@ -1014,12 +895,130 @@ mod tests {
         );
     }
 
-    /// [`refuse_unread`] both ways: a report at this chard's `chard_schema` with a digest
-    /// passes; every other `chard_schema` is refused naming what the file carries and the
-    /// version this chard reads, with or without a digest and before the digest's absence;
-    /// a document with no `observations` list is refused as not a report before its digest
-    /// is looked for; and a report at this version whose digest is absent or not an object
-    /// is refused naming it.
+    #[test]
+    fn a_report_at_a_published_version_names_the_chard_its_digest_names() {
+        use serde_json::json;
+        let mut fed = 0;
+        for published in PUBLISHED_REPORT_VERSIONS {
+            let (version, release) = (published.version, published.release);
+            assert_ne!(version, crate::report::SCHEMA_VERSION);
+            assert_eq!(published.decoders_sha256.len(), 64);
+            let other = "ab".repeat(32);
+            let named = format!("read this one with chard {release}");
+            let built = format!("chard {release} did not write this report as it stands");
+            let unnamed = "carries no `run.decoders_sha256` to say which".to_owned();
+            for (run, _, _) in [
+                (
+                    Some(json!({"decoders_sha256": published.decoders_sha256})),
+                    &named,
+                    false,
+                ),
+                (Some(json!({"decoders_sha256": other})), &built, false),
+                (
+                    Some(json!({"decoders_sha256": other, "harness_revision": null})),
+                    &built,
+                    false,
+                ),
+                (
+                    Some(json!({"decoders_sha256": other, "harness_revision": "0123abc"})),
+                    &built,
+                    true,
+                ),
+                (Some(json!({"decoders_sha256": null})), &unnamed, false),
+                (Some(json!({"decoders_sha256": 7})), &unnamed, false),
+                (Some(json!({})), &unnamed, false),
+                (None, &unnamed, false),
+            ] {
+                for with_digest in [true, false] {
+                    let mut report = json!({"chard_schema": version, "observations": []});
+                    if let Some(run) = &run {
+                        report["run"] = run.clone();
+                    }
+                    if with_digest {
+                        report["digest"] = json!({});
+                    }
+                    let refused = refuse_unread("r.json", &report).expect_err("refused");
+                    fed += 1;
+                    assert!(
+                        refused
+                            .message
+                            .contains(&format!("carries `chard_schema` \"{version}\",")),
+                        "{}",
+                        refused.message
+                    );
+                    assert!(refused.hint.is_some(), "a refusal carries a hint");
+                }
+            }
+        }
+        assert_eq!(fed, 16 * PUBLISHED_REPORT_VERSIONS.len());
+    }
+
+    #[test]
+    fn a_report_in_another_language_is_refused_and_other_documents_are_named() {
+        use serde_json::json;
+        // Another language, none, or a `decoders` with no `language` is refused; a report
+        // with no `decoders` carries no predicate to misread.
+        let current = |decoders: Option<Value>| {
+            let mut report = json!({"chard_schema": crate::report::SCHEMA_VERSION,
+                                    "observations": [], "digest": {}});
+            if let Some(decoders) = decoders {
+                report["decoders"] = decoders;
+            }
+            refuse_unread("r.json", &report)
+        };
+        current(None).expect("no decoders");
+        current(Some(
+            json!({"language": crate::predicate::LANGUAGE, "predicates": []}),
+        ))
+        .expect("this chard's language");
+        for decoders in [
+            json!({"language": "chard-predicate/1", "predicates": []}),
+            json!({"language": 2, "predicates": []}),
+            json!({"predicates": []}),
+            json!(null),
+        ] {
+            let refused = current(Some(decoders.clone())).expect_err("another language");
+            assert!(
+                refused.message.contains("`decoders.language`"),
+                "{decoders}: {}",
+                refused.message
+            );
+        }
+        // The release is named for a report's shape alone: the same version on a document
+        // with no observations list, or as a number, names none.
+        let unshaped = refuse_unread("r.json", &json!({"chard_schema": 1, "observations": []}))
+            .expect_err("a number is refused");
+        assert!(
+            !unshaped
+                .hint
+                .expect("a refusal carries a hint")
+                .contains("0.1.0")
+        );
+        // Each of chard's other documents at the version this chard writes for it is named
+        // as not a report, not refused for its version.
+        for version in OTHER_DOCUMENT_VERSIONS {
+            let said = refuse_unread("m.json", &json!({"chard_schema": version, "cells": []}))
+                .expect_err("not a report")
+                .to_string();
+            assert!(
+                said.contains("carries no observations"),
+                "{version}: {said}"
+            );
+            assert!(!said.contains("`chard_schema`"), "{version}: {said}");
+        }
+        // A version neither a report nor another document carries is refused for it, list
+        // or none.
+        for report in [
+            json!({"chard_schema": "99", "observations": []}),
+            json!({"chard_schema": "99"}),
+        ] {
+            let said = refuse_unread("r.json", &report)
+                .expect_err("refused")
+                .to_string();
+            assert!(said.contains("carries `chard_schema` \"99\","), "{said}");
+        }
+    }
+
     #[test]
     fn a_report_of_another_chard_schema_or_without_a_digest_is_not_read() {
         use serde_json::json;
@@ -1119,9 +1118,6 @@ mod tests {
         assert!(said.contains("carries no `chard_schema`"), "{said}");
     }
 
-    /// A directory is refused from its metadata as the caller's, with the shape named;
-    /// the socket and the device are held through the built binary in
-    /// `tests/error_classes.rs`, and a path to nothing keeps its errno.
     #[test]
     fn a_report_path_that_cannot_hold_a_report_is_refused_from_its_metadata() {
         let dir = std::env::temp_dir().join(format!("chard-notreport-{}", std::process::id()));
@@ -1145,12 +1141,6 @@ mod tests {
         crate::error::best_effort(std::fs::remove_dir_all(&dir));
     }
 
-    /// The truncation is a boundary, and both sides of it are rendered differently.
-    ///
-    /// `describe_list` shows six names and `describe` three, each with a `+N more` tail
-    /// that must appear exactly when something was left out. Inverting either equality
-    /// prints `+0 more` on a complete list, or drops the tail from a truncated one and
-    /// tells a reader they are seeing everything.
     #[test]
     fn a_truncated_list_says_so_and_a_complete_one_does_not() {
         let names = |n: usize| -> Vec<String> { (0..n).map(|i| format!("r{i}")).collect() };
@@ -1185,21 +1175,14 @@ mod tests {
         })
     }
 
-    /// A report that contradicts itself is named, and one that does not is left alone.
-    ///
-    /// `measure` exits 3 rather than writing a self-contradicted report, so one appearing
-    /// in a dataset means it was assembled from somewhere else. The filter is on the list
-    /// being non-empty: without the negation every report with a `contradictions` key —
-    /// which is every report, since the field is published unconditionally — would be
-    /// accused of contradicting itself.
     #[test]
     fn only_a_report_that_contradicts_itself_is_named() {
-        let with = |contradictions: serde_json::Value| {
+        let with = |contradictions: Value| {
             serde_json::json!({
                 "consistency": {"contradictions": contradictions},
                 "environment": environment(),
                 "observations": [],
-                "coverage": {"checks_attempted": 0, "corpus_checks_total": 0,
+                "coverage": {"checks_expected": 0, "checks_valid": 0, "checks_attempted": 0, "corpus_checks_total": 0,
                              "verdict_counts": {}, "all_verdicts_published": true,
                              "withholding": {"published": 0,
                                              "earned_limitations": {"count": 0, "no_named_cause": 0},
@@ -1211,14 +1194,15 @@ mod tests {
         let dirty = with(serde_json::json!([{"rule": "r", "property": "p"}]));
 
         // The status word: agreeing with the list adds nothing, disagreeing is named once.
-        let worded = |contradictions: serde_json::Value, status: &str| {
+        let worded = |contradictions: Value, status: &str| {
             let mut r = with(contradictions);
             r["consistency"]["status"] = serde_json::json!(status);
             r["consistency"]["rules_applied"] = json!(["r"]);
             r
         };
         assert!(
-            self_contradicted(&[("clean".to_owned(), worded(json!([]), "consistent"))]).is_empty()
+            self_contradicted(&[("clean".to_owned(), worded(json!([]), "consistent"))]).is_empty(),
+            "a consistent report with no contradiction is not self-contradicted"
         );
         let quarantined = worded(json!([{"rule": "r", "property": "p"}]), "contradicted");
         assert_eq!(self_contradicted(&[("q".to_owned(), quarantined)]).len(), 1);
@@ -1264,17 +1248,6 @@ mod tests {
         );
     }
 
-    /// A hand-edited report is not rendered as a clean bill of health.
-    ///
-    /// Measured with this check taken out: flipping 34 verdicts from `off` to `on` in a real
-    /// report and running `chard table` over it prints `cet on`, `pie on`, `fortify on`
-    /// and thirty more, exit 0. The file is contradictory in a way chard knows how to
-    /// describe: `composite-verdict-disagrees-with-constituents` is a rule it implements
-    /// and names in its own output. But the rules run once inside `measure`, and a
-    /// renderer that does not look prints past them.
-    ///
-    /// The redundancy is what makes it checkable on read: a composite constituent carries
-    /// a copy of the verdict of the observation it names.
     #[test]
     fn a_report_whose_two_copies_of_a_verdict_disagree_is_named() {
         let honest = json!({
@@ -1284,7 +1257,7 @@ mod tests {
             "composites": [{"id": "fhardened-effective",
                             "constituents": [{"check": "pie", "verdict": "off"}]}],
             "consistency": {"rules_applied": [], "fields_checked": []},
-            "coverage": {"checks_attempted": 1, "corpus_checks_total": 1,
+            "coverage": {"checks_expected": 1, "checks_valid": 0, "checks_attempted": 1, "corpus_checks_total": 1,
                          "verdict_counts": {"off": 1}, "all_verdicts_published": true,
                          "withholding": {"published": 1,
                                          "earned_limitations": {"count": 0, "no_named_cause": 0},
@@ -1324,7 +1297,7 @@ mod tests {
         let stripped = json!({
             "environment": environment(),
             "observations": [], "composites": [],
-            "coverage": {"checks_attempted": 0, "corpus_checks_total": 0,
+            "coverage": {"checks_expected": 0, "checks_valid": 0, "checks_attempted": 0, "corpus_checks_total": 0,
                          "verdict_counts": {}, "all_verdicts_published": true,
                          "withholding": {"published": 0,
                                          "earned_limitations": {"count": 0, "no_named_cause": 0},
@@ -1336,21 +1309,17 @@ mod tests {
         );
     }
 
-    /// A derived field edited alone, with every copy of every verdict left agreeing, is
-    /// named by the rule it breaks; the same report unedited is not named.
-    ///
-    /// The copies agree, so only a rule re-run on read can name it.
     #[test]
     fn a_derived_field_edited_alone_is_named_by_its_rule() {
         let honest = json!({
             "environment": environment(),
             "observations": [{"check": "pie", "flag": "-pie", "verdict": "off",
                               "defects": ["address-layout-disclosure"],
-                              "observes": "protection"}],
+                              "observes": "protection", "polarity": "harden"}],
             "defect_coverage": {"address-layout-disclosure": {
                 "status": "not-mitigated", "from_checks": ["pie"],
                 "verdict_counts": {"off": 1}}},
-            "coverage": {"checks_attempted": 1, "corpus_checks_total": 1,
+            "coverage": {"checks_expected": 1, "checks_valid": 0, "checks_attempted": 1, "corpus_checks_total": 1,
                          "verdict_counts": {"off": 1}, "all_verdicts_published": true,
                          "withholding": {"published": 1,
                                          "earned_limitations": {"count": 0, "no_named_cause": 0},
@@ -1407,9 +1376,7 @@ mod tests {
             "run": run,
             "environment": {"execution": execution},
             // The keys `measure` actually emits, so a caution that fires here fires on a
-            // real report too. A helper writing a `toolchain.provenance.status` that no
-            // report carries would let a caution reading that field pass its test while
-            // firing on every render.
+            // real report too.
             "toolchain": {
                 "id": "gcc-16.1.1-glibc2.43-fedora44",
                 "kind": "gcc",
@@ -1419,11 +1386,6 @@ mod tests {
         })
     }
 
-    /// A container shares the host's kernel, so a kernel-enforced verdict from one is
-    /// not the distribution's and must not be tabulated beside a VM's.
-    ///
-    /// Four rows in this project's own dataset are containers (Wolfi, Chimera and both
-    /// Gentoo profiles), and the README says such results "are not compared".
     #[test]
     fn a_container_row_is_not_joinable_with_a_vm_row() {
         let mixed = Identity::of(&[
@@ -1458,7 +1420,6 @@ mod tests {
         }
     }
 
-    /// One corpus and one revision is joinable; either differing is not.
     #[test]
     fn reports_from_two_corpora_are_not_joinable() {
         let same = [
@@ -1466,7 +1427,10 @@ mod tests {
             ("b.json".to_owned(), report("abc", Some("1111"))),
         ];
         assert!(Identity::of(&same).is_joinable());
-        assert!(Identity::of(&same).conflicts().is_empty());
+        assert!(
+            Identity::of(&same).conflicts().is_empty(),
+            "two reports of one identity conflict on nothing"
+        );
 
         let mixed = [
             ("old.json".to_owned(), report("abc", Some("1111"))),
@@ -1476,8 +1440,6 @@ mod tests {
         assert!(!id.is_joinable());
         let why = id.conflicts().join(" ");
         assert!(why.contains("corpora differ"), "{why}");
-        // Both values named, and the reports carrying each, so a reader can tell which
-        // pile is the old one.
         assert!(why.contains("abc") && why.contains("def"), "{why}");
         assert!(
             why.contains("old.json") && why.contains("new.json"),
@@ -1485,8 +1447,6 @@ mod tests {
         );
     }
 
-    /// A refusal over differing corpora names whether the decoders moved: not at all,
-    /// with them, or unstated where a report does not carry the field.
     #[test]
     fn a_corpus_refusal_names_whether_the_decoders_moved() {
         let with_decoders = |corpus: &str, decoders: Option<&str>| {
@@ -1528,8 +1488,6 @@ mod tests {
         );
     }
 
-    /// A detector change moves verdicts without moving the corpus hash, so the
-    /// revision has to be checked on its own.
     #[test]
     fn reports_from_two_harness_revisions_are_not_joinable() {
         let id = Identity::of(&[
@@ -1540,9 +1498,6 @@ mod tests {
         assert!(id.conflicts().join(" ").contains("revisions differ"));
     }
 
-    /// One commit read from a clone, an archive or a crate archive is one revision; the same
-    /// hash asserted with `CHARD_REVISION`, built under rustflags, or naming no source is
-    /// another, and reports asserted alike join among themselves, as a fleet's do.
     #[test]
     fn an_asserted_revision_joins_only_reports_asserted_alike() {
         let at = |source: Option<&str>, rustflags: Option<&str>| {
@@ -1600,9 +1555,6 @@ mod tests {
         );
     }
 
-    /// A build's own key names a clean revision read from its tree, with its rustflags, and
-    /// nothing else: not a dirty revision (with rustflags or without), not an asserted one,
-    /// not one without a source.
     #[test]
     fn only_a_clean_revision_read_from_the_tree_is_a_builds_own_key() {
         use crate::report::{HARNESS_REVISION, HARNESS_REVISION_SOURCE, HARNESS_RUSTFLAGS_SHA256};
@@ -1633,9 +1585,6 @@ mod tests {
         assert_eq!(build_key(None, Some("git"), None), None);
     }
 
-    /// A report naming no revision is unknown, not compatible. Mixing an unknown with
-    /// a known is exactly as unjoinable as mixing two knowns, and treating absence as
-    /// permission is how an old report joins a current table unnoticed.
     #[test]
     fn a_missing_revision_is_unknown_rather_than_permission() {
         let id = Identity::of(&[
@@ -1649,9 +1598,6 @@ mod tests {
         assert!(id.conflicts().join(" ").contains("(absent)"));
     }
 
-    /// A dirty revision is a caution rather than a conflict: it does not make the set
-    /// unjoinable, it makes it uncitable, and saying nothing is what let seven such
-    /// reports be treated as a dataset for a week.
     #[test]
     fn a_dirty_revision_is_named_without_blocking_the_render() {
         let id = Identity::of(&[
@@ -1671,13 +1617,11 @@ mod tests {
         assert!(
             Identity::of(&[("c.json".to_owned(), report("abc", Some("1111")))])
                 .cautions()
-                .is_empty()
+                .is_empty(),
+            "a single report carries no caution"
         );
     }
 
-    /// An image nobody established is a caution, not a conflict: two unattested rows are
-    /// as comparable with each other as two attested ones, because what is unsupported is
-    /// the distribution *label* rather than anything measured.
     #[test]
     fn an_unattested_image_is_cautioned_and_still_joinable() {
         let id = Identity::of(&[
@@ -1701,10 +1645,6 @@ mod tests {
         assert!(caution.contains("1 of 2"), "{caution}");
     }
 
-    /// A report that carries no attestation has established nothing about its image, so
-    /// absence reads as unattested. The opposite reading lets silence stand for a clean
-    /// result, the hazard this module exists to end, and the same one an absent
-    /// `coverage.complete` or an empty `contradictions` list carries.
     #[test]
     fn an_absent_attestation_reads_as_unattested_rather_than_as_nothing_to_say() {
         let id = Identity::of(&[(
@@ -1720,15 +1660,9 @@ mod tests {
 
     /// A report of the shape `measure` emits draws no caution about its toolchain.
     ///
-    /// A caution that read `toolchain.provenance.status` and treated anything but
-    /// `distro-packaged` as unestablished would take the safe direction, except that no report
-    /// carries the field. Every `table` render, on every stock distribution compiler, would
-    /// print "measured a compiler their distribution does not package", and a test that
-    /// hand-wrote the field into its fixture would not see it.
-    ///
-    /// So this asserts on the *absence* of a caution for input the tool can really produce, and
-    /// the helper above builds that input. A future caution about the toolchain has to survive
-    /// this to ship, which means it has to read a field that exists.
+    /// Asserted on input the tool can produce (`attested_report` writes the keys `measure`
+    /// emits), so a toolchain caution must read a field a report carries: one reading the
+    /// absent `toolchain.provenance.status` would fire on every stock compiler's render.
     #[test]
     fn a_report_measure_could_have_written_draws_no_toolchain_caution() {
         let id = Identity::of(&[(
@@ -1742,255 +1676,22 @@ mod tests {
         );
     }
 
-    /// `host` mode has no image to attest to, so it must not be cautioned. Reporting a
-    /// caution there would train a reader to ignore the caution.
+    /// `host` mode has no image to attest to; a caution there would train a reader to skip it.
     #[test]
     fn measuring_the_running_system_is_not_cautioned() {
         let id = Identity::of(&[(
             "host.json".to_owned(),
             attested_report("abc", Some("1111"), "host", Some("not-applicable")),
         )]);
-        assert!(id.unattested.is_empty());
-        assert!(id.cautions().is_empty());
-    }
-
-    /// The sample report `measure` wrote, which reads clean.
-    fn sample_report() -> Value {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-report.json");
-        let text = std::fs::read_to_string(path).expect("the sample fixture reads");
-        serde_json::from_str(&text).expect("JSON")
-    }
-
-    /// The sample as a `user` report another revision wrote: its digest's `user` sentence the
-    /// one that revision wrote, as a fleet sweep's OpenBSD `explicit` reports store it.
-    fn with_retired_user_sentence() -> Value {
-        use crate::report::{digest, flags_source};
-        let mut user = sample_report();
-        user["profile"]["flags_source"] = json!(flags_source::USER);
-        let status = user["consistency"]["status"]
-            .as_str()
-            .expect("a status")
-            .to_owned();
-        user["digest"] =
-            serde_json::to_value(digest::derive(&user, &status).expect("derives")).expect("JSON");
-        user["digest"]["profile"]["meaning"] = json!(
-            "the flags given to `measure` (`profile.cflags`, `cxxflags`, `ldflags`), passed to \
-             each measured build (a build's `dropped_flags` names any it left out): what a \
-             package build that injects exactly these lists gets, and not what a build that \
-             also injects anything else gets"
-        );
-        user
-    }
-
-    /// The sample with its `coverage.withholding` in a shape with no two sets, and no
-    /// digest, which this revision does not write either.
-    fn with_older_withholding() -> Value {
-        let mut older = sample_report();
-        let published = older["coverage"]["withholding"]["published"].clone();
-        older["coverage"]["withholding"] =
-            json!({"published": published, "withheld": 0, "percent_withheld": 0.0});
-        older.as_object_mut().expect("an object").remove("digest");
-        older
-    }
-
-    /// A report in a shape without `observes`: one protection check, its rollup counted on that
-    /// check as protection, no `observes`, and a corpus other than this build's.
-    fn with_older_rollup() -> Value {
-        json!({
-            "environment": environment(),
-            "run": {"probe_corpus_sha256": "cd".repeat(32)},
-            "observations": [{"check": "pie", "flag": "-pie", "verdict": "off",
-                              "defects": ["address-layout-disclosure"]}],
-            "defect_coverage": {"address-layout-disclosure": {
-                "status": "not-mitigated", "from_checks": ["pie"],
-                "verdict_counts": {"off": 1}}},
-            "coverage": {"checks_attempted": 1, "corpus_checks_total": 1,
-                         "verdict_counts": {"off": 1}, "all_verdicts_published": true,
-                         "withholding": {"published": 1,
-                                         "earned_limitations": {"count": 0, "no_named_cause": 0},
-                                         "instrument_withholdings": {"count": 0, "no_named_cause": 0}}},
-            "consistency": {"contradictions": []},
-        })
-    }
-
-    /// The sample as `measure` quarantines it: one contradiction of its own.
-    fn contradicted() -> Value {
-        let mut r = sample_report();
-        r["consistency"]["status"] = json!("contradicted");
-        r["consistency"]["contradictions"] = json!([{"rule": "r", "property": "p"}]);
-        r
-    }
-
-    /// The hint `refuse_self_contradicted` gives the set, which it must refuse.
-    fn refusal_hint_of(set: &[(&str, Value)]) -> String {
-        let set: Vec<(String, Value)> = set
-            .iter()
-            .map(|(name, r)| ((*name).to_owned(), r.clone()))
-            .collect();
-        refuse_self_contradicted(&set)
-            .expect_err("refused")
-            .hint
-            .expect("a hint")
-    }
-
-    /// Each older shape is typed as older on its own, and the sample reads clean, so the sets
-    /// below hold what they are named for.
-    #[test]
-    fn the_older_shapes_are_typed_as_older() {
-        assert!(self_contradicted(&[("s".to_owned(), sample_report())]).is_empty());
-        for older in [
-            with_retired_user_sentence(),
-            with_older_withholding(),
-            with_older_rollup(),
-        ] {
-            let found = self_contradicted(&[("o".to_owned(), older)]);
-            assert!(!found.is_empty());
-            assert!(
-                found.iter().all(|f| f.kind == FindingKind::Older),
-                "{found:?}"
-            );
-        }
-        // A contradiction, and a subtree that does not read, are contradictions: only the
-        // older shapes are typed apart.
-        let mut unreadable = sample_report();
-        unreadable["coverage"]["checks_attempted"] = json!("many");
-        for (name, report) in [("c", contradicted()), ("u", unreadable.clone())] {
-            let found = self_contradicted(&[(name.to_owned(), report)]);
-            assert!(!found.is_empty());
-            assert!(
-                found.iter().all(|f| f.kind == FindingKind::Contradiction),
-                "{found:?}"
-            );
-        }
-        assert_eq!(refusal_hint_of(&[("u.json", unreadable)]), ADVICE);
-    }
-
-    /// The remedies the hint names for one older report, and for more.
-    const REMEDIES_ONE: &str = "read it with the chard its `run.harness_revision` names, or run \
-                                `chard measure` again with this build and render the new report";
-    const REMEDIES_MANY: &str = "read each with the chard its `run.harness_revision` names, or \
-                                 run `chard measure` again with this build and render the new \
-                                 reports";
-    const ADVICE: &str = "leave out of the set a report that contradicts itself, which is \
-                          evidence for a chard bug report, readable as JSON, not a measurement";
-
-    /// A set of older shapes alone is refused, and the hint says first that they are older and
-    /// names both remedies, never the contradiction advice.
-    #[test]
-    fn a_set_of_older_shapes_alone_is_told_it_is_older_first() {
-        for one in [
-            with_retired_user_sentence(),
-            with_older_withholding(),
-            with_older_rollup(),
-        ] {
-            assert_eq!(
-                refusal_hint_of(&[("a.json", one)]),
-                format!(
-                    "the report named above is in a shape this revision does not write, \
-                     which this build cannot hold to its rules: {REMEDIES_ONE}"
-                )
-            );
-        }
-        assert_eq!(
-            refusal_hint_of(&[
-                ("a.json", with_retired_user_sentence()),
-                ("b.json", with_older_withholding()),
-            ]),
-            format!(
-                "every report named above is in a shape this revision does not write, which this \
-                 build cannot hold to its rules: {REMEDIES_MANY}"
-            )
-        );
-    }
-
-    /// A set of contradictions alone keeps the contradiction advice, and says nothing of an
-    /// older shape it does not hold.
-    #[test]
-    fn a_set_of_contradictions_alone_keeps_the_contradiction_advice() {
-        let hint = refusal_hint_of(&[("c.json", contradicted()), ("d.json", contradicted())]);
-        assert_eq!(hint, ADVICE);
-    }
-
-    /// A mixed set opens with the contradiction advice and names its older reports as older,
-    /// each once, with both remedies; a report both older and contradicting is a contradicting
-    /// one.
-    #[test]
-    fn a_mixed_set_opens_with_the_contradiction_advice_and_names_the_older_reports() {
-        let hint = refusal_hint_of(&[
-            ("c.json", contradicted()),
-            ("a.json", with_retired_user_sentence()),
-        ]);
-        assert_eq!(
-            hint,
-            format!(
-                "{ADVICE}. a.json is in a shape this revision does not write, which this build \
-                 cannot hold to its rules: {REMEDIES_ONE}"
-            )
-        );
-        // `b.json` older twice over: its sentence and its withholding block.
-        let mut twice = with_retired_user_sentence();
-        twice["coverage"]["withholding"] =
-            with_older_withholding()["coverage"]["withholding"].clone();
-        let found = self_contradicted(&[("b.json".to_owned(), twice.clone())]);
-        assert_eq!(found.len(), 2, "{found:?}");
         assert!(
-            found.iter().all(|f| f.kind == FindingKind::Older),
-            "{found:?}"
+            id.unattested.is_empty(),
+            "a host report whose attestation is not-applicable is not unattested: {:?}",
+            id.unattested
         );
-        assert_eq!(
-            refusal_hint_of(&[
-                ("a.json", with_retired_user_sentence()),
-                ("c.json", contradicted()),
-                ("b.json", twice),
-            ]),
-            format!(
-                "{ADVICE}. a.json, b.json are in shapes this revision does not write, which this \
-                 build cannot hold to its rules: {REMEDIES_MANY}"
-            )
+        assert!(
+            id.cautions().is_empty(),
+            "a host report whose attestation is not-applicable carries no caution: {:?}",
+            id.cautions()
         );
-
-        // Older and edited besides: a contradiction, so not named as older.
-        let mut both = with_retired_user_sentence();
-        both["digest"]["toolchain"] = json!("edited");
-        let found = self_contradicted(&[("e.json".to_owned(), both.clone())]);
-        assert!(found.iter().any(|f| f.kind == FindingKind::Older));
-        assert!(found.iter().any(|f| f.kind == FindingKind::Contradiction));
-        assert_eq!(refusal_hint_of(&[("e.json", both)]), ADVICE);
-    }
-
-    /// `chard matrix` and `chard digest` refuse an older report through the same refusal, as
-    /// the caller's input, with the older hint first.
-    #[test]
-    fn matrix_and_digest_give_the_older_hint_first() {
-        let read = ("a.json".to_owned(), with_retired_user_sentence());
-        let hint_of = |e: anyhow::Error| {
-            e.downcast::<UserError>()
-                .expect("a user error, exit 2")
-                .hint
-                .expect("a hint")
-        };
-        let matrix = crate::matrix::build_from_reports(
-            std::slice::from_ref(&read),
-            false,
-            crate::matrix::Repeated::Refuse,
-        )
-        .expect_err("refused");
-        let digest = crate::report::digest::of_read(&read).expect_err("refused");
-        for hint in [hint_of(matrix), hint_of(digest)] {
-            assert_eq!(
-                hint,
-                format!(
-                    "the report named above is in a shape this revision does not write, \
-                     which this build cannot hold to its rules: {REMEDIES_ONE}"
-                )
-            );
-        }
-    }
-
-    /// No finding, no hint to choose: the contradiction advice, never "every report named
-    /// above is older" over a set that names none.
-    #[test]
-    fn an_empty_finding_list_reads_as_no_older_report() {
-        assert_eq!(refusal_hint(&[]), ADVICE);
     }
 }

@@ -1,40 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! ELF fact extraction for the `elf-static` observation channel.
-//!
-//! We parse the container ourselves rather than shelling out to
-//! `readelf`/`objdump`: their text output drifts between binutils versions, and
-//! a guest image we drop chard into may ship no binutils at all (Alpine).
-//!
-//! Only the facts probes actually look at are implemented — this is deliberately
-//! not a general ELF library. Every read is bounds-checked and every arithmetic
-//! step is explicit, because the inputs are binaries from compilers we have not
-//! seen and a panic here would abort a sweep mid-flight.
-//!
-//! ## The alignment rule that must not be got wrong
-//!
-//! GNU notes pad the *absolute* offset of the descriptor up to the note's
-//! alignment — `desc = note_start + align_up(12 + namesz, align)`. For an ELF64
-//! `.note.gnu.property` (align 8, `namesz` 4 for `"GNU\0"`), `12 + 4 = 16` is
-//! already 8-aligned, so there is no padding at all. The tempting-but-wrong
-//! `12 + align_up(namesz, align)` yields 20, reads four bytes into the middle of
-//! the first property, and reports a CET-marked binary as unmarked. That failure
-//! is silent and looks exactly like a real "hardening off" result, which is the
-//! one outcome this project cannot tolerate — hence `note_padding_*` in
-//! `tests/elf_notes.rs` pins it against a real `-fcf-protection=full` build.
-//!
-//! ## A table the reader could not finish is said so, in the facts
-//!
-//! Every per-table walk records what it could not read to its end as a typed
-//! [`Truncation`] on [`ElfFacts::truncations`], naming the [`ElfTable`] it cut and whether
-//! that table's facts are `unread` or a disagreeing view of it was `ignored`. The
-//! consumer is `report::truncation_limitation`, which reads the list against the tables
-//! each check declares in `probe::Check::reads`; that pairing is what turns a cut table
-//! into a withheld verdict rather than a reading of absence. [`ElfTable::SOFT_SITES`]
-//! names the tables with a recording site here, and [`ElfTable::HARD_FAILURES`] the two
-//! that `parse` refuses outright instead, which `report::Variant::sufficient_for` turns
-//! into `indeterminate` before any detector runs. The architecture of the gate is in
-//! `DESIGN.md` under the verdict vocabulary.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +27,8 @@ const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
+/// The thread-local storage template; a segment like any other for `p_flags`.
+const PT_TLS: u32 = 7;
 /// The segment `ld.so` and the kernel read the program's property notes from.
 const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 const PT_GNU_STACK: u32 = 0x6474_e551;
@@ -71,6 +39,7 @@ const PT_GNU_RELRO: u32 = 0x6474_e552;
 const PT_OPENBSD_NOBTCFI: u32 = 0x65a3_dbe8;
 
 const PF_X: u32 = 0x1;
+const PF_W: u32 = 0x2;
 
 /// `e_phnum` cannot hold a count of 65535 or more, so the gABI reserves that value to say
 /// the real count is in `shdr[0].sh_info`.
@@ -84,14 +53,9 @@ const SHN_UNDEF: u16 = 0;
 const SHN_XINDEX: u16 = 0xffff;
 
 /// A relocatable object: a `.o`, a kernel module, a grub `.mod`.
-///
-/// Was missing, so `e_type == 1` fell to `format!("ET_{other}")` and rendered `"ET_1"`, while
-/// `inspect`'s classifier tested for `"ET_REL"` — a comparison that could never be true. Every
-/// relocatable object was published as `kind: "other"`, and 13,424 of them sat in denominators for
-/// properties a relocatable object cannot carry, because it has no program headers at all.
 const ET_REL: u16 = 1;
-/// A core dump. Named for the same reason: an unnamed type is indistinguishable from a type nobody
-/// thought about.
+/// A core dump. Named because an unnamed type is indistinguishable from a type nobody thought
+/// about.
 const ET_CORE: u16 = 4;
 const SHT_STRTAB: u32 = 3;
 /// A symbol that stands for a section; relocations against local data go through one.
@@ -125,8 +89,9 @@ const SHF_EXECINSTR: u64 = 0x4;
 const BUILD_ID_SECTION: &str = ".note.gnu.build-id";
 /// The smallest page a kernel maps for any machine [`machine_name`] names: 4096 bytes,
 /// the floor of every family's configurable page sizes (`i386`, `x86_64`, `aarch64`,
-/// `arm`, `ppc`, `ppc64`, `s390`, `mips`, `riscv`, `loongarch`). [`ElfFacts::data_in_code_pages`] widens an
-/// executable segment to at least this, whatever its `p_align` says.
+/// `arm`, `ppc`, `ppc64`, `s390`, `mips`, `riscv`, `loongarch`).
+/// [`ElfFacts::data_in_code_pages`] widens an executable segment to at least this, whatever
+/// its `p_align` says.
 const MIN_PAGE: u64 = 0x1000;
 
 const DT_NEEDED: i64 = 1;
@@ -151,8 +116,7 @@ const DT_PLTREL: i64 = 20;
 /// tag, like `DT_TEXTREL`. `link_kind` reads it as the third discriminator of an
 /// executable: see `LinkKind::StaticPie`.
 const DT_DEBUG: i64 = 21;
-// The original gABI spelling of the fact `DF_TEXTREL` also carries. A marker tag: its
-// presence is the statement and its value is ignored.
+// The original gABI spelling of the fact `DF_TEXTREL` also carries.
 const DT_TEXTREL: i64 = 22;
 const DT_JMPREL: i64 = 23;
 const DT_BIND_NOW: i64 = 24;
@@ -164,20 +128,16 @@ const DT_GNU_HASH: i64 = 0x6fff_fef5;
 
 const DF_TEXTREL: u64 = 0x4;
 const DF_BIND_NOW: u64 = 0x8;
-// DT_FLAGS_1 bits, spelled out in full because they are easy to misremember and
-// a wrong bit here is invisible in exactly the wrong way: DF_1_NOOPEN is 0x40,
-// while 0x4 is DF_1_GROUP. Reading the wrong bit reports a `-Wl,-z,nodlopen`
-// binary as unmarked, which is indistinguishable from a distro that never set
-// the flag — a false "off" of the precise kind this project exists to prevent.
+// DT_FLAGS_1 bits, spelled out in full: `DF_1_NOOPEN` is 0x40, while 0x4 is `DF_1_GROUP`,
+// and the wrong bit reads a `-Wl,-z,nodlopen` binary as unmarked, a false `off`.
 const DF_1_NOW: u64 = 0x0000_0001;
 const DF_1_NOOPEN: u64 = 0x0000_0040;
 const DF_1_PIE: u64 = 0x0800_0000;
 
-/// `e_machine` values, as glibc's `elf.h` defines them; the gABI's table gives the same
-/// numbers. Named for the machines a sweep is likely to meet, so `machine` can name them
-/// as readelf does, and any other value renders as unrecognised in the style of
-/// `elf_type`. `machine_name` is the rendering, and `tests/elf_readelf.rs` checks each
-/// name against the oracle's on any object of that machine the differential meets.
+/// `e_machine` values, as glibc's `elf.h` and the gABI define them, for the machines a sweep
+/// is likely to meet: `machine_name` names them as readelf does and renders any other value
+/// as unrecognised. `tests/elf_readelf.rs` checks each name against readelf's on any object
+/// of that machine it meets.
 const EM_386: u16 = 3;
 const EM_MIPS: u16 = 8;
 const EM_PPC: u16 = 20;
@@ -190,6 +150,23 @@ const EM_RISCV: u16 = 243;
 const EM_LOONGARCH: u16 = 258;
 
 const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
+/// The note [`Elf::parse_notes`] keeps for one walk: its owner and type, and whether a note
+/// of that type whose name bytes are the owner and its NUL is held to that `n_namesz`.
+#[derive(Clone, Copy)]
+struct NoteKind {
+    owner: &'static str,
+    ntype: u32,
+    name_size_held: bool,
+}
+
+/// The GNU property note, the one note [`Elf::parse_notes`] keeps for [`Elf::notes`]. Its
+/// `n_namesz` is held: Linux 7.3-rc1's `parse_elf_properties` (`fs/binfmt_elf.c`) returns
+/// `ENOEXEC` for a property note whose `n_namesz` is not `sizeof("GNU")`.
+const GNU_PROPERTY_NOTE: NoteKind = NoteKind {
+    owner: "GNU",
+    ntype: NT_GNU_PROPERTY_TYPE_0,
+    name_size_held: true,
+};
 /// The floor of the processor-specific property range. A type at or above it means
 /// whatever `e_machine` says it means, and nothing without that.
 const GNU_PROPERTY_LOPROC: u32 = 0xc000_0000;
@@ -199,17 +176,9 @@ const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
 /// the BTI/PAC/GCS word; on `EM_RISCV` it is `GNU_PROPERTY_RISCV_FEATURE_1_AND`; and
 /// binutils before 2.32 used it on x86 for `GNU_PROPERTY_X86_ISA_1_USED`, so an x86-64
 /// object linked by gcc 8 or 9-era binutils carries this type with an ISA bitmap in it.
-/// Read without the machine, that bitmap published `aarch64_bti: true` and
+/// Read without the machine, that bitmap publishes `aarch64_bti: true` and
 /// `aarch64_pac: true` on an x86-64 binary, which is why `facts` decodes a
 /// processor-specific property only on the machine that defines it.
-///
-/// On RISC-V, GNU readelf 2.46 names the word's bit 1 `CFI_LP_UNLABELED`
-/// (Zicfilp landing pads) and bit 2 `CFI_SS` (Zicfiss shadow stack) and prints bit 4 as
-/// unknown; the psABI's function-signature labels for bit 4 are known from the sources
-/// and not measured here. gcc 16.1.1 (Fedora 44's riscv64 cross compiler) writes the word 3
-/// under `-march=rv64gc_zicfilp_zicfiss -fcf-protection=full`, which read as the aarch64
-/// word would be BTI and PAC. The reader lists the type there and decodes nothing from
-/// it, and no check reads RISC-V's control-flow marking.
 const GNU_PROPERTY_AARCH64_FEATURE_1_AND: u32 = 0xc000_0000;
 const X86_FEATURE_1_IBT: u32 = 0x1;
 const X86_FEATURE_1_SHSTK: u32 = 0x2;
@@ -219,20 +188,22 @@ const AARCH64_FEATURE_1_PAC: u32 = 0x2;
 /// `-mbranch-protection=gcs`, and also by `standard` on compilers new enough to have it.
 const AARCH64_FEATURE_1_GCS: u32 = 0x4;
 
-/// Symbols whose presence or absence a probe may key on. Kept as one list so
-/// the extracted facts are the same shape regardless of which probe built the
-/// binary, which keeps reports diffable across toolchains.
-///
-/// Public so `tests/elf_readelf.rs` can check both directions against its oracle: a
-/// watched name `readelf` shows and this reader does not is the false negative the
-/// list exists to make visible.
+/// `SHT_AARCH64_ATTRIBUTES`, `SHT_LOPROC + 3`: the type of `.ARM.attributes` on aarch64, the
+/// build-attributes section of the Arm ELF ABI for the 64-bit architecture (format version `A`).
+const SHT_AARCH64_ATTRIBUTES: u32 = 0x7000_0003;
+/// The build-attributes subsection that states the BTI, PAC and GCS marking, tags 0, 1 and 2,
+/// each ULEB128 and 1 for marked. gcc 16.1.1 with binutils 2.46 (Fedora 44's aarch64 cross
+/// compiler) writes it to an unlinked object in place of a GNU property note.
+const AEABI_FEATURE_AND_BITS: &[u8] = b"aeabi_feature_and_bits";
+
+/// Symbols whose presence or absence a probe may key on. One list, so the facts have the
+/// same shape whichever probe built the binary and reports diff across toolchains.
 pub const WATCHED_SYMBOLS: &[&str] = &[
     "__stack_chk_fail",
     "__stack_chk_fail_local",
     "__stack_chk_guard",
     // OpenBSD's canary failure handler, called where other targets call
-    // `__stack_chk_fail`. `predicate::elf_static`'s `CANARY` carries the measurement, and
-    // why OpenBSD amd64 emits RETGUARD rather than this by default.
+    // `__stack_chk_fail`.
     "__stack_smash_handler",
     "__memcpy_chk",
     "__memmove_chk",
@@ -245,18 +216,14 @@ pub const WATCHED_SYMBOLS: &[&str] = &[
     "__printf_chk",
     // clang's checking `printf`, called from glibc's out-of-line wrapper with the same flag
     // argument gcc passes `__printf_chk`; `predicate::elf_static`'s `FORTIFY_PRINTF_FLAG`
-    // reads either. Measured 2026-10-02 with `nm -u` under clang 22.1.8 with glibc 2.43 on
-    // Fedora 44 x86_64 and aarch64.
+    // reads either and carries the measurement.
     "__vprintf_chk",
     "__fprintf_chk",
     "__vsnprintf_chk",
     "__read_chk",
-    // FreeBSD's failure handler, which its inline wrappers (`__ssp_check` in `<ssp/ssp.h>`,
-    // the descriptor functions among them) call directly; the string family reaches the
-    // `__*_chk` functions above through `__builtin___*_chk`. `decode::runtime`'s
-    // `freebsd_checking_call` reads either kind. Measured 2026-10-27 with `nm -u` on FreeBSD
-    // 15.1 amd64 (clang 19.1.7): `read` into a short buffer references `__chk_fail`, and the
-    // fortify probes `__memcpy_chk` or `__strcpy_chk`.
+    // FreeBSD's failure handler, which its inline wrappers (`__ssp_check` in `<ssp/ssp.h>`)
+    // call directly; `decode::runtime::FREEBSD_CHECKING_CALLS` lists it beside the `__*_chk`
+    // functions above.
     "__chk_fail",
     "__fortify_fail",
     "__asan_init",
@@ -267,11 +234,6 @@ pub const WATCHED_SYMBOLS: &[&str] = &[
     // spelling a runtime gives them: the recovering handler, `_abort` under
     // `-fno-sanitize-recover`, and clang's `-fsanitize-minimal-runtime` names, recovering
     // and not (the recovering `add_overflow` and `type_mismatch_v1` are above).
-    // `predicate::elf_static`'s `UBSAN_TRAP` reads them beside a trap to tell a build
-    // whose checks all trap from one where some still call the runtime. Measured
-    // 2026-10-02 with `nm -u` over that probe's object on Fedora 44 x86_64 (gcc 16.1.1,
-    // clang 22.1.8) and aarch64 (gcc 16.2.1, clang 22.1.8); gcc refuses
-    // `-fsanitize-minimal-runtime`.
     "__ubsan_handle_type_mismatch_v1_abort",
     "__ubsan_handle_type_mismatch_minimal",
     "__ubsan_handle_type_mismatch_minimal_abort",
@@ -292,32 +254,20 @@ pub const WATCHED_SYMBOLS: &[&str] = &[
     "__ubsan_handle_pointer_overflow_minimal_abort",
     // The minimal runtime's recovering handlers under clang's
     // `-fsanitize-handler-preserve-all-regs`, which calls them with every register
-    // preserved. Measured 2026-10-02 with `nm -u` over `probes/ubsan_trap.c`'s object under
-    // clang 22.1.8 on Fedora 44 x86_64 and aarch64, at -O0 and -O2: these five, and with
-    // `-fno-sanitize-recover=all` the `_minimal_abort` names above. A handler spelling this
-    // list lacks still cannot pass a trap as trap mode: `UBSAN_TRAP`'s `trap-beside-call`
-    // reads the call itself.
+    // preserved.
     "__ubsan_handle_type_mismatch_minimal_preserve",
     "__ubsan_handle_shift_out_of_bounds_minimal_preserve",
     "__ubsan_handle_out_of_bounds_minimal_preserve",
     "__ubsan_handle_add_overflow_minimal_preserve",
     "__ubsan_handle_pointer_overflow_minimal_preserve",
     // The type-mismatch handler's name before its `_v1` revision, which gcc 8 and clang 5
-    // adopted: a toolchain older than those calls this one. Not measured, since no host
-    // carries such a toolchain; listed so a trap beside it reads as a trap beside a
-    // handler rather than as a trap alone.
+    // adopted: a toolchain older than those calls this one.
     "__ubsan_handle_type_mismatch",
     "__ubsan_handle_type_mismatch_abort",
     // The handlers `probes/ubsan_trap.c`'s third and fourth functions call outside trap
     // mode: clang's `local-bounds` on the indexed global array
     // under `-fno-sanitize-trap=local-bounds` (the group traps by default), and clang's
-    // `function` on the call through a pointer. gcc's `object-size` on the same array calls
-    // `type_mismatch_v1`, above. Measured 2026-10-07 with `nm -u` over that probe's object
-    // under clang 22.1.8 on Fedora 44 x86_64 at -O0 and -O2: `_abort` is the recovering
-    // default's spelling for `local-bounds` (`-fsanitize-recover=local-bounds` gives the
-    // bare name), the `_minimal` pair under `-fsanitize-minimal-runtime`, and
-    // `-fsanitize-handler-preserve-all-regs` spells `local-bounds` as `_minimal_abort` and
-    // `function` as `_minimal_preserve`.
+    // `function` on the call through a pointer.
     "__ubsan_handle_local_out_of_bounds",
     "__ubsan_handle_local_out_of_bounds_abort",
     "__ubsan_handle_local_out_of_bounds_minimal",
@@ -330,16 +280,7 @@ pub const WATCHED_SYMBOLS: &[&str] = &[
     // The handlers `probes/ubsan_trap.c`'s second function, `chard_ubsan_trap_groups`, calls
     // outside trap mode, in every spelling a runtime gives them, so a build whose only
     // sanitizer is one of its groups, in handler mode, reads as handler mode rather than as a
-    // call the predicate cannot name. `builtin_unreachable` has no `_abort` form: it never
-    // returns. Measured 2026-10-07 with `nm -u` over that probe's object under gcc 16.1.1
-    // and clang 22.1.8 on Fedora 44 x86_64, at -O0 and -O2, with `-fsanitize=undefined`
-    // beside `float-divide-by-zero` and `float-cast-overflow` (and under clang
-    // `implicit-conversion`, `nullability`, `unsigned-integer-overflow` and
-    // `unsigned-shift-base`), recovering, `-fno-sanitize-recover=all`, and under clang
-    // `-fsanitize-minimal-runtime` with each of those and with
-    // `-fsanitize-handler-preserve-all-regs`; the `nullability_*` names with
-    // `-fsanitize=nullability` alone, since beside `nonnull-attribute` clang calls the
-    // `nonnull_*` handlers for the same constructs.
+    // call the predicate cannot name.
     "__ubsan_handle_builtin_unreachable",
     "__ubsan_handle_builtin_unreachable_minimal",
     "__ubsan_handle_builtin_unreachable_minimal_preserve",
@@ -405,71 +346,128 @@ pub const WATCHED_SYMBOLS: &[&str] = &[
     "__cfi_slowpath",
     "abort",
     // libstdc++'s out-of-line assertion failure handler, and the two `__gnu_debug`
-    // entry points `-D_GLIBCXX_DEBUG` substitutes for it. Mangled and unversioned:
-    // `nm -D` prints `@GLIBCXX_3.4.30` after the first, but the version lives in
-    // `.gnu.version` rather than in the symbol's own name, which is what this list
-    // matches against. Measured on gcc 16.2.1 and clang 22.1.8 over libstdc++ 16.
+    // entry points `-D_GLIBCXX_DEBUG` substitutes for it.
     "_ZSt21__glibcxx_assert_failPKciS0_S0_",
     // The same failure before GCC 12 moved it out of line: `std::__replacement_assert`,
     // defined inline in `bits/c++config.h` and emitted as a comdat wherever the compiler
-    // did not fold it away. The length prefixes differ because the names do -- `21` for
-    // `__glibcxx_assert_fail`, `20` for `__replacement_assert` -- and reading only the
-    // first spelling reported the mechanism absent on every libstdc++ up to 11, where it
-    // is present under the older name.
+    // did not fold it away.
     "_ZSt20__replacement_assertPKciS0_S0_",
     "_ZNK11__gnu_debug16_Error_formatter10_M_messageENS_13_Debug_msg_idE",
     "_ZNK11__gnu_debug16_Error_formatter8_M_errorEv",
     // gcc's mark of a slim LTO object: a common symbol in an object that holds GIMPLE in
     // `.gnu.lto_*` sections and no generated code, over which `report::lto_ir_limitation`
-    // withholds an elf-static reading. Measured 2026-10-01 with `readelf -sW` over a
-    // `-flto -c` object: present under gcc 11.4.0 and 13.3.0 (Ubuntu 22.04, 24.04 x86_64),
-    // 15.2.0 (Alpine x86_64), 16.1.1 (Fedora 44 x86_64) and 16.2.1 (Fedora 44 aarch64), and absent
-    // under `-flto -ffat-lto-objects`, whose object carries generated code beside the
-    // GIMPLE. Reading its absence as fat is `gcc-marks-every-slim-lto-object` in
-    // `report::ASSUMPTIONS`.
+    // withholds an elf-static reading.
     "__gnu_lto_slim",
     // libgcc's trapping arithmetic for `int`, which gcc calls in place of a signed
     // addition, subtraction or multiplication under -ftrapv; undefined in the object that
-    // calls them. `predicate::elf_static`'s TRAPV_HELPER carries the measurement.
+    // calls them.
     "__addvsi3",
     "__subvsi3",
     "__mulvsi3",
 ];
 
-/// The least multiple of `align` that is not below `value`, or `None` when no such
-/// multiple is representable.
-///
-/// `None` has exactly one cause: `value + align - 1` overflows `u64`, so every multiple
-/// of `align` at or above `value` is past the end of the address space. No other error
-/// path is reachable: the early return establishes `align >= 2` for the rest of the body, so
-/// `align - 1` cannot underflow, the division cannot be by zero, and `(bump / align) *
-/// align <= bump` cannot overflow. `proofs/align_up_is_least_multiple.rs` checks that
-/// claim rather than trusting this paragraph, and checks the postcondition with it.
-///
-/// Returns `Option` rather than a `Result` for the reason `Cursor` does: an eagerly
-/// formatted error on this path is what a model checker follows into
-/// `core::slice::memchr`, and there is nothing to say here beyond "did not fit" anyway.
-///
-/// ## Why this function is worth proving
-///
-/// The module header calls the alignment rule the one that must not be got wrong, and its
-/// failure is silent: `12 + align_up(namesz, align)` instead of `align_up(12 + namesz,
-/// align)` reads four bytes into the middle of the first property and reports a
-/// `-fcf-protection=full` binary as having no CET markings. Until the proof, the whole
-/// rule rested on four hand-picked examples, none of which reaches a non-power-of-two
-/// alignment or the overflow edge.
-// The bare `align - 1`, `/` and `*` below are the operations this lint exists to catch, and
-// they are here deliberately. `the_deleted_error_paths_were_unreachable` in
-// `proofs/align_up_is_least_multiple.rs` is a machine-checked proof that none of them can
-// underflow, divide by zero or overflow given `align >= 2`, which the early return
-// establishes. The checked forms would reintroduce three `None` arms no input can reach,
-// and an unreachable arm in a function whose job is to be exactly right is worse than an
-// allow with a proof behind it. If the proof is ever removed, remove this too.
-#[allow(
+/// The `aeabi_feature_and_bits` word of one build-attributes section's bytes: `Ok(None)`
+/// where the section holds no such subsection, `Err` with the reason where it cannot be
+/// read whole.
+fn feature_and_bits(bytes: &[u8], little: bool) -> Result<Option<u32>, String> {
+    let Some((&version, mut rest)) = bytes.split_first() else {
+        return Ok(None);
+    };
+    if version != b'A' {
+        return Err(format!("format version {version:#04x}, not 'A'"));
+    }
+    let mut word: Option<u32> = None;
+    while !rest.is_empty() {
+        let Some(&head) = rest.first_chunk::<4>() else {
+            return Err("a subsection length lies past the end of the section".to_owned());
+        };
+        let len = if little {
+            u32::from_le_bytes(head)
+        } else {
+            u32::from_be_bytes(head)
+        };
+        let fits = usize::try_from(len)
+            .ok()
+            .filter(|&n| n > 4)
+            .and_then(|n| Some((rest.get(4..n)?, rest.get(n..)?)));
+        let Some((sub, next)) = fits else {
+            return Err(format!(
+                "a subsection of length {len} does not fit the {} bytes left",
+                rest.len()
+            ));
+        };
+        rest = next;
+        let mut parts = sub.splitn(2, |&b| b == 0);
+        let (Some(name), Some(tail)) = (parts.next(), parts.next()) else {
+            return Err("a subsection name has no terminator".to_owned());
+        };
+        if name != AEABI_FEATURE_AND_BITS {
+            continue;
+        }
+        let Some((&[_comprehension, encoding], mut pairs)) = tail.split_first_chunk::<2>() else {
+            return Err("the feature subsection ends before its encoding byte".to_owned());
+        };
+        if encoding != 0 {
+            return Err(format!("the feature subsection's encoding is {encoding}"));
+        }
+        let mut found = [None::<bool>; 3];
+        while !pairs.is_empty() {
+            let (tag, after) = uleb128(pairs).ok_or("a tag is cut off")?;
+            let (value, after) = uleb128(after).ok_or("a value is cut off")?;
+            pairs = after;
+            let Some(slot) = usize::try_from(tag).ok().and_then(|t| found.get_mut(t)) else {
+                continue;
+            };
+            if slot.is_some() {
+                return Err(format!("tag {tag} is given twice"));
+            }
+            *slot = Some(match value {
+                0 => false,
+                1 => true,
+                v => return Err(format!("tag {tag} holds {v}, not 0 or 1")),
+            });
+        }
+        let this = found
+            .iter()
+            .zip([
+                AARCH64_FEATURE_1_BTI,
+                AARCH64_FEATURE_1_PAC,
+                AARCH64_FEATURE_1_GCS,
+            ])
+            .filter(|(set, _)| **set == Some(true))
+            .fold(0, |w, (_, bit)| w | bit);
+        word = Some(word.map_or(this, |w| w & this));
+    }
+    Ok(word)
+}
+
+/// One ULEB128 number from the front of `bytes`, and what follows it; `None` where the
+/// number runs off the end or past 64 bits.
+fn uleb128(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let mut value = 0u64;
+    let mut rest = bytes;
+    for shift in (0..64).step_by(7) {
+        let (&b, after) = rest.split_first()?;
+        rest = after;
+        // The tenth byte holds bit 63 alone: anything above it is a number past 64 bits.
+        if shift == 63 && b & 0x7e != 0 {
+            return None;
+        }
+        value |= u64::from(b & 0x7f).checked_shl(shift)?;
+        if b & 0x80 == 0 {
+            return Some((value, rest));
+        }
+    }
+    None
+}
+
+/// The least multiple of `align` that is not below `value`, or `None` when `value + align -
+/// 1` overflows, which for an alignment that is a power of two means no such multiple is
+/// representable.
+// The bare `align - 1`, `/` and `*` below are the operations this lint exists to catch.
+#[expect(
     clippy::arithmetic_side_effects,
-    reason = "proofs/align_up_is_least_multiple.rs machine-checks that align >= 2 makes \
-              the subtraction, division and multiplication total; the checked forms would \
-              reintroduce three None arms no input can reach"
+    reason = "align >= 2 makes the subtraction, division and multiplication total"
 )]
 fn align_up(value: u64, align: u64) -> Option<u64> {
     if align <= 1 {
@@ -481,25 +479,112 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
 }
 
 /// The alignment a note walk pads to, from the one its container declares.
-///
-/// Notes are padded to at least 4 bytes whatever the container says, so a declared 0, 1
-/// or 2 is read as 4, which is what readelf's `process_notes_at` does. Declared 1 is not
-/// hypothetical: annobin's per-function `.gnu.build.attributes..text.*` sections carry
-/// `sh_addralign` 1, and walking them with no padding stopped part-way on every
-/// annobin-built object, withholding `cet-marked` over a property note that was intact.
 fn note_alignment(declared: u64) -> u64 {
     declared.max(4)
 }
 
-/// Refuse a table whose declared stride is below the record it is made of.
-///
-/// A count of zero says nothing about the stride, so it is not grounds to refuse; larger
-/// than the record size is legal, since the spec permits padding.
+/// Where the note whose header is at `pos` puts its descriptor, and where the next note
+/// starts. `proofs/note_walk_stays_in_its_table.rs` proves what a walk takes from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NoteSpan {
+    desc_off: u64,
+    /// `None` where the descriptor's padded length overflows.
+    next: Option<u64>,
+}
+
+/// Why [`note_span`] refuses a note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteRefusal {
+    /// The name's padded length overflows the descriptor's offset.
+    Overflows,
+    /// The descriptor runs past the end of the table or the file.
+    PastTheEnd,
+}
+
+/// The note at `pos` with an `n_namesz` of `namesz` and an `n_descsz` of `descsz`, in a table
+/// that ends at `end` of a file that ends at `file_end`. The descriptor starts at `pos` plus
+/// `12 + namesz` rounded up to `align`: the padding is of the offset from the note's own start,
+/// the rule this module's header warns about. It must end inside both the table and the file.
+/// The next note starts after the descriptor padded to `align`.
+fn note_span(
+    pos: u64,
+    namesz: u32,
+    descsz: u32,
+    align: u64,
+    end: u64,
+    file_end: u64,
+) -> Result<NoteSpan, NoteRefusal> {
+    let rel =
+        align_up(12u64.saturating_add(u64::from(namesz)), align).ok_or(NoteRefusal::Overflows)?;
+    // Saturating is safe here: a saturated sum exceeds `file_end`, a slice's length, and is
+    // refused.
+    let desc_off = pos.saturating_add(rel);
+    let desc_len = u64::from(descsz);
+    let desc_end = desc_off.saturating_add(desc_len);
+    if desc_end > end || desc_end > file_end {
+        return Err(NoteRefusal::PastTheEnd);
+    }
+    Ok(NoteSpan {
+        desc_off,
+        next: align_up(desc_len, align).map(|pad| desc_off.saturating_add(pad)),
+    })
+}
+
+/// Where the data of the property whose header is at `pos` starts, and where the next
+/// property starts. `proofs/note_walk_stays_in_its_table.rs` proves what a walk takes from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PropertySpan {
+    data_off: u64,
+    next: u64,
+}
+
+/// Why [`property_span`] refuses a property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyRefusal {
+    /// The data's padded length, or the next offset, overflows.
+    Overflows,
+    /// The data, padded to `pad` bytes, runs past the descriptor.
+    PastTheEnd { pad: u64 },
+}
+
+/// The property at `pos` with a `pr_datasz` of `datasz`, in a descriptor that ends at `end`.
+/// Its data follows the 8-byte header, and the next property follows the data padded to
+/// `align`, which must not pass the descriptor's end.
+fn property_span(
+    pos: u64,
+    datasz: u32,
+    align: u64,
+    end: u64,
+) -> Result<PropertySpan, PropertyRefusal> {
+    let data_off = pos.saturating_add(8);
+    let pad = align_up(u64::from(datasz), align).ok_or(PropertyRefusal::Overflows)?;
+    // Checked, not saturating: a sum saturated to `u64::MAX` would pass the test below for a
+    // descriptor that ends there.
+    let next = data_off
+        .checked_add(pad)
+        .ok_or(PropertyRefusal::Overflows)?;
+    if next > end {
+        return Err(PropertyRefusal::PastTheEnd { pad });
+    }
+    Ok(PropertySpan { data_off, next })
+}
+
+/// The bytes one program header and one section header occupy in this class: `Elf64_Phdr`
+/// and `Elf64_Shdr` are 56 and 64 bytes, `Elf32_Phdr` and `Elf32_Shdr` 32 and 40.
+fn header_records(elf64: bool) -> (NonZeroU64, NonZeroU64) {
+    if elf64 {
+        (record_size::<56>(), record_size::<64>())
+    } else {
+        (record_size::<32>(), record_size::<40>())
+    }
+}
+
+/// Refuse a header table whose declared stride is no record size.
 fn check_strides(elf64: bool, ph: (u64, u64), sh: (u64, u64)) -> Result<(), ElfError> {
-    let (ph_min, sh_min) = if elf64 { (56, 64) } else { (32, 40) };
+    let (ph_record, sh_record) = header_records(elf64);
     for (field, record, (count, entsize), min) in [
-        ("e_phentsize", "program header", ph, ph_min),
-        ("e_shentsize", "section header", sh, sh_min),
+        ("e_phentsize", "program header", ph, ph_record.get()),
+        ("e_shentsize", "section header", sh, sh_record.get()),
     ] {
         if count > 0 && entsize < min {
             return Err(ElfError::malformed(format!(
@@ -508,7 +593,42 @@ fn check_strides(elf64: bool, ph: (u64, u64), sh: (u64, u64)) -> Result<(), ElfE
             )));
         }
     }
+    let (count, entsize) = ph;
+    if count > 0 && entsize != ph_record.get() {
+        return Err(ElfError::malformed(format!(
+            "e_phentsize is {entsize}, not the {ph_record}-byte program header this class defines, so the program-header table ({count} declared) was not read"
+        )));
+    }
     Ok(())
+}
+
+/// Why the section-header table is not read, where `e_shoff` is 0 and the header still declares
+/// sections: an `unread` [`ElfTable::SectionHeaders`] record, under which the file is read as
+/// having no section-header table. `None` where `e_shoff` names a table or no section is
+/// declared.
+fn section_table_at_no_offset(e_shoff: u64, count: u64) -> Option<Truncation> {
+    (e_shoff == 0 && count > 0).then(|| {
+        Truncation::unread(
+            ElfTable::SectionHeaders,
+            format!(
+                "section-header table: e_shoff is 0, which says the file has none, while e_shnum declares {count} headers"
+            ),
+        )
+    })
+}
+
+/// Why the section-header table is not read, where it declares a stride above the record's:
+/// an `unread` [`ElfTable::SectionHeaders`] record, under which the file is read as having no
+/// section-header table. `None` where the table is read.
+fn section_table_withheld(count: u64, entsize: u64, record: NonZeroU64) -> Option<Truncation> {
+    (count > 0 && entsize != record.get()).then(|| {
+        Truncation::unread(
+            ElfTable::SectionHeaders,
+            format!(
+                "section-header table: e_shentsize is {entsize} where the record is {record} bytes, so its {count} headers could lie at either stride"
+            ),
+        )
+    })
 }
 
 /// The bytes one symbol occupies in this class: `Elf64_Sym` or `Elf32_Sym`.
@@ -541,37 +661,6 @@ fn relocation_record(elf64: bool, rela: bool) -> NonZeroU64 {
 /// The stride a table of fixed-size records is read at, which is the record size whatever
 /// the table declares, beside an `ignored` record on `table` where the declared entry size
 /// (`field`: a section's `sh_entsize`, a `DT_RELAENT`) says otherwise.
-///
-/// The ABI fixes each record's size. The loader walks `DT_SYMTAB` at that size whatever a
-/// header declares; glibc's `ld.so` refuses an object whose `DT_RELAENT` is not the record
-/// size (measured 2026-10-20 with glibc 2.43 on Fedora 44 x86_64: the assertion in
-/// `elf_get_dynamic_info`, exit 127); and readelf reports an invalid `sh_entsize` and reads at
-/// the expected size. So no reading at a declared size is one a loader makes, and the record
-/// says the size the ABI fixes rather than naming a loader. A walk that took the declared size
-/// floored at the record would let a declared size above it choose which records are read.
-/// Measured 2026-10-20 on Fedora 44 x86_64 with gcc 16.1.1: a
-/// `-O2 -fstack-protector-strong -fPIE -pie -s` program whose `.dynsym` `sh_entsize` is
-/// patched from 24 to 48 still runs, and a walk at the declared size reads 4 of its 8 named
-/// symbols and loses `__stack_chk_fail`, withheld only by the stops a misaligned read happens
-/// to reach; a table whose size the declared stride divides is read every other record with
-/// nothing recorded (`tests/elf_truncations.rs`,
-/// `a_symbol_table_declaring_another_entry_size_is_read_in_records`).
-///
-/// This is the one place a stride is decided: a section's walk reaches it through
-/// [`Elf::section_stride`], the only reader of `sh_entsize`, and `relocation_reach` calls it
-/// for the dynamic tags; `tests::every_stride_is_decided_by_record_stride` holds both. The
-/// record is `ignored`, not `unread`: the table is read whole, at the size the ABI fixes, so
-/// the facts are the ones every reader of the format takes, and the record names the header
-/// or tag that disagreed. A declared size below the record, which a floor at the record
-/// would keep from reading one "symbol" per byte, is the same disagreement and is read the same
-/// way.
-///
-/// A named risk, not a withholding: a `DT_RELAENT` or `DT_RELENT` that differs is `ignored`
-/// too, though glibc's `ld.so` refuses to run the object. musl's loader runs it and walks the
-/// tables at the record size (measured 2026-10-20 with musl 1.2.5 on Fedora 44 x86_64: a
-/// `-fPIE -pie` program with `DT_RELAENT` 48 exits 0), so the facts are the ones that loader
-/// and readelf take, and an object glibc will not start runs no protection, so no verdict
-/// over it describes a running glibc program; the record names the tag.
 #[must_use]
 fn record_stride(
     declared: u64,
@@ -594,7 +683,7 @@ fn record_stride(
 /// How every record [`record_stride`] writes ends, after the record size.
 const STRIDE_RECORD_TAIL: &str = "-byte records, the size the ABI fixes";
 
-/// Whether `t` is a record [`record_stride`] wrote: `ignored`, and its detail ending as that
+/// Whether `t` is a record `record_stride` wrote: `ignored`, and its detail ending as that
 /// helper's does. For a reader that compares two readings with the declarations taken out
 /// (the `elf_parse` fuzz target), so its filter is this module's and not a copy of the
 /// sentence; `tests::a_stride_record_is_told_apart_by_its_writer` holds the two together.
@@ -605,10 +694,9 @@ pub fn is_stride_record(t: &Truncation) -> bool {
 
 /// `trunc` with each stride record kept at its first place only: several walks read one
 /// section (the symbol readers, a relocatable object's three relocation walks), and
-/// [`Elf::section_stride`] labels the record from that section alone (its name, with its
-/// index where the name is absent or another section's too), so theirs are equal and two
-/// sections' are not. One pass over a set, where checking the list at each push was
-/// quadratic in the section count; the other records are left as they are.
+/// [`Elf::section_stride`] labels the record from that section alone, so theirs are equal
+/// and two sections' are not. One pass over a set, not quadratic in the section count; the
+/// other records are left as they are.
 fn once_each_stride_record(mut trunc: Vec<Truncation>) -> Vec<Truncation> {
     let mut seen = BTreeSet::new();
     trunc.retain(|t| !is_stride_record(t) || seen.insert((t.table, t.detail.clone())));
@@ -623,26 +711,6 @@ struct Cursor<'a> {
 }
 
 /// Why a bounded read could not be served.
-///
-/// A plain enum rather than an `anyhow::Error`, and the reason is mechanical rather than
-/// stylistic. These four are the reader's numeric contact with untrusted bytes; `cstr_at`
-/// is a fifth, proved differently, see its own doc comment. `THREAT_MODEL.md` treats a
-/// panic in any of the five as a bug to report, so these four are where a Kani proof
-/// belongs. `anyhow`'s constructors format eagerly, and a bounded model checker following
-/// that path disappears into `core::slice::memchr`: a Kani proof of a *four-line arithmetic
-/// helper* in this file was killed at 480s having unwound memchr 6,687 times, while a proof
-/// touching no chard code verified in seconds. Constructing an error must therefore allocate
-/// and format nothing. `cstr_at` calls `position()` over the same `memchr`-backed path on
-/// every input by construction, which is why it is held to a targeted unit test
-/// (`a_cstring_read_never_crosses_its_own_tables_declared_end`) instead of a Kani harness:
-/// the harness that would prove it is the one this paragraph already measured timing out.
-///
-/// Callers are unaffected. [`ElfError`] converts from it, so the 50 `?` sites downstream
-/// widen into `ElfError::Truncated` at the call site, and the conversion happens in the
-/// caller rather than inside the read.
-///
-/// The payload is captured, not rendered. `Display` runs only when someone prints the error,
-/// which is the boundary, never the read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
     /// The offset does not fit this machine's `usize`.
@@ -673,21 +741,6 @@ impl std::fmt::Display for ReadError {
 impl std::error::Error for ReadError {}
 
 /// Why an object could not be read into facts.
-///
-/// The type a read fails with once it has left `Cursor`. [`ReadError`] stays the
-/// allocation-free `Copy` enum the Kani proofs need, and `From<ReadError>` is where the
-/// widening happens: a `?` on a bounded read inside `parse` lands here as `Truncated`,
-/// carrying the read that fell outside the object. The other variants are built at the two
-/// boundaries, `parse` for the shape of the bytes and `facts_for` for the file around them,
-/// and `facts_for` attaches the path to whatever `parse` refused without one.
-///
-/// Typed because the envelope classifies by variant: `src/error.rs` reads `Io` by its kind
-/// and every other variant as the caller's object, and a message string can only be
-/// guessed at. `Display` is the whole message, with the path in front when one is known,
-/// and `source()` is `None` on every variant. The two consumers want opposite things of a
-/// source: the envelope joins the chain and would print it twice, and `Variant::elf_error`
-/// stores `Display` alone and would never print it. Carrying the reason in `Display`
-/// serves both.
 #[derive(Debug)]
 pub enum ElfError {
     /// The bytes are not an ELF object: too short for an identification, wrong magic, or
@@ -700,8 +753,9 @@ pub enum ElfError {
     /// the dump by design over a Mach-O artifact on a macOS run and over nothing else this
     /// reader refuses (`report::artifact_account_missing`).
     MachO { path: Option<PathBuf> },
-    /// The header describes a table the file cannot hold: a stride below the record, an
-    /// offset that overflows, a `shdr[0]` escape that names bytes past the end.
+    /// The header describes a table the file cannot hold, or one chard reads at no stride: a
+    /// stride below the record, a program-header stride other than the record, an offset that
+    /// overflows, a `shdr[0]` escape that names bytes past the end.
     Malformed { path: Option<PathBuf>, what: String },
     /// A bounded read fell outside the object.
     Truncated {
@@ -781,9 +835,7 @@ impl std::fmt::Display for ElfError {
                 cap,
             } => write!(
                 f,
-                "{} is {size} bytes, above the {cap}-byte cap on a single object, so it \
-                 was not read. Four magic bytes are all that identify a file as ELF, and \
-                 this reader holds whatever it opens.",
+                "{} is {size} bytes, above the {cap}-byte cap on a single object.",
                 path.display()
             ),
             Self::TooLarge {
@@ -792,9 +844,7 @@ impl std::fmt::Display for ElfError {
                 cap,
             } => write!(
                 f,
-                "{} carried more than {cap} bytes, the cap on a single object, so the rest \
-                 was not read. Four magic bytes are all that identify a stream as ELF, and \
-                 this reader holds whatever it reads.",
+                "{} carried more than {cap} bytes, the cap on a single object.",
                 path.display()
             ),
             Self::Io { path, op, source } => write!(f, "{op} {}: {source}", path.display()),
@@ -812,13 +862,12 @@ impl From<ReadError> for ElfError {
 
 /// The result of a bounded read. Deliberately narrower than [`ElfError`]: it is the type
 /// the Kani proofs see.
-type Read<T> = std::result::Result<T, ReadError>;
+type Read<T> = Result<T, ReadError>;
 
 impl<'a> Cursor<'a> {
     fn slice(&self, off: u64, len: u64) -> Read<&'a [u8]> {
         // The discarded `TryFromIntError` says only "did not fit", which the variant
-        // already says while also carrying the value that did not fit. Named-but-ignored
-        // rather than `|_|` so the discard is deliberate and clippy can see that it is.
+        // already says while also carrying the value that did not fit.
         let start = usize::try_from(off).map_err(|_too_big| ReadError::OffsetTooLarge(off))?;
         let count = usize::try_from(len).map_err(|_too_big| ReadError::LengthTooLarge(len))?;
         let end = start
@@ -867,43 +916,257 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// A NUL-terminated string at `base + off`, never read past `off + table_len` bytes
-    /// from `base`. `table_len` is the caller's own declared bound on the table `base`
-    /// starts (a section's `sh_size`, `DT_STRSZ`, a note's `namesz`) — never the size of
+    /// A NUL-terminated string at `base + off`, never read past `table_len` bytes from
+    /// `base`. `table_len` is the caller's own declared bound on the table `base`
+    /// starts (a section's `sh_size`, `DT_STRSZ`, a note's `namesz`), never the size of
     /// `self.data`. A table whose declared length is exceeded before any NUL appears
-    /// reads as truncated at that length, not as reaching into whatever bytes follow.
-    ///
-    /// Unbounded-but-safe is the hazard: a scan to `self.data.len()` is panic-free
-    /// because of `.get()`, which is beside the point. Two failures follow from treating
-    /// "cannot panic" as "cannot mislead":
-    /// a note name that overruns `namesz` reads bytes belonging to the descriptor or the
-    /// next note, changing what the name compares equal to (`gnu_properties` gates on
-    /// `note.name == "GNU"`, so a corrupted name silently drops a real property note,
-    /// a false `off` from a crafted file, the one verdict this reader exists to refuse);
-    /// and a string table with no terminator before EOF turns a bounded-count loop over
-    /// `dyn_strings`/`symbols` into an O(n²) scan, the same shape `min_step`
-    /// above closes for one trigger without bounding the read underneath it.
-    ///
-    /// Both are closed here. The misreadings a crafted file can still produce, the ones measured so
-    /// far, are the register entries `THREAT_MODEL.md`'s crafted-ELF row names.
-    fn cstr_at(&self, base: u64, off: u32, table_len: u64) -> String {
+    /// reads as truncated at that length, not as reaching into whatever bytes follow. An
+    /// `off` at or past `table_len`, or a start past the data, reads as the empty name.
+    fn cstr_at(&self, base: u64, off: u32, table_len: u64) -> Result<&'a [u8], Overlong> {
         let Some(remaining) = table_len.checked_sub(u64::from(off)) else {
-            return String::new(); // `off` is at or past the table's own declared end
+            return Ok(&[]); // `off` is at or past the table's own declared end
         };
         let Ok(start) = usize::try_from(base.saturating_add(u64::from(off))) else {
-            return String::new();
+            return Ok(&[]);
         };
         let cap = usize::try_from(remaining).unwrap_or(usize::MAX);
         let Some(rest) = self.data.get(start..) else {
-            return String::new();
+            return Ok(&[]);
         };
         let bounded = rest.get(..cap.min(rest.len())).unwrap_or(rest);
-        let end = bounded
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(bounded.len());
-        String::from_utf8_lossy(bounded.get(..end).unwrap_or(&[])).into_owned()
+        // One byte past the bound is searched, so a name of exactly `MAX_NAME_BYTES` is
+        // told from a longer one by the NUL after it.
+        let window = bounded
+            .get(..bounded.len().min(MAX_NAME_BYTES.saturating_add(1)))
+            .unwrap_or(bounded);
+        match window.iter().position(|&c| c == 0) {
+            Some(end) => Ok(window.get(..end).unwrap_or(&[])),
+            None if bounded.len() <= MAX_NAME_BYTES => Ok(bounded),
+            None => Err(Overlong),
+        }
     }
+}
+
+/// The longest name, in bytes and without its NUL, the reader takes from a string table:
+/// a section, symbol, note or dynamic-string name longer than this is not read, and the walk
+/// that met it records its table `unread` and stops (`NameFault::Overlong`).
+pub const MAX_NAME_BYTES: usize = 64 * 1024;
+
+/// The longest section name a label carries whole; see [`label_of`].
+const LABEL_BYTES: usize = 256;
+
+/// Section `idx`'s label in the records and facts the walks write: its name, or, for a name
+/// longer than [`LABEL_BYTES`], the name's first 64 bytes, an ellipsis and the index.
+fn label_of(name: &str, idx: usize) -> String {
+    if name.len() <= LABEL_BYTES {
+        return name.to_owned();
+    }
+    let cut = name
+        .char_indices()
+        .map(|(at, _)| at)
+        .take_while(|&at| at <= 64)
+        .fold(0, |_, at| at);
+    format!("{}... [{idx}]", name.get(..cut).unwrap_or(""))
+}
+
+/// A name past [`MAX_NAME_BYTES`]: the scan found no NUL within the bound and the table
+/// goes on past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Overlong;
+
+/// Units of reader work allowed per byte of the file read; see [`work_budget`].
+pub const WORK_PER_BYTE: u64 = 16;
+
+/// Units of reader work allowed whatever the file's length; see [`work_budget`].
+pub const WORK_FLOOR: u64 = 1 << 20;
+
+/// The units of work the reader may spend on a file of `len` bytes:
+/// [`WORK_PER_BYTE`] per byte plus [`WORK_FLOOR`].
+#[must_use]
+pub fn work_budget(len: usize) -> u64 {
+    let len = u64::try_from(len).unwrap_or(u64::MAX);
+    len.saturating_mul(WORK_PER_BYTE).saturating_add(WORK_FLOOR)
+}
+
+/// The work one file's reading may still spend.
+struct Budget {
+    granted: u64,
+    left: std::cell::Cell<u64>,
+    /// Whether a spend has failed, which `left` at zero does not say: a spend can take the
+    /// last unit and succeed.
+    ran_out: std::cell::Cell<bool>,
+    /// What was left, and whether a spend had failed, when [`Elf::parse_within`] returned: each
+    /// [`Elf::facts`] starts from it, so a second reading spends what the first did.
+    parsed: std::cell::Cell<(u64, bool)>,
+}
+
+impl Budget {
+    fn new(granted: u64) -> Self {
+        Self {
+            granted,
+            left: std::cell::Cell::new(granted),
+            ran_out: std::cell::Cell::new(false),
+            parsed: std::cell::Cell::new((granted, false)),
+        }
+    }
+
+    /// Keep what is left as the point every reading starts from.
+    fn mark_parsed(&self) {
+        self.parsed.set((self.left.get(), self.ran_out.get()));
+    }
+
+    /// Go back to the point [`Self::mark_parsed`] kept.
+    fn restart(&self) {
+        let (left, ran_out) = self.parsed.get();
+        self.left.set(left);
+        self.ran_out.set(ran_out);
+    }
+
+    /// The failure a spend has met, if one has: for a walk whose own records go to a
+    /// scratch list, to say its table was cut by the budget.
+    fn exhausted(&self) -> Option<Spent> {
+        self.ran_out.get().then_some(Spent {
+            granted: self.granted,
+        })
+    }
+
+    /// Take `units` from what is left, or fail and leave nothing, so every later spend
+    /// fails too.
+    fn spend(&self, units: u64) -> Result<(), Spent> {
+        if let Some(left) = self.left.get().checked_sub(units) {
+            self.left.set(left);
+            return Ok(());
+        }
+        self.left.set(0);
+        self.ran_out.set(true);
+        Err(Spent {
+            granted: self.granted,
+        })
+    }
+
+    fn spent(&self) -> u64 {
+        self.granted.saturating_sub(self.left.get())
+    }
+}
+
+/// The budget ran out: the walk that meets this stops and records its table `unread`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Spent {
+    granted: u64,
+}
+
+impl std::fmt::Display for Spent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the reader's work budget for this file ({} units) was spent",
+            self.granted
+        )
+    }
+}
+
+/// Why a name was not taken from its string table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameFault {
+    /// Longer than [`MAX_NAME_BYTES`].
+    Overlong,
+    /// The file's work budget ran out.
+    Spent(Spent),
+}
+
+impl From<Spent> for NameFault {
+    fn from(spent: Spent) -> Self {
+        Self::Spent(spent)
+    }
+}
+
+impl std::fmt::Display for NameFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overlong => write!(
+                f,
+                "a name runs past the reader's {MAX_NAME_BYTES}-byte bound on one name"
+            ),
+            Self::Spent(spent) => spent.fmt(f),
+        }
+    }
+}
+
+/// Why one symbol-table entry was not read: its bytes are not in the file, or its name was
+/// not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryStop {
+    Read(ReadError),
+    Name(NameFault),
+}
+
+impl From<ReadError> for EntryStop {
+    fn from(read: ReadError) -> Self {
+        Self::Read(read)
+    }
+}
+
+impl From<NameFault> for EntryStop {
+    fn from(fault: NameFault) -> Self {
+        Self::Name(fault)
+    }
+}
+
+impl std::fmt::Display for EntryStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(read) => read.fmt(f),
+            Self::Name(fault) => fault.fmt(f),
+        }
+    }
+}
+
+/// The name at `base + off` in a table of `table_len` bytes, charged to `budget`: one unit
+/// per byte and one for the NUL.
+fn name_in(
+    cur: &Cursor<'_>,
+    budget: &Budget,
+    (base, off, table_len): (u64, u32, u64),
+) -> Result<String, NameFault> {
+    let Ok(bytes) = cur.cstr_at(base, off, table_len) else {
+        // The bytes searched before the refusal are charged too, so headers aliasing one
+        // table whose name runs past the bound each pay for the search.
+        budget.spend(u64::try_from(MAX_NAME_BYTES).unwrap_or(u64::MAX))?;
+        return Err(NameFault::Overlong);
+    };
+    let units = u64::try_from(bytes.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    budget.spend(units)?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The symbols [`Elf::symbols`] has read, and every versioned spelling kept among them, so a
+/// repeat is found in a set and not by a scan of the name's list: `N` symbols sharing one bare
+/// name under distinct versions would scan `N x N`.
+#[derive(Default)]
+struct SymbolsRead {
+    facts: BTreeMap<String, SymbolFact>,
+    spellings: BTreeSet<String>,
+}
+
+/// The (function, symbol) pairs and the unattributed symbols `function_references` has listed,
+/// by index, so a repeat is found without comparing names, whose shared prefix a crafted file
+/// makes as long as the bound on one name.
+#[derive(Default)]
+struct Attributed {
+    pairs: BTreeSet<(usize, u64)>,
+    unattributed: BTreeSet<u64>,
+}
+
+/// The symbols `code_relocations` has named, by the offset of the symbol's entry and the offset
+/// and size of the string table its name was read through, and the kinds listed through each,
+/// so an entry through a symbol already named reads and lists nothing again: otherwise a
+/// relocatable object of `R` entries through one long name would copy that name `R` times.
+#[derive(Default)]
+struct RelocationsRead {
+    names: BTreeMap<(u64, u64, u64), Option<(String, u8)>>,
+    listed: BTreeSet<(u32, (u64, u64, u64))>,
 }
 
 /// What naming a relocation's symbol reads: the symbol table its section links, that
@@ -1040,13 +1303,6 @@ fn is_mach_o(ident: &[u8]) -> bool {
 }
 
 /// The identification: is this an ELF object, and in which class and byte order.
-///
-/// Returns `(elf64, little)`. Everything refused here is [`ElfError::NotElf`], since a file
-/// with no magic, too short to carry one, or in a class or encoding this reader has no
-/// layout for is the same statement to the caller: this is not an object it can read. The
-/// one exception is a file of at least an identification's length that opens a Mach-O
-/// object ([`is_mach_o`]), refused as [`ElfError::MachO`], since the self-report gate reads
-/// that format's refusal differently on a macOS run.
 fn identify(data: &[u8]) -> Result<(bool, bool), ElfError> {
     let not_elf = |why: String| ElfError::NotElf { path: None, why };
     let ident = data
@@ -1071,23 +1327,15 @@ fn identify(data: &[u8]) -> Result<(bool, bool), ElfError> {
     Ok((elf64, little))
 }
 
-/// The program-header table: `count` records of `entsize` bytes from `off`.
-///
-/// A record the file does not hold ends the read with an error, so a header that
-/// declares more than the file carries is refused at the header: the reads are what
-/// bound a declared count the file cannot satisfy.
-fn read_phdrs(
-    cur: &Cursor<'_>,
-    elf64: bool,
-    off: u64,
-    count: u64,
-    entsize: u64,
-) -> Result<Vec<Phdr>, ElfError> {
+/// The program-header table: `count` records of the class's program-header size from
+/// `off`. It takes no declared stride: [`check_strides`] has refused any other.
+fn read_phdrs(cur: &Cursor<'_>, elf64: bool, off: u64, count: u64) -> Result<Vec<Phdr>, ElfError> {
+    let (record, _) = header_records(elf64);
     let mut phdrs = Vec::new();
     for i in 0..count {
         let base = off
             .checked_add(
-                i.checked_mul(entsize)
+                i.checked_mul(record.get())
                     .ok_or_else(|| ElfError::malformed("phdr index overflow"))?,
             )
             .ok_or_else(|| ElfError::malformed("phdr offset overflow"))?;
@@ -1140,20 +1388,6 @@ fn read_shdr(cur: &Cursor<'_>, elf64: bool, base: u64) -> Read<Shdr> {
 
 /// `shdr[0]`, read for a header escape, or `None` where the count escape names a record
 /// the file does not hold.
-///
-/// A nonzero `e_shoff` that names bytes past the end of the file is a file cut before
-/// its section-header table, or one whose header was edited, with `e_shnum` at 0 either
-/// way. GNU readelf probes `shdr[0]` for the escapes and, when the probe fails, applies
-/// none of them, so it reads the file as having no section-header table and goes on
-/// through the program headers. A reader that refused the file would leave
-/// `tests/elf_readelf.rs` reporting it unreadable by one side, so this one follows readelf
-/// for the count escape, and says so in `truncations` under the `section-header table:` prefix. The
-/// other two escapes cannot be tolerated the same way: a declared `e_shnum` above 0 at
-/// that offset is a table the file does not hold, and `PN_XNUM` with no `shdr[0]` is a
-/// program-header count of 65535 the file does not hold either, so both stay errors, as
-/// they are in readelf. A stride below the record size is refused before the probe, on
-/// `parse`'s pre-escape check; that is the one place this reader is stricter than the
-/// probe.
 fn probe_shdr0(
     cur: &Cursor<'_>,
     elf64: bool,
@@ -1166,20 +1400,11 @@ fn probe_shdr0(
         Err(e) if uses_shnum_escape => {
             // `SectionHeaders`, because this entry is the cause: the header's escape
             // names a record the file does not hold, and the reader goes on as if there
-            // were no section-header table. The effects are `structural_truncations`'
-            // entries, `symbols` and `section-names`, which a file with no table at all
-            // carries too. Typing the cause as `symbols` as well made one condition two
-            // `symbols` entries, a count no reader could use. No check declares
-            // `section-headers`, so the cause withholds nothing on its own. (2026-09-30:
-            // `ret-protector-emitted` declares it, beside the `section-names` it also
-            // declares and this escape also records.)
+            // were no section-header table.
             truncations.push(Truncation::unread(
                 ElfTable::SectionHeaders,
                 format!(
-                    "section-header table: e_shnum is 0 and e_shoff {e_shoff:#x} names a \
-                     shdr[0] the file does not hold ({e}), so the count escape was not \
-                     followed and the file is read as having no section-header table, as \
-                     readelf reads it"
+                    "section-header table: e_shnum is 0 and e_shoff {e_shoff:#x} names a shdr[0] the file does not hold ({e})"
                 ),
             ));
             Ok(None)
@@ -1194,6 +1419,7 @@ fn probe_shdr0(
 /// `section-names` truncation where that table cannot be read as one.
 fn section_names(
     cur: &Cursor<'_>,
+    budget: &Budget,
     shdrs: &[Shdr],
     shstrndx: u32,
     truncations: &mut Vec<Truncation>,
@@ -1212,40 +1438,43 @@ fn section_names(
             return vec![String::new(); shdrs.len()];
         }
     };
-    // The table's bytes are held before a name is read from them. `cstr_at` answers ""
-    // for an offset past the end of the file, and a name table the file does not hold
-    // read every section as unnamed and recorded nothing.
+    // `cstr_at` answers "" for an offset past the end of the file, so the table's bytes are
+    // held first: a table the file does not hold would read every section as unnamed.
     let base = strtab.sh_offset;
     let len = strtab.sh_size;
     if let Err(why) = cur.slice(base, len) {
         truncations.push(Truncation::unread(
             ElfTable::SectionNames,
             format!(
-                "section names: the table at {base:#x}+{len:#x} lies past the end of the file \
-                 ({why}), so no section can be found by name"
+                "section names: the table at {base:#x}+{len:#x} lies past the end of the file ({why})"
             ),
         ));
         return vec![String::new(); shdrs.len()];
     }
     // Bounded by the table's own `sh_size`, which `cstr_at` requires of every caller: a
-    // name that runs past the table's declared end is cut at that end, whatever section
-    // follows.
-    shdrs
-        .iter()
-        .map(|sh| cur.cstr_at(base, sh.sh_name, len))
-        .collect()
+    // name that runs past the table's declared end is cut at that end.
+    let mut names = Vec::with_capacity(shdrs.len());
+    for (i, sh) in shdrs.iter().enumerate() {
+        match name_in(cur, budget, (base, sh.sh_name, len)) {
+            Ok(name) => names.push(name),
+            Err(fault) => {
+                truncations.push(Truncation::unread(
+                    ElfTable::SectionNames,
+                    format!(
+                        "section names: section {i} of {} names offset {:#x} of the table at {base:#x}+{len:#x}, and {fault}",
+                        shdrs.len(),
+                        sh.sh_name
+                    ),
+                ));
+                return vec![String::new(); shdrs.len()];
+            }
+        }
+    }
+    names
 }
 
 /// The section-name table, or why there is none to read.
-///
-/// Three refusals, each a different file. `SHN_UNDEF` is a file that declares no
-/// name table at all; an index past the table is a header that names a section the
-/// table does not hold; a candidate of another type is a header pointing somewhere
-/// names cannot be read from. Index 0 was the one that mattered: it is the null
-/// header, whose `sh_offset` is 0, and reading names through it produced strings cut
-/// out of the ELF header itself, which were then published in `sections` as though
-/// the file had named them.
-fn section_name_table(shdrs: &[Shdr], shstrndx: u32) -> std::result::Result<&Shdr, String> {
+fn section_name_table(shdrs: &[Shdr], shstrndx: u32) -> Result<&Shdr, String> {
     if shstrndx == u32::from(SHN_UNDEF) {
         return Err(
             "e_shstrndx is SHN_UNDEF, so the file declares no section-name table \
@@ -1255,15 +1484,13 @@ fn section_name_table(shdrs: &[Shdr], shstrndx: u32) -> std::result::Result<&Shd
     }
     let Some(candidate) = shdrs.get(usize::try_from(shstrndx).unwrap_or(usize::MAX)) else {
         return Err(format!(
-            "e_shstrndx {shstrndx} is past the section-header table of {} entries, so no \
-             section can be found by name",
+            "e_shstrndx {shstrndx} is past the section-header table of {} entries",
             shdrs.len()
         ));
     };
     if candidate.sh_type != SHT_STRTAB {
         return Err(format!(
-            "e_shstrndx {shstrndx} names a section of type {:#x}, and only an SHT_STRTAB \
-             holds names, so no section can be found by name",
+            "e_shstrndx {shstrndx} names a section of type {:#x}",
             candidate.sh_type
         ));
     }
@@ -1283,33 +1510,103 @@ fn dyn_tag_name(tag: i64) -> &'static str {
     }
 }
 
+/// Byte ranges `[start, end)` sorted by start, beside the running maximum of their ends, so
+/// whether any range overlaps or contains a given one is a binary search, not a scan.
+struct Spans {
+    starts: Vec<u64>,
+    reach: Vec<u64>,
+}
+
+impl Spans {
+    fn new(mut spans: Vec<(u64, u64)>) -> Self {
+        spans.sort_unstable();
+        let mut furthest = 0;
+        let reach = spans
+            .iter()
+            .map(|&(_, end)| {
+                furthest = furthest.max(end);
+                furthest
+            })
+            .collect();
+        Self {
+            starts: spans.into_iter().map(|(start, _)| start).collect(),
+            reach,
+        }
+    }
+
+    /// The furthest end among the ranges starting where `starts_before` holds.
+    fn reach_of(&self, starts_before: impl Fn(u64) -> bool) -> Option<u64> {
+        let n = self.starts.partition_point(|&s| starts_before(s));
+        n.checked_sub(1)
+            .and_then(|last| self.reach.get(last).copied())
+    }
+
+    /// Whether some range shares a byte with `[start, end)`.
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.reach_of(|s| s < end).is_some_and(|r| r > start)
+    }
+
+    /// Whether some range holds all of `[start, end)`.
+    fn contains(&self, start: u64, end: u64) -> bool {
+        self.reach_of(|s| s <= start).is_some_and(|r| r >= end)
+    }
+}
+
+/// A note of the one owner and type a walk asked [`Elf::parse_notes`] for, by its descriptor's
+/// offset and length: a GNU property note (`GNU`, `NT_GNU_PROPERTY_TYPE_0`) for the property
+/// note walks, the only notes a property check reads, or the run witness for
+/// [`Elf::run_witness`]. Every note of a table is read, and these alone are kept.
 struct Note {
-    name: String,
-    ntype: u32,
     desc_off: u64,
     desc_len: u64,
+    short_len: u64,
+}
+
+impl Note {
+    /// The note one header read: its descriptor at `desc_off`, `desc_len` long.
+    fn read(desc_off: u64, desc_len: u64) -> Self {
+        Self {
+            desc_off,
+            desc_len,
+            short_len: desc_len,
+        }
+    }
+}
+
+/// Keep `note` once by its descriptor's offset, with the longest and the shortest length read
+/// there.
+fn keep_note(kept: &mut BTreeMap<u64, usize>, out: &mut Vec<Note>, note: Note) {
+    if let Some(&i) = kept.get(&note.desc_off) {
+        if let Some(held) = out.get_mut(i) {
+            held.desc_len = held.desc_len.max(note.desc_len);
+            held.short_len = held.short_len.min(note.short_len);
+        }
+    } else {
+        kept.insert(note.desc_off, out.len());
+        out.push(note);
+    }
+}
+
+/// The one `unread` record of the property notes [`Elf::gnu_properties`] did not walk because
+/// their headers read the descriptor at two lengths: the first such note, and how many follow it.
+fn record_disagreeing(disagreeing: Option<(&Note, u64)>, trunc: &mut Vec<Truncation>) {
+    let Some((note, more)) = disagreeing else {
+        return;
+    };
+    let others = match more {
+        0 => String::new(),
+        n => format!(", and {n} more property notes are"),
+    };
+    trunc.push(Truncation::unread(
+        ElfTable::Notes,
+        format!(
+            "property note at {:#x}: headers read its descriptor as {:#x} and {:#x} bytes{others}",
+            note.desc_off, note.short_len, note.desc_len
+        ),
+    ));
 }
 
 /// A table of the ELF container, as the reader and the checks name it.
-///
-/// One vocabulary for two declarations: a [`Truncation`] says which table it cut, and
-/// `probe::Check::reads` says which tables a check's observable is read from. The gate
-/// in `report::truncation_limitation` is the intersection, so a table that appears in
-/// neither list is unrepresentable.
-///
-/// Two of the tables have no recording site. The ELF header and the program-header table
-/// are read in [`Elf::parse`], and a cut there is an `Err` from it: `measure::gather`
-/// stores that as `elf_error`, and `report::Variant::sufficient_for` withholds every
-/// elf-static check over the artifact as `indeterminate` before a detector runs. They are
-/// in the enum so a check can still declare them, and [`Self::SOFT_SITES`] and
-/// [`Self::HARD_FAILURES`] partition the enum so a declaration can never name a table
-/// nothing records: `probe::tests::every_checks_tables_derive_from_its_decoder` holds
-/// every declared table to one of the two lists.
-///
-/// Two `PT_GNU_STACK` headers that disagree on `PF_X` (`Elf::gnu_stack`) are recorded
-/// against [`Self::GnuStack`], a table of its own that only the checks reading the stack
-/// header declare, so the program-header table keeps no recording site and the two lists
-/// partition the enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ElfTable {
@@ -1320,21 +1617,13 @@ pub enum ElfTable {
     ProgramHeaders,
     /// The `PT_GNU_STACK` headers among the program headers, recorded `unread` where two
     /// disagree on `PF_X` (`Elf::gnu_stack`).
-    ///
-    /// A finer unit than [`Self::ProgramHeaders`], whose cut it cannot stand for: the
-    /// header table read whole, and one segment type in it contradicts itself. Recorded
-    /// against the whole table, the disagreement withheld every check declaring it, `pie`,
-    /// `relro` and `textrel-absent` among them, which read `PT_INTERP`, `PT_GNU_RELRO` and
-    /// the dynamic section and not the stack header. A check reading the stack header
-    /// declares both tables, so a program-header table [`Elf::parse`] refuses withholds it
-    /// as it withholds every other, and the pair withholds it alone.
     GnuStack,
-    /// The section-header table itself, recorded when a header escape names a `shdr[0]`
-    /// the file does not hold. Its effects are recorded against the tables it cuts off. A
-    /// check whose predicate reads section headers declares it (`ret-protector-emitted`
-    /// beside `SectionNames`, because its predicate reads `sections`, which both tables
-    /// feed). The escape records `section-names` too, so the declaration withholds nothing
-    /// the other does not.
+    /// The section-header table itself, recorded when the file declares one that is not read:
+    /// a header escape names a `shdr[0]` the file does not hold (`probe_shdr0`), `e_shoff` is 0
+    /// with sections declared (`section_table_at_no_offset`), or the declared stride is above
+    /// the record (`section_table_withheld`). Its effects are recorded against the tables it
+    /// cuts off (`Elf::structural_truncations`), `symbols` and `section-names` among them,
+    /// and a check whose predicate reads section headers declares it beside one of those.
     SectionHeaders,
     /// The section-name string table, which everything reached by name goes through, and
     /// the named sections read as text (`.chard.report`, `.GCC.command.line`) when one is
@@ -1350,7 +1639,12 @@ pub enum ElfTable {
     /// `.symtab` and `.dynsym`, with the string tables their `sh_link` names.
     Symbols,
     /// The GNU notes, by `PT_GNU_PROPERTY` segment, by `PT_NOTE` segment where there is
-    /// none, or by `SHT_NOTE` section where the file has no program headers.
+    /// none, or by `SHT_NOTE` section in a relocatable object or a file with no program
+    /// headers (`Elf::notes_from_sections`). On an unlinked
+    /// aarch64 object it is also the `SHT_AARCH64_ATTRIBUTES` section the marking is read from
+    /// where no property note carries it (`Elf::aarch64_attribute_word`), and the disagreement
+    /// of the two where both do: the marking checks declare this table, so either withholds
+    /// them.
     Notes,
     /// `.comment`, the section every producer of a linked object appends its line to;
     /// read by `toolchain::artifact_agreement` and declared by no check.
@@ -1409,8 +1703,7 @@ impl ElfTable {
     ];
 
     /// The tables whose cut is an error from [`Elf::parse`]. Neither is on
-    /// [`Self::SOFT_SITES`]; the disagreement `ProgramHeaders` recorded for part of
-    /// 2026-10-05 is [`Self::GnuStack`]'s.
+    /// [`Self::SOFT_SITES`].
     pub const HARD_FAILURES: [Self; 2] = [Self::Header, Self::ProgramHeaders];
 
     /// The kebab-case spelling the report carries.
@@ -1435,11 +1728,6 @@ impl ElfTable {
 }
 
 /// What a truncation did to the table's facts.
-///
-/// `measure::unread_table_faults` publishes each kind at its own severity: an `Unread`
-/// table is an `error` diagnostic at the probe, since a reading was withheld, and an
-/// `Ignored` entry is a `warning`, since the facts are whole and the finding is about the
-/// artifact declaring something the reader did not follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TruncationKind {
@@ -1468,13 +1756,6 @@ impl TruncationKind {
 }
 
 /// A table the reader could not finish, and what that did to the facts.
-///
-/// `detail` is the site's own sentence, with the offset or index it stopped at, and is
-/// what a diagnostic and a gating reason quote. `table` and `kind` are what code reads:
-/// the gate never matches prose. The type carries no `Display`: the two sentences that
-/// publish an entry, `report::truncated_reading` and `measure::unread_table_faults`, each
-/// compose `table.as_str()` and `detail` into their own wording, and a third form nothing
-/// printed would drift from both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Truncation {
     pub table: ElfTable,
@@ -1502,23 +1783,6 @@ impl Truncation {
 
 /// The tags whose value one loader field holds, so a second entry is a second answer to a
 /// question the loader asks once.
-///
-/// `ld.so` and musl store `info[tag]` in a loop that stops at `DT_NULL`, so the last entry of
-/// a repeated tag answers. Measured 2026-10-09 on Fedora 44 x86_64 (glibc 2.43, musl): a PIE
-/// whose `DT_DEBUG` slot was relabelled `DT_INIT` ran the later `DT_INIT` under both, in both
-/// value orders, and a relabelled `DT_FLAGS_1` of `DF_1_NOW` ahead of the real `DF_1_PIE`
-/// left `puts` bound after `ld.so` transferred control (lazy), where the same flag last bound
-/// it before (now). An entry behind `DT_NULL` (a relabelled `DT_INIT`) was ignored by both. `DT_NEEDED` is absent
-/// because it legitimately repeats. `DT_RPATH` and `DT_RUNPATH` are here: the loader keeps
-/// the last of each, so `rpath` and `runpath` list the last and the repeat is recorded
-/// (`dyn_strings`). No linker writes a repeat of any of these, so a repeat is a
-/// file nothing ordinary produced, and a loader family not run here may differ: the value
-/// read is the last, and the repeat is recorded `unread`. `DT_SYMTAB`, `DT_HASH` and
-/// `DT_GNU_HASH` are here because `dynsym_view` reads the dynamic symbol table through
-/// them; the loaders' last-entry rule was measured on `DT_INIT` and `DT_FLAGS_1`, and these
-/// are taken to share it because the same loop stores every tag. The relocation tags are
-/// here on the same footing: `dynsym_view` reads the relocation tables for the floor they
-/// put under the symbol count.
 const LOADER_SINGLE_TAGS: [(i64, &str); 19] = [
     (DT_PLTRELSZ, "DT_PLTRELSZ"),
     (DT_HASH, "DT_HASH"),
@@ -1541,10 +1805,29 @@ const LOADER_SINGLE_TAGS: [(i64, &str); 19] = [
     (DT_GNU_HASH, "DT_GNU_HASH"),
 ];
 
+/// How a symbol table spells a version, which decides what a symbol's name is keyed on.
+#[derive(Clone, Copy)]
+enum Spelling {
+    /// `.symtab`: the name before the first `@` is the key, and the whole spelling is kept in
+    /// `versioned`.
+    Versioned,
+    /// `.dynsym`: the name is the key, whole.
+    Whole,
+}
+
+impl Spelling {
+    /// How a symbol table of `sh_type` spells a name: `SHT_SYMTAB` with its version, every
+    /// other type (`SHT_DYNSYM`, the one other the reader reads) bare.
+    fn of(sh_type: u32) -> Self {
+        if sh_type == SHT_SYMTAB {
+            Self::Versioned
+        } else {
+            Self::Whole
+        }
+    }
+}
+
 /// How the dynamic symbol table is reached, from the dynamic table and the program headers.
-///
-/// See `Elf::dynsym_view`. The variants are the answers to "what does the loader read here",
-/// and each decides what the `SHT_DYNSYM` headers are held to.
 enum DynSymView {
     /// No loader view: no `PT_DYNAMIC`, no section headers, or a dynamic table that could
     /// not be read. The headers are the reading.
@@ -1571,11 +1854,7 @@ fn repeated_loader_tags(entries: &[(i64, u64)], trunc: &mut Vec<Truncation>) {
         if n > 1 {
             trunc.push(Truncation::unread(
                 ElfTable::Dynamic,
-                format!(
-                    "{name} appears {n} times in .dynamic; the loader keeps the last, which \
-                     is the one measured, and a loader not run for this was not established \
-                     to agree"
-                ),
+                format!("{name} appears {n} times in .dynamic"),
             ));
         }
     }
@@ -1583,14 +1862,6 @@ fn repeated_loader_tags(entries: &[(i64, u64)], trunc: &mut Vec<Truncation>) {
 
 /// How the loader would treat a linked object, from `e_type`, `PT_INTERP`, `.dynamic`,
 /// `DF_1_PIE` and `DT_DEBUG`.
-///
-/// One value, flattened by `LinkKind::flatten` into the four booleans the report carries, so
-/// the pairs that cannot both hold are unrepresentable: a shared object that is statically
-/// linked, a static PIE that is not. `None` from `link_kind` is an object the loader
-/// cannot run at all, and every fact derived here is `None` with it: a relocatable
-/// object has no program headers, so "no `PT_GNU_STACK`", "no `PT_GNU_RELRO`" and
-/// "statically linked" were true of every `.o` for the wrong reason, and `relro: "none"`
-/// on a `.o` was the falsy default this project refuses arriving by another route.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LinkKind {
     /// `PT_INTERP` names a loader. `pie` is whether the object is `ET_DYN`, which with an
@@ -1599,47 +1870,7 @@ enum LinkKind {
     /// `ET_DYN` with no interpreter, marked as executable output by `DF_1_PIE`, by
     /// `DT_DEBUG`, or by both; the payload says which, and `link_kind` builds the variant
     /// only when at least one holds. It still carries `.dynamic`, since it relocates
-    /// itself, which is why "no interpreter and no dynamic section" was the wrong reading
-    /// of "statically linked": it made a static PIE not statically linked.
-    ///
-    /// `DT_DEBUG` is the third discriminator because `DF_1_PIE` alone left a gap: lld
-    /// 10.0.0 did not set the flag on a static PIE, so that object read as a shared object
-    /// and `pie` read `off`. Measured 2026-09-28 on Fedora 44 x86_64 (`chard-f44-linkers`:
-    /// GNU ld and gold 2.46.1, lld 22.1.8, mold 2.40.4) and in an Ubuntu 20.04 container
-    /// with lld 10.0.0: every executable output that linked carried `DT_DEBUG`, and no
-    /// shared object did. On Fedora the four linkers each linked a dynamic PIE and a
-    /// non-PIE executable, and GNU ld, lld and mold a static PIE; gold did not link one.
-    /// lld 10.0.0 was measured on a static PIE and a dynamic PIE, and not on a non-PIE
-    /// executable. The shared objects were linked plain under all five, and with
-    /// `-soname` or with `-e` giving them a non-zero entry point under the four on Fedora.
-    /// The lld 10 static PIE is `ET_DYN` with no
-    /// interpreter, `DT_DEBUG` and no `DT_FLAGS_1` at all, which is the case this closes.
-    /// That object, linked by clang 10 with `-static-pie` from `int main(){return 0;}`,
-    /// segfaults at startup in the Ubuntu 20.04 container and on Fedora 44 x86_64 although
-    /// it carries glibc's `_dl_relocate_static_pie`; the cause is not established, so it
-    /// shows the tags lld 10.0.0 writes on that link and not a working static PIE. The
-    /// rule rests on the tag shape, and the assumption it needs is registered as
-    /// `dt-debug-marks-only-executable-output` in `report::ASSUMPTIONS`.
-    /// The replay corpus agrees: none of its 98 shared objects, from gcc 8.5 through 16
-    /// and clang 10 through 23, carries the tag.
-    ///
-    /// `DT_SONAME` does not veto it. A `-soname` given to an executable link is written
-    /// all the same, so the tag names a file and says nothing about how the loader treats
-    /// it; `DT_DEBUG` beside `DT_SONAME` is executable output. Measured the same day:
-    /// `-Wl,-soname` on a static PIE linked by GNU ld 2.46.1, lld 22.1.8 and mold 2.40.4,
-    /// and on a dynamic PIE and a non-PIE executable linked by GNU ld 2.46.1 under gcc
-    /// 16.1.1, left both tags in every output, and each static PIE ran. lld 10.0.0 under
-    /// clang 10 wrote the same pair with no `DT_FLAGS_1`, so there `DT_DEBUG` is the only
-    /// marker and `DT_SONAME` the only reason to doubt it. The pair is pinned on bytes in
-    /// `debug_marks_executable_output_whatever_the_soname`.
-    ///
-    /// What stays open is an interpreter-less `ET_DYN` carrying neither marker, which
-    /// reads as a shared object, and a static PIE is written so: lld 10.0.0 under clang 10
-    /// `-static-pie -Wl,-z,rodynamic` (Ubuntu 20.04 x86_64, 2026-10-26) wrote no `DT_DEBUG`
-    /// and no `DT_FLAGS_1`. The tags cannot tell it from a shared object with no
-    /// `DT_NEEDED`, so the case is settled where chard knows what it asked for:
-    /// `report::link_mode_limitation` withholds a reading of the classification over an
-    /// executable link's artifact that classifies as a shared object.
+    /// itself, and is statically linked all the same.
     StaticPie { df_1_pie: bool, dt_debug: bool },
     /// `ET_DYN` with `.dynamic`, no interpreter, and neither `DF_1_PIE` nor `DT_DEBUG`. A
     /// static PIE written without either marker carries the same tags and reads as this;
@@ -1687,9 +1918,8 @@ fn link_kind(e_type: u16, has_interp: bool, tags: &BTreeSet<i64>, flags1: u64) -
     })
 }
 
-/// `e_type` as the facts spell it. An unrecognised type says so: `ET_1` read as a decoded
-/// name for a value nobody had named, and a classifier that compared it against `"ET_REL"`
-/// could never match.
+/// `e_type` as the facts spell it. An unrecognised type says so, with the number, rather
+/// than in a spelling that reads as a decoded name.
 fn type_name(e_type: u16) -> String {
     match e_type {
         ET_NONE => "ET_NONE".to_owned(),
@@ -1706,13 +1936,6 @@ fn type_name(e_type: u16) -> String {
 }
 
 /// The `machine` fact for `e_machine`: the family's short name, or unrecognised.
-///
-/// The names are the families', lowercase, with width and byte order left to
-/// `elf_class` and the file's own `EI_DATA`: `ppc64` covers a ppc64le object and `s390`
-/// an s390x one, since `EM_PPC64` and `EM_S390` are the values both carry. A value
-/// outside the list says so, with the number, the way `elf_type` does. Before this the
-/// fallback was `EM_<n>`, which read as a decoded name for a value nobody had named, and
-/// the ELF32 big-endian fixture recorded `PowerPC` as `EM_20`.
 fn machine_name(e_machine: u16) -> String {
     match e_machine {
         EM_386 => "i386".to_owned(),
@@ -1767,14 +1990,6 @@ pub const RELRO_PARTIAL: &str = "partial";
 pub const RELRO_NONE: &str = "none";
 
 /// Every value `ElfFacts::relro` carries on an object the loader can run, strongest first.
-///
-/// The fourth state in the report is `null`: `LinkKind` withholds every link fact on an
-/// object the loader cannot run, so `null` describes the object the way the three levels
-/// do.
-///
-/// `schema/chard-report.schema.json` declares this list beside `null` under
-/// `$defs/elf_facts`, and `tests/schema_conformance.rs` compares the two, so a level
-/// added here without the schema fails on every host.
 pub const RELRO_LEVELS: &[&str] = &[RELRO_FULL, RELRO_PARTIAL, RELRO_NONE];
 
 /// A link-classification fact as an `observed` string reads it: `true`, `false`, or
@@ -1788,13 +2003,7 @@ pub fn classification(fact: Option<bool>) -> &'static str {
 }
 
 /// Deserialize an `Option` field that must be present, as `null` or a value.
-///
-/// serde reads a missing `Option` field as `None`. For the link classification that would
-/// make a recording written before the field existed indistinguishable from one that
-/// measured "this object carries no classification", and the fixtures in `probe` and
-/// `measure` are deserialized precisely so that a missing field fails loudly. With
-/// `deserialize_with` and no `default`, it does.
-fn required<'de, D, T>(d: D) -> std::result::Result<Option<T>, D::Error>
+fn required<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -1803,11 +2012,6 @@ where
 }
 
 /// One GNU property type as seen across every property note in the object.
-///
-/// The linker's rule for a `*_FEATURE_1_AND` word is AND across its inputs, and the
-/// output carries the merged word in one note, so a second note of one type is a file no
-/// linker wrote. `ElfFacts::gnu_property_notes` says what the count means, and what it
-/// does and does not claim about a loader.
 struct Property {
     /// Under a feature-word type on this machine, the AND of every note's word, the
     /// linker's rule applied once more; under any other type, the first word seen.
@@ -1819,25 +2023,24 @@ struct Property {
 /// One symbol-table entry, reduced to what probes ask about.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolFact {
-    /// `false` means the symbol is `SHN_UNDEF` — a reference satisfied at load
-    /// time. A canary-protected binary *references* `__stack_chk_fail`; one that
-    /// statically links libssp *defines* it. Probes need to tell those apart.
+    /// `false` means the symbol is `SHN_UNDEF`, a reference satisfied at load time: a
+    /// canary-protected binary *references* `__stack_chk_fail`, and one that statically
+    /// links libssp *defines* it.
     pub defined: bool,
     /// Which tables it appeared in (`.symtab`, `.dynsym`); a stripped binary has
     /// only `.dynsym`, so an absent symbol there is weaker evidence.
     pub tables: Vec<String>,
-    /// The spellings that carried a version, as the table stored them:
+    /// The spellings that carried a version, as `.symtab` stored them:
     /// `__stack_chk_fail@GLIBC_2.4`, or `name@@VERSION` for a default version. The map
-    /// key is the name before the first `@`; this keeps what was cut. Empty for a symbol
-    /// every table stored bare.
+    /// key is such a name before its first `@` (`Spelling`); this keeps what was cut. Empty
+    /// for a symbol every table stored bare, and a `.dynsym` name, kept whole, adds none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versioned: Vec<String>,
 }
 
 /// Everything the `elf-static` channel extracts from one artifact. Serialized
 /// verbatim into the report's `facts` store as an `elf` entry keyed by the artifact's
-/// digest (`observation.evidence.elf` in the older shape), whose contract is
-/// `$defs/elf_facts` in
+/// digest, whose contract is `$defs/elf_facts` in
 /// `schema/chard-report.schema.json`: every field here is declared there, the fields
 /// with `skip_serializing_if` as optional and the rest as required, and
 /// `tests/schema_conformance.rs` holds the two together over the checked-in fixture
@@ -1850,13 +2053,10 @@ pub struct ElfFacts {
     /// this is what tells them apart, and with `elf_class` it is what the target witness
     /// holds the artifacts to (`toolchain::TargetArch::abi`) and what `env::runs_natively`
     /// holds to the kernel's own order. A live read always writes it (`Elf::facts` is the
-    /// one constructor); `None` only in a record without the field, which the
-    /// replay corpus holds (the `elf` blocks of `tests/fixtures/detectors.json` predate
-    /// it), read back by `#[serde(default)]` as `openbsd_nobtcfi` is. Such a record the
-    /// target witness leaves out of `toolchain.target.abi.artifacts`, counting it in the
-    /// `no-witness` evidence where no artifact of the family carried an order (beside
-    /// recorded ones it is left out silently), and the execution witness withholds on,
-    /// since an order it cannot read it cannot hold to the kernel's.
+    /// one constructor); `None` only in a record without the field, read back by
+    /// `#[serde(default)]`. The target witness leaves such a record out of
+    /// `toolchain.target.abi.artifacts`, and the execution witness withholds on it, since an
+    /// order it cannot read it cannot hold to the kernel's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elf_data: Option<ByteOrder>,
     pub elf_type: String,
@@ -1867,16 +2067,6 @@ pub struct ElfFacts {
     /// `ET_DYN` alone cannot distinguish a PIE from a shared library, so this is
     /// `ET_DYN` plus one of the linker-recorded `DF_1_PIE`, a `PT_INTERP`, or `DT_DEBUG`,
     /// the linker's mark of executable output that `LinkKind::StaticPie` explains.
-    ///
-    /// This and the eight fields after it are the link classification, derived from
-    /// `LinkKind` and carried only for an object the loader can run (`ET_EXEC`,
-    /// `ET_DYN`). For anything else they are `null` in the report, and a consumer reads
-    /// `None` as an artifact that cannot carry the observable: a relocatable object has
-    /// no loader to be position-independent for, and no segment for RELRO to cover. A
-    /// detector that reads one of these returns no reading on `None`, and `measure`
-    /// withholds the observation as `indeterminate`, or as `not-applicable` where
-    /// `report::artifact_limitation` finds the check's precondition on the artifact
-    /// failed.
     #[serde(deserialize_with = "required")]
     pub pie: Option<bool>,
     pub df_1_pie: bool,
@@ -1913,6 +2103,14 @@ pub struct ElfFacts {
     /// says why, and what is recorded where two disagree.
     #[serde(deserialize_with = "required")]
     pub gnu_stack_executable: Option<bool>,
+    /// A `PT_LOAD` or `PT_TLS` segment carrying both `PF_W` and `PF_X`: for a `PT_LOAD`, a
+    /// page the linked program maps writable and executable at once; a `PT_TLS` is the
+    /// template each thread's block is copied from, read because GNU ld warns on its flags
+    /// too (`segment-flags-are-the-mappings`). `None` where there is no
+    /// linked object to be a fact about (`elf::LinkKind`), as the classification-linked
+    /// fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rwx_segment: Option<bool>,
 
     pub df_1_noopen: bool,
     pub textrel: bool,
@@ -1937,57 +2135,20 @@ pub struct ElfFacts {
 
     /// Property *markings*. A marked binary is not necessarily an enforced one:
     /// IBT/SHSTK and BTI/PAC/GCS enforcement depends on CPU and kernel, and no check
-    /// reads enforcement from these words. The kernel-dependent checks,
-    /// `noexecstack-enforced` and `shadow-stack-enforced`, read what the kernel did when
-    /// the probe ran, and declare `needs_vm`; `DESIGN.md` (Containers vs VMs) says where
-    /// their readings belong to the distribution.
-    ///
-    /// Every property type found is listed, hex-formatted, whatever the machine. Only the
-    /// feature words below are *decoded* from them, and only on the machine that defines
-    /// the type: see `GNU_PROPERTY_AARCH64_FEATURE_1_AND` for what reading `0xc0000000`
-    /// without the machine published.
+    /// reads enforcement from these words. The kernel-dependent checks read what the kernel
+    /// did when the probe ran, and declare `needs_vm`.
     pub gnu_property_types: Vec<String>,
     /// How many `NT_GNU_PROPERTY_TYPE_0` notes carried each type in `gnu_property_types`.
-    ///
-    /// The linker merges its inputs' property notes into one note per output, and its
-    /// rule for a `*_FEATURE_1_AND` word is AND: one input without the bit clears it for
-    /// the whole object. So a linked object carries each type once, and a count of two
-    /// is a file no linker wrote; the count is what exposes it, and what lets a reader
-    /// tell "no property note" from "two notes". A feature word that arrived twice is
-    /// the AND of both, the linker's rule applied once more. Before this the second note
-    /// overwrote the first, so a `0` note behind an `IBT|SHSTK` note published CET off
-    /// and the reverse order published it on.
-    ///
-    /// What a loader makes of a second note is its own rule, and this reader does not
-    /// model it. As read in the source: glibc's `_dl_process_pt_gnu_property`
-    /// (`elf/dl-load.c`) handles the first `NT_GNU_PROPERTY_TYPE_0` it finds in
-    /// `PT_GNU_PROPERTY` and returns, and the kernel's `parse_elf_properties`
-    /// (`fs/binfmt_elf.c`) reads the one note that segment begins with. On such a file
-    /// the loader's word is the first note's, so an AND that clears a bit the first note
-    /// carries reads a marking off that the loader would honour. That is the direction
-    /// the count marks for a reader, on a file only a hand produces. The AND was measured
-    /// to read `cet-marked` `absent` on such a file, and the case is the assumption
-    /// `one-property-note-per-object` in `report::ASSUMPTIONS`; the loaders' rules were
-    /// read, not run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gnu_property_notes: BTreeMap<String, u32>,
     pub x86_ibt: bool,
     pub x86_shstk: bool,
     pub aarch64_bti: bool,
     pub aarch64_pac: bool,
-    /// The default is defensive rather than load-bearing. Every fixture in
-    /// `tests/fixtures/detectors.json` that carries an `elf` block records this field
-    /// explicitly, and it is always written by a live read, so neither a report nor a
-    /// mined fixture carries a defaulted value. `#[serde(default)]` covers only a fixture
-    /// without the field, and the tree contains none.
-    ///
-    /// That last sentence is the whole guarantee. It does not rest on every fixture being
-    /// captured on x86_64, where the aarch64 feature word cannot be present at all: the
-    /// corpus holds aarch64 recordings (they are what `gcs-marked` is tested against), and
-    /// on those a defaulted `false` would be an unmeasured claim that the binary lacks GCS.
-    /// What keeps that from happening is that the fixtures are mined
-    /// from reports written by a build that has this field, not that they come from a
-    /// machine where the answer is knowable in advance.
+    /// The default is defensive rather than load-bearing: a live read always writes this
+    /// field, so a report never carries a defaulted value. `#[serde(default)]` covers only a
+    /// record without the field; on an aarch64 record a defaulted `false` would be an
+    /// unmeasured claim that the binary lacks GCS.
     #[serde(default)]
     pub aarch64_gcs: bool,
     /// A `PT_OPENBSD_NOBTCFI` program header (`0x65a3dbe8`, as OpenBSD 7.9 installs it in
@@ -1996,25 +2157,6 @@ pub struct ElfFacts {
     /// arm64 and IBT on amd64. lld writes it under `-z nobtcfi`, OpenBSD's base linker and
     /// lld 22.1.8 on Linux alike, for any target. A raw fact, `false` on an object with no
     /// program headers.
-    ///
-    /// Not a marking, and the reverse of one: on OpenBSD enforcement does not wait for
-    /// the property note this struct decodes above, and this header is what turns it off,
-    /// per program rather than per mapping. `composite::cfi` reads it, and the measurement
-    /// behind that reading is recorded there. GNU ld 2.46.1 ignores `-z nobtcfi` with a
-    /// warning. lld 22.1.8 writes the header (clang 22.1.8 in a `fedora:44` container on
-    /// Fedora 44 x86_64, 2026-10-01): for `aarch64-unknown-openbsd`,
-    /// `x86_64-unknown-openbsd` and `aarch64-unknown-linux-gnu` linked `-nostdlib -static`,
-    /// and for x86_64 Linux programs linked through clang and gcc with `-fuse-ld=lld`; the
-    /// reader and readelf agreed on all six, and on the four links without it. So a Linux
-    /// artifact carries it wherever lld linked it with the flag.
-    ///
-    /// Absent from the serialization when `false`, as `gnu_property_notes` is when empty,
-    /// and `#[serde(default)]` to read it back. A recorded row without the field reads as
-    /// `false`, and no detector reads it, so a member written on every artifact would be one the
-    /// schema has to require and 3,501 recorded rows lack. The cost is that a report from
-    /// before the field and one whose artifact carries no header read alike, which
-    /// `run.harness_revision` tells apart; the one reader, `composite::cfi`, reads a live
-    /// parse, where `false` is a measured absence.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub openbsd_nobtcfi: bool,
 
@@ -2025,56 +2167,6 @@ pub struct ElfFacts {
     /// the question has no referent: no `PT_LOAD` carries `PF_X` (a relocatable object has
     /// no program headers at all), or no section header describes an allocated section, so
     /// nothing could be classified (a file whose section headers were removed).
-    ///
-    /// A section is code by its own `SHF_EXECINSTR` flag, never by its name. The detection
-    /// recipe's form was a segment's section list against a name allowlist of `.init`,
-    /// `.plt*`, `.text*` and `.fini`, and it named its own weakness: a code section the
-    /// list does not know (`.text.hot`, `.plt.bnd`, a linker thunk) reads as data, a false
-    /// `off`. The flag is the linker's own statement of which bytes are instructions, so a
-    /// new code section is classified as code without a list to keep current. Header
-    /// bytes are not sections and are not read, so the ELF header and the program header
-    /// table never count, as they never did in the recipe's form either.
-    ///
-    /// The page is the executable segment's own `p_align`, or 4096 bytes where that is smaller:
-    /// its file range is widened down and up to that alignment before the sections are
-    /// compared against it, because the loader maps whole pages and the linker lays out for
-    /// the largest page the target allows. The floor is there because no kernel for a
-    /// machine this reader names maps a page below 4096 bytes, so a segment declaring less
-    /// still has its neighbours' bytes mapped with it: `-Wl,-z,max-page-size=0x10` with
-    /// `-Wl,-z,separate-code` puts `.rodata`, `.dynsym` and `.eh_frame` at 0x4c0 beside a
-    /// code segment ending at 0x4b9, and read at its own 16-byte alignment that layout
-    /// was `on` (GNU ld 2.46.1 on Fedora 44 x86_64, 2026-10-02). A segment aligned above
-    /// the running kernel's page is read at its own alignment, which is the layout the
-    /// linker wrote rather than the pages one kernel maps; the assumption
-    /// `separate-code-reads-the-linked-layout` in `report::ASSUMPTIONS` carries that and
-    /// the exclusions below. Read by pages rather than by segment membership because lld and mold lay
-    /// out separate segments either way and differ only there: under
-    /// `-z noseparate-code` their executable segment holds `.text` alone, as it does under
-    /// `-z separate-code`, and its first and last pages share file bytes with the
-    /// read-only and writable segments beside it. A segment-membership reading reads `on`
-    /// for both arms there. Measured 2026-10-02 with gcc 16.2.1 and clang 22.1.8 in the
-    /// Fedora 44 x86_64 container carrying lld 22.1.8 and mold 2.40.4, by hand with readelf
-    /// and a reader of these rules: by membership both arms of both linkers put `.text`,
-    /// `.init`, `.fini` and `.plt` alone in the executable segment, and by pages
-    /// `-z separate-code` holds no data while `-z noseparate-code` holds `.rodata`,
-    /// `.eh_frame`, `.dynsym` and the rest of the image beside the code.
-    ///
-    /// `.note.gnu.build-id` is not counted. Fedora's GNU ld places the note before `.init`
-    /// in the executable segment on x86_64 ("as close to the ELF headers as possible", its
-    /// default linker script says, so that a core file carries it), under
-    /// `-z separate-code` as well. Counted, the flag's own positive arm reads data in the
-    /// code pages on Fedora 44 x86_64 (GNU ld 2.46.1, measured 2026-10-02), and the check
-    /// would be `probe-invalid` on the distribution's default linker. The recipe's
-    /// allowlist names the note for the same reason. On Fedora 44 aarch64 the same linker
-    /// keeps the note out of the code segment.
-    ///
-    /// Absent from the serialization when `None`, and `#[serde(default)]` to read it back,
-    /// for the reason `openbsd_nobtcfi` carries both: a recorded row without the field reads
-    /// as absent.
-    /// A defaulted `None` reads `indeterminate`, so a row mined before the field existed
-    /// cannot read as either verdict. A report's `facts` store states the `null`
-    /// (`report::serialize_stored_elf`), so a reader re-evaluating `separate-code` over
-    /// the store can tell an artifact with no referent from a store that lost the member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_in_code_pages: Option<Vec<String>>,
     /// The relocations a relocatable object asks the linker to apply to its code, each as
@@ -2084,168 +2176,52 @@ pub struct ElfFacts {
     /// `STV_DEFAULT` carries it as a third word (`R_386_PC32 __x86.get_pc_thunk.ax
     /// STV_HIDDEN`), since how the code reaches a symbol depends on it: under `-fPIC` a
     /// hidden global is reached directly, as under `-fPIE`, and `pic-object-relocs` reads a
-    /// direct type as `-fPIC` absent only against a default-visibility anchor (added
-    /// 2026-10-02; the replay corpus's rows mined before it carry two words throughout).
+    /// direct type as `-fPIC` absent only against a default-visibility anchor.
     /// Distinct entries, sorted. `None` for anything but an
     /// `ET_REL` with a section-header table: a linked object's static relocations were
     /// applied and dropped, and its dynamic ones are the loader's, not the compiler's.
-    ///
-    /// Code is a relocation section whose `sh_info` names a section with `SHF_EXECINSTR`,
-    /// by the flag rather than by name, as [`Self::data_in_code_pages`] reads it, so
-    /// `-ffunction-sections`' `.text.<name>` is code without a list. Relocations patching
-    /// data are left out: under `-g` the debug sections carry an absolute `R_X86_64_64`
-    /// against every global, and under gcc's `-fsanitize=address` the instrumented
-    /// globals' descriptors carry one in `.data.rel.local` (gcc 16.1.1, Fedora 44 x86_64,
-    /// measured 2026-10-02); neither says how the code reaches the global. A section
-    /// symbol, which a reference to a local or anchored object goes through, is listed by
-    /// its section in brackets, so no reading keyed on a symbol name matches it and an
-    /// `indeterminate` reading still shows where the reference went; an unnamed symbol of
-    /// any other type, and symbol index 0, name nothing and are left out. A type
-    /// `elf/reloc_names.rs` does not name is spelt `reloc-type-` and its number in hex,
-    /// so an unnamed type never reads as a named one.
-    ///
-    /// The fact `plt-bypassed` reads: a call to a function the object does not define is
-    /// relocated through the callee's GOT slot under `-fno-plt`, and as a direct call a PLT
-    /// entry serves without it. The same GOT types load external data's addresses, so its
-    /// predicate reads the probe callee's entries alone; the measurements are beside it in
-    /// `predicate::elf_static`.
-    ///
-    /// The fact `pic-object-relocs` reads: under `-fPIC` the compiler reaches a defined,
-    /// preemptible global through the GOT, and under `-fPIE` or without PIC directly. The
-    /// measurements are beside its predicate in `predicate::elf_static`.
-    ///
-    /// Absent from the serialization when `None`, and `#[serde(default)]` to read it back,
-    /// for the reason `data_in_code_pages` carries both; a report's `facts` store states
-    /// the `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_relocations: Option<Vec<String>>,
     /// What each function of a relocatable object refers to, attributed from the object's
     /// own relocations. Each defined `STT_FUNC` symbol, in symbol-table order, is an item
     /// `name:`, followed by an item `name:target` for every distinct named symbol that a
     /// relocation at an offset inside the function's range refers to, the targets sorted.
-    /// A `.symtab` name's version suffix is cut as [`Elf::symbols`] cuts it, and a
+    /// A `.symtab` name's version suffix is cut as `Elf::symbols` cuts it, and a
     /// relocation against an unnamed symbol (a section symbol) names nothing and is not
     /// listed.
-    ///
-    /// The range is `[st_value, st_value + st_size)` in the section `st_shndx` names, which
-    /// in an object is an offset into that section, and a relocation section's `sh_info`
-    /// names the section its offsets are into. So the attribution needs no
-    /// `-ffunction-sections`, which the recipe built with to read the function off the
-    /// section name; a build flag the measured arm and both controls would have had to
-    /// share is one more thing that could differ between them. A function in a section
-    /// numbered at or above `SHN_LORESERVE` cannot be placed and is not listed, so a
-    /// reading that needs it finds it missing rather than finding it with no references.
-    /// After the functions, an item `?:target` ([`UNATTRIBUTED_REFERENCE`]) for every
-    /// distinct named symbol a relocation in code refers to from outside every function's
-    /// range, sorted: the code clang's `-fbasic-block-sections=all` moves into a section
-    /// with no function symbol (see `Elf::attribute_relocations`).
-    ///
-    /// `ssp-level-emitted` reads it: a function whose range refers to the canary failure
-    /// handler or the guard got a canary, and a function the list does not hold is not
-    /// one without. `None` where the question has no referent: the object is not
-    /// relocatable (a link resolves the relocations and keeps none per function), has no
-    /// `SHT_SYMTAB`, or is a 64-bit MIPS object, whose `r_info` this reader does not
-    /// decode. A relocation section the reader could not finish, or one in an encoding it
-    /// does not decode (`SHT_CREL`, or any other type whose `SHF_INFO_LINK` names a
-    /// section holding functions), is recorded in
-    /// [`Self::truncations`] against [`ElfTable::Relocations`], and a symbol table it
-    /// could not read against [`ElfTable::Symbols`]; either withholds the reading.
-    ///
-    /// Absent from the serialization when `None`, `#[serde(default)]` to read it back, and
-    /// stated as `null` in a report's `facts` store, all for the reasons
-    /// [`Self::data_in_code_pages`] gives: a recorded row without the field reads as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_references: Option<Vec<String>>,
-    /// The symbol tables the file has, as [`Elf::symbols`] labels them: `.symtab` and
+    /// The symbol tables the file has, as `Elf::symbols` labels them: `.symtab` and
     /// `.dynsym` by name, or `SHT_SYMTAB` and `SHT_DYNSYM` where the section names could
     /// not be read. In header order.
-    ///
-    /// The fact `report::artifact_limitation` reads for the checks whose observable is a
-    /// symbol reference (`canary-emitted`, `ssp-covers-small-arrays`,
-    /// `cxx-assertions-symbol`): a linked object with no symbol table at all cannot carry
-    /// one, and a stripped static link is that object, since `-s` removes `.symtab` and a
-    /// static link has no `.dynsym`. The canary in such an artifact was emitted and is
-    /// unreachable, so the reading is `not-applicable` under
-    /// `artifact-cannot-carry-observable`; without this fact it read `off` over a
-    /// discriminating triple, since the controls are built unstripped. A file whose
-    /// section headers are gone has its symbol tables recorded as `unread` in
-    /// [`Self::truncations`] instead, which `measure::artifact_gating` consults first.
-    ///
-    /// `#[serde(default)]` for the reason `comment` carries it: a recorded row without
-    /// the field reads as empty, and no detector reads it. Absent from the report when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symbol_tables: Vec<String>,
     pub symbol_count: usize,
     pub watched_symbols: BTreeMap<String, SymbolFact>,
 
     /// Tables this parse could not read to their end, named.
-    ///
-    /// Every accessor on `Cursor` returns a `Result`. A caller that discarded it into a `break`
-    /// would return, for a table truncated at byte *k*, its first *k* entries as though that were
-    /// all of them. Each such failure lands on **absence**, and every detector reads absence as a
-    /// measured negative, so an unreadable symbol table would publish `canary: false`, and a
-    /// binary with no section-header table would publish `relro: partial` and `dt_relr: false`
-    /// while still carrying `DF_1_NOW`. Both are reproduced against such a reader:
-    /// `objcopy --strip-section-headers` flips six facts to the unprotected answer on a binary
-    /// that still runs, and zeroing `.dynsym`'s `sh_link`, a single four-byte edit, flips
-    /// `canary` and the eight `__*_chk` counts while `parse_failed` stays at zero.
-    ///
-    /// The module header promises *"a truncated or hostile file produces a typed error instead of a
-    /// panic"*. `Cursor` keeps that promise with its errors, and this field keeps it above
-    /// `Cursor`: a reader that could not finish says so, in the facts, so a consumer can
-    /// tell "measured
-    /// and absent" from "could not be read". A table read to its end but read differently from the
-    /// loader is not this half: those readings, the ones measured so far, are the register
-    /// entries `THREAT_MODEL.md`'s crafted-ELF row names.
-    ///
-    /// Typed, so the consumer can read it: each entry names its [`ElfTable`] and whether that
-    /// table's facts went [`TruncationKind::Unread`] or a disagreeing view was
-    /// [`TruncationKind::Ignored`]. `report::truncation_limitation` matches `table` against a
-    /// check's declared `reads` and withholds on `Unread` alone; [`Self::unread`] is the lookup.
-    /// A table that is absent from the file is never recorded here: an `ET_REL` has no
-    /// `.dynamic` and a stripped static link no symbol table, and a missing table is
-    /// `not-applicable`'s business. `report::artifact_limitation` decides it over the facts
-    /// that say which tables the file has, `has_dynamic` for `.dynamic` and
-    /// [`Self::symbol_tables`] for the symbol tables, through the precondition rows keyed
-    /// on the checks that read each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub truncations: Vec<Truncation>,
 
+    /// The run witnesses the file carries: the descriptor, in hex, of each note of
+    /// [`RUN_WITNESS_SECTION`], or of a `PT_NOTE` segment where the file shows no such
+    /// section, walked at [`RUN_WITNESS_ALIGN`], that is owned by
+    /// [`RUN_WITNESS_OWNER`], typed [`RUN_WITNESS_TYPE`] and [`RUN_WITNESS_BYTES`] long,
+    /// each distinct value once, in file order, at most [`RUN_WITNESSES_KEPT`] of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_witness: Vec<String>,
     /// Contents of `.chard.report`: the binary's own account of the macros in
     /// effect when it was compiled. Self-reported, hence cross-checked by the
     /// other channels.
     pub self_report: String,
-    /// Contents of `.GCC.command.line` (`-frecord-gcc-switches` /
-    /// clang's `-frecord-command-line`) — the literal driver command line when
-    /// the toolchain was asked to record it. gcc records the options `cc1`
-    /// received, driver- and spec-injected ones included; clang records its
-    /// driver's arguments, configuration-file options included. Neither records
-    /// a default compiled into the compiler, so it complements rather than
-    /// replaces the macro channel (measurements in the project's DWARF-producer study).
+    /// Contents of `.GCC.command.line` (`-frecord-gcc-switches`, clang's
+    /// `-frecord-command-line`): the driver command line when the toolchain was asked to
+    /// record it. gcc records the options `cc1` received, driver- and spec-injected ones
+    /// included; clang records its driver's arguments, configuration-file options included.
+    /// Neither records a default compiled into the compiler, so it complements rather than
+    /// replaces the macro channel.
     pub recorded_command_line: String,
     /// The distinct lines of `.comment`, in file order.
-    ///
-    /// Every producer that touched the object appends a line of its own: the compiler,
-    /// unless built with `-fno-ident` (`GCC: (GNU) 16.1.1 20260515 (Red Hat 16.1.1-2)`,
-    /// `clang version 22.1.8 (Fedora 22.1.8-4.fc44)`), lld (`Linker: LLD 22.1.8`) and mold
-    /// (`mold 2.40.4 (compatible with GNU ld)`). GNU ld and gold append nothing, so an
-    /// object either of them linked carries compiler lines only, and one built under
-    /// `-fno-ident` carries none at all. `toolchain::artifact_agreement` reads this field
-    /// to hold the banner-derived linker identity to the artifact; the grammar and the
-    /// measurements behind it are recorded there.
-    ///
-    /// Read through [`Elf::section_lines`] and never through `section_text`, whose empty
-    /// string means "absent" and "unreadable" alike. Here that conflation would let a
-    /// `.comment` the reader could not reach publish as an object no linker signed, which
-    /// is the wrong direction for a field whose job is to catch a wrong identity. A
-    /// `.comment` that could not be read, or could not be looked up because the file
-    /// carries no section-header table or no readable section names, leaves this empty
-    /// and names itself in `truncations`; [`ElfFacts::comment_truncation`] is how a
-    /// consumer tells the two apart.
-    ///
-    /// `#[serde(default)]` for the reason `aarch64_gcs` carries it: the fixtures in
-    /// `tests/fixtures/detectors.json` predate the field, and no detector reads it, so a
-    /// defaulted empty list decides no verdict.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comment: Vec<String>,
 
@@ -2256,11 +2232,6 @@ pub struct ElfFacts {
     /// found" from "not searched" by this list; a function that is defined and could not be
     /// read is in `truncations` under `code`. The mechanism and why a byte search over one
     /// known function is sound are in the `code` module's documentation.
-    ///
-    /// Omitted when empty, as `comment` is, so `chard elf`, the replay corpus and the
-    /// synthetic fixtures predating it serialize as they did; a report's `elf` store entries
-    /// state it, `[]` included, through `report::serialize_stored_elf`, since
-    /// `predicate::Published` reads an absent list as `Incomplete`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_scanned: Vec<String>,
     /// `<function>:<pattern>@<offset>` for each match `code_scanned` counts, the offset
@@ -2275,22 +2246,12 @@ pub struct ElfFacts {
     /// there" by this list; one that is defined and could not be read is in `truncations`
     /// under `function-entries`. The mechanism, and why the bytes at a function's address
     /// are its first instruction, are in the `entry` module's documentation.
-    ///
-    /// Omitted when empty, as `comment` is, so `chard elf`, the replay corpus and the
-    /// synthetic fixtures predating it serialize as they did; a report's `elf` store entries
-    /// state it, `[]` included, through `report::serialize_stored_elf`, since
-    /// `predicate::Published` reads an absent list as `Incomplete`. `cet-endbr-emitted`
-    /// reads it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub function_entries: Vec<String>,
 }
 
 impl ElfFacts {
     /// The first truncation that left one of `tables` unread, if any.
-    ///
-    /// `Ignored` entries never match: the loader's view was measured whole, and a gate
-    /// that withheld on them would turn the forged-section defence into a denial of
-    /// measurement.
     #[must_use]
     pub fn unread(&self, tables: &[ElfTable]) -> Option<&Truncation> {
         self.truncations
@@ -2300,10 +2261,6 @@ impl ElfFacts {
 
     /// The reader's sentence for a `.comment` that was present, or could not be looked
     /// up, and was not read: the `detail` of the [`ElfTable::Comment`] entry.
-    ///
-    /// Matched on the typed table, so the sentence `Elf::section_lines` writes is free to
-    /// change; `toolchain::artifact_agreement` reads this to leave the artifact out of the
-    /// linker count and to name it.
     #[must_use]
     pub fn comment_truncation(&self) -> Option<&str> {
         self.unread(&[ElfTable::Comment]).map(|t| t.detail.as_str())
@@ -2317,6 +2274,49 @@ const COMMENT_SECTION: &str = ".comment";
 /// reads it from. Spelled once here: `report::self_report_entries` says whether an artifact
 /// carries a readable one, and the gating rule `artifact-lacks-self-report` names it.
 pub const SELF_REPORT_SECTION: &str = ".chard.report";
+
+/// The note section the run's generated header (`compile::RunWitness::header`) writes the
+/// run's nonce into, and [`ElfFacts::run_witness`] reads it from. A `SHT_NOTE` section, so
+/// that a link under `--gc-sections` keeps it: measured on Fedora 44 x86_64 with gcc 16.2.1
+/// and clang 22.1.8 over GNU ld 2.46, `-O2 -ffunction-sections -fdata-sections
+/// -Wl,--gc-sections` linked a program whose `.note.chard.run` held the note, and so did
+/// the same link through mold 2.40.4 and through the distribution's lld (gcc 16.2.1).
+pub const RUN_WITNESS_SECTION: &str = ".note.chard.run";
+
+/// The owner of the run-witness note, as its name field spells it.
+pub const RUN_WITNESS_OWNER: &str = "chard";
+
+/// The type of the run-witness note. The owner namespaces it; `readelf -n` prints an
+/// unknown owner's type 1 as `NT_VERSION`.
+pub const RUN_WITNESS_TYPE: u32 = 1;
+
+/// The alignment the run-witness note is written with, which is the alignment its table is
+/// walked at, whatever alignment the section or segment that holds it declares. The
+/// generated header pads the note to four bytes (`.balign 4`). A linker is free to put it
+/// in a `PT_NOTE` segment of alignment 8 beside an 8-aligned property note, and walked at
+/// the segment's alignment the note's descriptor is read four bytes late, as a value no
+/// build wrote. Measured on Fedora 44 x86_64 with gcc 16.2.1 and mold 2.40.4, whose one
+/// note segment, of alignment 8, holds `.note.gnu.property` (aligned to 8),
+/// `.note.ABI-tag`, `.note.chard.run` and `.note.gnu.build-id` (each aligned to 4).
+pub const RUN_WITNESS_ALIGN: u64 = 4;
+
+/// The length of the run-witness note's descriptor: the nonce's 128 bits.
+pub const RUN_WITNESS_BYTES: usize = 16;
+
+/// The run-witness note, the one note [`Elf::parse_notes`] keeps for [`Elf::run_witness`].
+/// Its `n_namesz` is not held: the witness walk keeps every note that reads as a witness, so a
+/// look-alike with another name size is counted, and a foreign nonce in it refuses the file,
+/// where a stop would end the walk of a segment and leave a note after it unseen.
+const RUN_WITNESS_NOTE: NoteKind = NoteKind {
+    owner: RUN_WITNESS_OWNER,
+    ntype: RUN_WITNESS_TYPE,
+    name_size_held: false,
+};
+
+/// How many distinct run witnesses [`ElfFacts::run_witness`] keeps. An artifact of one run
+/// carries one, so a second is already the finding; the bound keeps a section of forged
+/// notes from growing the facts with the file.
+pub const RUN_WITNESSES_KEPT: usize = 4;
 
 pub struct Elf<'a> {
     cur: Cursor<'a>,
@@ -2336,14 +2336,47 @@ pub struct Elf<'a> {
     /// whose `shdr[0]` the file does not hold (`section-header table:`). Merged into
     /// `ElfFacts::truncations` by `structural_truncations`.
     header_truncations: Vec<Truncation>,
+    /// The work this file's reading may still spend, [`work_budget`] of its length.
+    budget: Budget,
+    /// The notes the latest [`Self::facts`] kept, for [`Self::notes_kept`]; `None` before one.
+    notes_kept: std::cell::Cell<Option<u64>>,
+}
+
+/// The header's identity and the two tables' entry counts. The file's bytes and the tables
+/// themselves are left out: a crafted file can make them as large as the file.
+impl std::fmt::Debug for Elf<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Elf")
+            .field("elf64", &self.elf64)
+            .field("little", &self.cur.little)
+            .field("e_type", &self.e_type)
+            .field("e_machine", &self.e_machine)
+            .field("phdr_count", &self.phdrs.len())
+            .field("shdr_count", &self.shdrs.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> Elf<'a> {
+    /// Errors when `data` is not an ELF file, declares a class or endianness we do
+    /// not recognize, or is truncated inside the header tables.
+    ///
     /// # Errors
     ///
     /// Errors when `data` is not an ELF file, declares a class or endianness we do
     /// not recognize, or is truncated inside the header tables.
     pub fn parse(data: &'a [u8]) -> Result<Self, ElfError> {
+        Self::parse_within(data, work_budget(data.len()))
+    }
+
+    /// [`Self::parse`] with a work budget of `units` in place of [`work_budget`]'s, for the
+    /// tests that hold a reading under every budget to the rule `Budget` states.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`].
+    pub fn parse_within(data: &'a [u8], units: u64) -> Result<Self, ElfError> {
+        let budget = Budget::new(units);
         let (elf64, little) = identify(data)?;
         let cur = Cursor { data, little };
 
@@ -2362,20 +2395,9 @@ impl<'a> Elf<'a> {
         let e_shstrndx = cur.u16_at(hdr_tail.saturating_add(8))?;
 
         // A table walk is `base + i * entsize`, so an `entsize` below the real record size
-        // makes the walk read overlapping records -- and at zero it makes every index name
-        // the *same* bytes. `e_shentsize = 0` with `e_shnum = 65535` aliased one
-        // `SHT_DYNAMIC` header onto 65535 logical sections, and `dynamic()` walked its
-        // region once per alias: a 16 KB input drove 4.79 `GiB` of resident memory, a 1.09 GB
-        // report and 5.0s of wall time. Nothing capped it -- `MAX_OBJECT_BYTES` bounds the
-        // *input*, and this PoC shows the derived iteration count is unrelated to input size.
-        //
-        // Refused rather than clamped. An entsize below the record size describes a table
-        // that cannot exist, and a file that declares one is malformed at the header, before
-        // any question of what it contains. `readelf -S` silently enumerates zero sections
-        // for it and `objdump -h` refuses the file outright; erroring is the nearer of the
-        // two and says why. Larger than the record size is legal -- the spec allows padding.
-        // The declared counts, before the escapes below can widen them: a stride of zero
-        // must be refused before `shdr[0]` is read through it.
+        // reads overlapping records, and at zero every index names the same bytes: one
+        // header can alias onto 65535 sections, a work count `MAX_OBJECT_BYTES` does not
+        // bound.
         let uses_shnum_escape = e_shnum == 0 && e_shoff != 0;
         let declared_shnum = if uses_shnum_escape {
             1
@@ -2388,18 +2410,8 @@ impl<'a> Elf<'a> {
             (declared_shnum, e_shentsize),
         )?;
 
-        // The gABI's three escapes, all through `shdr[0]`: the null header carries no
-        // section of its own, so its size, link and info fields are free to hold the counts
-        // and the index that the 16-bit header fields cannot. `readelf` resolves all three,
-        // and so does this reader. Taking `e_shnum == 0` as "no sections" and `e_shstrndx ==
-        // 0xffff` as an index past the table would lose, from a file using either escape,
-        // every fact that is reached by section name.
-        //
-        // All three need a table to escape into. With `e_shoff == 0` there is none, and a
-        // header that says `PN_XNUM` or `SHN_XINDEX` anyway is malformed: the values are
-        // left as declared, and the walks below fail on them. The ELF header is never
-        // read as `shdr[0]`. A nonzero `e_shoff` past the end of the file is
-        // `probe_shdr0`'s case.
+        // The gABI's three escapes, all through `shdr[0]`, whose size, link and info fields
+        // hold the counts and the index the 16-bit header fields cannot.
         let mut header_truncations = Vec::new();
         let escapes =
             e_shoff != 0 && (uses_shnum_escape || e_phnum == PN_XNUM || e_shstrndx == SHN_XINDEX);
@@ -2429,25 +2441,36 @@ impl<'a> Elf<'a> {
         // Again, over the counts the escapes produced.
         check_strides(elf64, (e_phnum, e_phentsize), (e_shnum, e_shentsize))?;
 
-        let phdrs = read_phdrs(&cur, elf64, e_phoff, e_phnum, e_phentsize)?;
+        let phdrs = read_phdrs(&cur, elf64, e_phoff, e_phnum)?;
+        let (_, sh_record) = header_records(elf64);
+        let walked = match section_table_at_no_offset(e_shoff, e_shnum)
+            .or_else(|| section_table_withheld(e_shnum, e_shentsize, sh_record))
+        {
+            Some(withheld) => {
+                header_truncations.push(withheld);
+                0
+            }
+            None => e_shnum,
+        };
         let mut shdrs = Vec::new();
-        for i in 0..e_shnum {
+        for i in 0..walked {
             let base = e_shoff
                 .checked_add(
-                    i.checked_mul(e_shentsize)
+                    i.checked_mul(sh_record.get())
                         .ok_or_else(|| ElfError::malformed("shdr index overflow"))?,
                 )
                 .ok_or_else(|| ElfError::malformed("shdr offset overflow"))?;
             shdrs.push(read_shdr(&cur, elf64, base)?);
         }
 
-        let shnames = section_names(&cur, &shdrs, shstrndx, &mut header_truncations);
+        let shnames = section_names(&cur, &budget, &shdrs, shstrndx, &mut header_truncations);
         let mut seen = BTreeSet::new();
         let shared_names = shnames
             .iter()
             .filter(|n| !n.is_empty() && !seen.insert(n.as_str()))
             .cloned()
             .collect();
+        budget.mark_parsed();
 
         Ok(Self {
             cur,
@@ -2459,7 +2482,62 @@ impl<'a> Elf<'a> {
             shnames,
             shared_names,
             header_truncations,
+            budget,
+            notes_kept: std::cell::Cell::new(None),
         })
+    }
+
+    /// The units of work spent so far, by the parse and the latest [`Self::facts`], of the
+    /// budget the file was given.
+    #[must_use]
+    pub fn work_spent(&self) -> u64 {
+        self.budget.spent()
+    }
+
+    /// The GNU property notes the latest [`Self::facts`] kept, each once by its descriptor's
+    /// offset (`Self::notes`), however many headers name the bytes they lie in, so fewer than
+    /// the file has bytes; `None` before a reading.
+    #[must_use]
+    pub fn notes_kept(&self) -> Option<u64> {
+        self.notes_kept.get()
+    }
+
+    /// The name at `off` in the string table of `table_len` bytes at `base`, charged to the
+    /// file's budget; [`Cursor::cstr_at`] says how it is bounded.
+    fn name_at(&self, base: u64, off: u32, table_len: u64) -> Result<String, NameFault> {
+        name_in(&self.cur, &self.budget, (base, off, table_len))
+    }
+
+    /// One unit of the file's budget, for one entry of a walk.
+    fn step(&self) -> Result<(), Spent> {
+        self.budget.spend(1)
+    }
+
+    /// [`Self::step`], recording `table` `unread` at the place `at` names where the budget is
+    /// spent; `true` then, and the walk stops.
+    fn out_of_budget(
+        &self,
+        table: ElfTable,
+        trunc: &mut Vec<Truncation>,
+        at: impl FnOnce() -> String,
+    ) -> bool {
+        self.out_of_budget_for(1, table, trunc, at)
+    }
+
+    /// [`Self::out_of_budget`] for `units` at once, the bytes of a copy the facts keep.
+    fn out_of_budget_for(
+        &self,
+        units: usize,
+        table: ElfTable,
+        trunc: &mut Vec<Truncation>,
+        at: impl FnOnce() -> String,
+    ) -> bool {
+        let units = u64::try_from(units).unwrap_or(u64::MAX);
+        let Err(spent) = self.budget.spend(units) else {
+            return false;
+        };
+        trunc.push(Truncation::unread(table, format!("{}: {spent}", at())));
+        true
     }
 
     fn section_bytes(&self, sh: &Shdr) -> Result<&'a [u8], ElfError> {
@@ -2472,12 +2550,6 @@ impl<'a> Elf<'a> {
     }
 
     /// Translate a virtual address to a file offset, through the `PT_LOAD` that contains it.
-    ///
-    /// `.dynamic` holds *addresses* (`DT_STRTAB` points at where the string table will be
-    /// mapped, not at where it sits in the file), so this is how every table the dynamic section
-    /// names is reached: `dyn_strtab` prefers it to `.dynstr`'s section header, and with section
-    /// headers gone it is the only route. It bounds on `p_memsz`, not `p_filesz`, which is the
-    /// assumption `address-reached-tables-lie-in-the-file-image` in `report::ASSUMPTIONS`.
     fn offset_of_vaddr(&self, vaddr: u64) -> Option<u64> {
         self.phdrs
             .iter()
@@ -2486,10 +2558,9 @@ impl<'a> Elf<'a> {
             .map(|p| p.p_offset.saturating_add(vaddr.saturating_sub(p.p_vaddr)))
     }
 
-    /// Bytes from `vaddr` to the end of the containing `PT_LOAD` segment's file image —
-    /// a defensive bound for a table reached by address when the table's own size tag
-    /// (e.g. `DT_STRSZ`) is absent, so a scan still has a declared limit narrower than
-    /// the whole file rather than none at all.
+    /// Bytes from `vaddr` to the end of the containing `PT_LOAD` segment's file image: the
+    /// bound for a table reached by address whose own size tag (`DT_STRSZ`) is absent,
+    /// narrower than the whole file.
     fn segment_remaining_at(&self, vaddr: u64) -> Option<u64> {
         self.phdrs
             .iter()
@@ -2517,12 +2588,6 @@ impl<'a> Elf<'a> {
     /// The text of section `name`, NULs as newlines, trimmed. Empty when the section is
     /// absent, and when its name table could not be read, which `parse` has already
     /// recorded as a `SectionNames` entry.
-    ///
-    /// A section that is listed and cannot be read pushes an `Unread` [`ElfTable::SectionNames`]
-    /// truncation naming it and returns empty. `.chard.report` is the self-report the
-    /// runtime fortify checks read through `Evidence::fortify_impl`, and those checks declare
-    /// `SectionNames`: returned empty with no record, a cut section read as a probe that
-    /// reported nothing, and the check withheld with no table named.
     fn section_text(&self, name: &str, truncations: &mut Vec<Truncation>) -> String {
         let Some(sh) = self.section_by_name(name) else {
             return String::new();
@@ -2533,8 +2598,7 @@ impl<'a> Elf<'a> {
                 truncations.push(Truncation::unread(
                     ElfTable::SectionNames,
                     format!(
-                        "{name}: {:#x}+{:#x} could not be read ({why:#}), so the section's \
-                         text was not read and the field is empty for want of a reading",
+                        "{name}: {:#x}+{:#x} could not be read ({why:#})",
                         sh.sh_offset, sh.sh_size
                     ),
                 ));
@@ -2549,16 +2613,6 @@ impl<'a> Elf<'a> {
 
     /// The NUL-separated strings of section `name`: trimmed, non-empty, first occurrence
     /// kept, file order preserved. Empty when the section is absent.
-    ///
-    /// A section that is present and cannot be read pushes a [`ElfTable::Comment`]
-    /// truncation and returns empty, which is the one difference from `section_text`. There
-    /// absence and failure read the same, and a consumer of `.comment` needs them apart:
-    /// "no linker signed this object" is a finding only when the section was read to its
-    /// end. So does a section that could not be looked up at all: a file with no
-    /// section-header table, or one whose section names could not be read, has not
-    /// established that the section is absent, and the `structural_truncations` entry
-    /// that records the file's shape is not one a consumer of this field reads.
-    /// `ElfFacts::comment_truncation` reads the entry back by its table.
     fn section_lines(&self, name: &str, truncations: &mut Vec<Truncation>) -> Vec<String> {
         let unlisted = if self.shdrs.is_empty() {
             Some("no section-header table")
@@ -2570,10 +2624,7 @@ impl<'a> Elf<'a> {
         if let Some(why) = unlisted {
             truncations.push(Truncation::unread(
                 ElfTable::Comment,
-                format!(
-                    "{name}: could not be looked up ({why}), so the section's lines were not \
-                     read and the field is empty for want of a reading"
-                ),
+                format!("{name}: could not be looked up ({why})"),
             ));
             return Vec::new();
         }
@@ -2586,107 +2637,79 @@ impl<'a> Elf<'a> {
                 truncations.push(Truncation::unread(
                     ElfTable::Comment,
                     format!(
-                        "{name}: {:#x}+{:#x} could not be read ({why:#}), so the section's \
-                         lines were not read and the field is empty for want of a reading",
+                        "{name}: {:#x}+{:#x} could not be read ({why:#})",
                         sh.sh_offset, sh.sh_size
                     ),
                 ));
                 return Vec::new();
             }
         };
+        // A repeat is found in a set, not by a scan of the lines kept, which is quadratic
+        // in the lines: a section of `N` one-byte lines would scan `N x N / 2`.
+        let text = String::from_utf8_lossy(bytes);
+        let mut seen = BTreeSet::new();
         let mut lines: Vec<String> = Vec::new();
-        for raw in String::from_utf8_lossy(bytes).split('\0') {
+        for raw in text.split('\0') {
             let line = raw.trim();
-            if !line.is_empty() && !lines.iter().any(|seen| seen == line) {
+            if !line.is_empty() && seen.insert(line) {
                 lines.push(line.to_owned());
             }
         }
         lines
     }
 
+    /// Whether this file's dynamic section, if it has one, was out of reach: no `PT_DYNAMIC`,
+    /// which leaves [`Self::dynamic`] the `SHT_DYNAMIC` sections, and either no program headers
+    /// or a section-header table the file declares and `parse` did not read (its
+    /// `section-headers` cause is recorded). A stripped program with program headers and no
+    /// `PT_DYNAMIC` has no dynamic section the loader reads, so its reading stands.
+    fn dynamic_unreached(&self) -> bool {
+        let segment = self.phdrs.iter().any(|p| p.p_type == PT_DYNAMIC);
+        let declared_unread = self
+            .header_truncations
+            .iter()
+            .any(|t| t.table == ElfTable::SectionHeaders);
+        self.shdrs.is_empty() && !segment && (self.phdrs.is_empty() || declared_unread)
+    }
+
     /// Truncations that are properties of the file's shape rather than of a read that failed.
-    ///
-    /// One case, and it is the expensive one: **no section-header table**. Reproduced with
-    /// `objcopy --strip-section-headers` on `/usr/bin/ls`, which still runs: six facts flipped to
-    /// the unprotected answer, because `.dynamic` and the symbol tables were reached only through
-    /// section headers while notes already fell back to `PT_NOTE`.
-    ///
-    /// Four of the six are now recovered — `dynamic` walks the `PT_DYNAMIC` segment and `dyn_strings`
-    /// resolves `DT_STRTAB` through the containing `PT_LOAD` — so RELRO, `BIND_NOW`, `DT_RELR`,
-    /// `DF_1_NOOPEN`, `TEXTREL` and the `needed`/`rpath`/`runpath` lists survive the strip. The
-    /// symbol tables do not: reaching them without section headers means walking `DT_SYMTAB` and
-    /// deriving a count from `DT_HASH` or `DT_GNU_HASH`, which is a larger piece of work.
-    ///
-    /// So the note names what is *still* lost rather than what was lost before the fallback existed.
-    /// A truncation message that overstates is the same defect as a verdict that overstates.
-    ///
-    /// The second case is a section-header table whose names cannot be read, recorded by
-    /// `parse` under the `section names:` prefix. It is distinct from the first: the tables
-    /// are all there and are still walked by type, so `.dynamic` and both symbol tables are
-    /// read, but nothing reached by name is, and `sections` is empty because the file
-    /// named nothing; the truncation is what says the sections exist.
-    ///
-    /// The first case records two entries, `symbols` for the tables walked by type and
-    /// `section-names` for everything reached by name, `.chard.report` among it: the
-    /// runtime fortify checks read that self-report and declare `section-names`, so a
-    /// stripped object withholds them with the cause named.
-    ///
-    /// The third is the first reached by a stale header, recorded by `parse` under the
-    /// `section-header table:` prefix as a `section-headers` entry and carried beside the
-    /// first case's two: a count escape whose `shdr[0]` lies past the end of the file
-    /// leaves the reader with no table, and the note says why there is none.
     fn structural_truncations(&self) -> Vec<Truncation> {
         let mut out = Vec::new();
         if self.shdrs.is_empty() {
-            out.push(Truncation::unread(
-                ElfTable::Symbols,
-                "no section-header table: the symbol tables are unreachable, so the stack canary \
-                 and the fortify symbol counts are absent here because they could not be read, \
-                 not because they are not present. The dynamic segment was read instead, so RELRO, \
-                 BIND_NOW, DT_RELR and the library lists are measured"
-                    .to_owned(),
-            ));
+            let dynamic_unreached = self.dynamic_unreached();
+            let mut symbols =
+                "no section-header table: the symbol tables are unreachable.".to_owned();
+            if !dynamic_unreached {
+                symbols.push_str(" The dynamic segment was read instead");
+            }
+            out.push(Truncation::unread(ElfTable::Symbols, symbols));
             out.push(Truncation::unread(
                 ElfTable::SectionNames,
-                "no section-header table: nothing reached by section name was read, so the \
-                 .chard.report self-report and .GCC.command.line are empty because they could \
-                 not be looked up, not because the object lacks them"
-                    .to_owned(),
+                "no section-header table: nothing reached by section name was read".to_owned(),
             ));
+            if self.notes_from_sections() {
+                out.push(Truncation::unread(
+                    ElfTable::Notes,
+                    "no section-header table, in a relocatable object or a file with no program headers"
+                        .to_owned(),
+                ));
+            }
+            if dynamic_unreached {
+                out.push(Truncation::unread(
+                    ElfTable::Dynamic,
+                    "no section-header table read and no PT_DYNAMIC segment".to_owned(),
+                ));
+            }
         }
         out.extend(self.header_truncations.iter().cloned());
         out
     }
 
     /// `(tag, value)` pairs from `.dynamic`. Empty for a static non-PIE binary.
-    ///
-    /// `trunc` collects the name of any table that could not be read to its end, so an empty
-    /// result can be told apart from an unreadable one.
     fn dynamic(&self, trunc: &mut Vec<Truncation>) -> Vec<(i64, u64)> {
         let mut out = Vec::new();
-        // `(offset, size)` of every `.dynamic` to walk. Sections when they exist; otherwise the
-        // `PT_DYNAMIC` segment, which is the same bytes reached the way the loader reaches them.
-        //
-        // Without this a binary stripped of its section headers reported `bind_now: false` and so
-        // `relro: partial`, plus `dt_relr: false`, `df_1_noopen: false` and `textrel: false` — all
-        // in the unprotected direction, on a file that still runs and whose `PT_DYNAMIC` segment
-        // still carries `DF_1_NOW`. `objcopy --strip-section-headers` (binutils >= 2.42) and
-        // `sstrip` both produce it, and it is common in container images.
-        // **The segment wins, and the ordering is the whole point.** `ld.so` reads `PT_DYNAMIC`
-        // and never reads section headers at all -- they are optional metadata that `strip
-        // --strip-all` removes without changing what the file does. Preferring the section view
-        // therefore let a crafted file be measured through bytes the loader never consults: a
-        // 4.4 KB `ET_DYN` whose `PT_DYNAMIC` sets no flags, plus an `SHT_DYNAMIC` section header
-        // aimed at a second, forged table, read as `pie: true`, `df_1_pie: true`,
-        // `bind_now: true`, while `readelf -d` reported `FLAGS_1: None` from the real segment and
-        // flagged the file as anomalous. That is a false `on` on an attacker-supplied binary,
-        // which is the one verdict THREAT_MODEL.md says this project exists to prevent.
-        //
-        // Nothing is lost by the flip. The stripped-section-header case this fallback was written
-        // for -- `objcopy --strip-section-headers`, `sstrip`, common in container images, where
-        // `bind_now: false` and `relro: partial` were reported for a file whose `PT_DYNAMIC`
-        // still carried `DF_1_NOW` -- has no section headers at all, so it is served by the
-        // fallback either way round.
+        // `(offset, size)` of every `.dynamic` to walk: the `PT_DYNAMIC` segment, and the
+        // `SHT_DYNAMIC` sections only in a file with none.
         let segments: Vec<(u64, u64)> = self
             .phdrs
             .iter()
@@ -2700,42 +2723,37 @@ impl<'a> Elf<'a> {
             .map(|s| (s.sh_offset, s.sh_size))
             .collect();
         let regions: Vec<(u64, u64)> = if segments.is_empty() {
-            // No loader reads an object with no `PT_DYNAMIC`, so there is no loader rule to
-            // follow and the one the segments follow is borrowed: one table is read, the
-            // last, and the others are a disagreement this file does not settle. Concatenated,
-            // the earlier sections answered for a table the later one displaced.
+            // No loader reads an object with no `PT_DYNAMIC`, so the segments' rule is
+            // borrowed: the last table is read, and the others are a disagreement this file
+            // does not settle.
             if sections.len() > 1 {
                 trunc.push(Truncation::unread(
                     ElfTable::Dynamic,
                     format!(
-                        "{} SHT_DYNAMIC sections and no PT_DYNAMIC segment; the last is the \
-                         one measured, as for a repeated PT_DYNAMIC, and no loader reads \
-                         this object to say which it would take",
+                        "{} SHT_DYNAMIC sections and no PT_DYNAMIC segment",
                         sections.len()
                     ),
                 ));
             }
             sections.iter().copied().next_back().into_iter().collect()
         } else {
-            // A section view that the loader would not reach is *dropped*, and a drop this file
-            // stays silent about reads as agreement. Containment rather than equality, because an
-            // ordinary `.dynamic` section sits inside its `PT_DYNAMIC` segment and the two
-            // legitimately differ in size.
+            // A section view the loader would not reach is dropped and recorded, since a
+            // silent drop reads as agreement.
+            let held = Spans::new(
+                segments
+                    .iter()
+                    .map(|&(p_off, p_size)| (p_off, p_off.saturating_add(p_size)))
+                    .collect(),
+            );
             for (off, size) in &sections {
                 let end = off.saturating_add(*size);
-                let contained = segments
-                    .iter()
-                    .any(|(p_off, p_size)| off >= p_off && end <= p_off.saturating_add(*p_size));
+                let contained = held.contains(*off, end);
                 if !contained {
-                    // `Ignored`: the facts are whole, read from the segment. Recording it
-                    // as unread would let the forged view withhold the measurement it was
-                    // dropped in order to protect.
+                    // `Ignored`: the facts are whole, read from the segment.
                     trunc.push(Truncation::ignored(
                         ElfTable::Dynamic,
                         format!(
-                            "SHT_DYNAMIC section at {off:#x}+{size:#x} lies outside every \
-                             PT_DYNAMIC segment and was not read; the loader reads the segment, \
-                             so the segment is what was measured"
+                            "SHT_DYNAMIC section at {off:#x}+{size:#x} lies outside every PT_DYNAMIC segment and was not read"
                         ),
                     ));
                 }
@@ -2743,18 +2761,12 @@ impl<'a> Elf<'a> {
             // **The last `PT_DYNAMIC` is the one the loader reads.** Measured 2026-10-09 on
             // Fedora 44 x86_64 (glibc 2.43 `ld.so`, musl `ld-musl-x86_64.so.1`): a PIE patched
             // to carry two `PT_DYNAMIC` headers ran the `DT_INIT` of the later table under
-            // both, in both header orders. The loaders do not concatenate, so neither does
-            // this: concatenating let the earlier table's entries answer for a table the
-            // loader never reads. No source for either loader was on the host; the rule is
-            // the experiment's, and it was not run under a BSD or bionic loader, so the
-            // disagreement is recorded `unread`, not resolved silently.
+            // both, in both header orders.
             if segments.len() > 1 {
                 trunc.push(Truncation::unread(
                     ElfTable::Dynamic,
                     format!(
-                        "{} PT_DYNAMIC segments; glibc and musl read the last and \
-                         that is the one measured, and a loader not run for this \
-                         was not established to agree",
+                        "{} PT_DYNAMIC segments; glibc and musl read the last and that is the one measured",
                         segments.len()
                     ),
                 ));
@@ -2769,14 +2781,6 @@ impl<'a> Elf<'a> {
     }
 
     /// The entries of one `.dynamic` region, up to `DT_NULL`.
-    ///
-    /// `DT_NULL` is the loader's terminator: `ld.so` walks `l_ld` from `p_vaddr` to the
-    /// first `DT_NULL` and consults neither `p_filesz` nor `sh_size`. So a region whose
-    /// declared size ends before `DT_NULL` is a table the reader did not finish, and is
-    /// recorded as one. Before this a `PT_DYNAMIC` whose `p_filesz` ended before
-    /// `DT_FLAGS_1` read `bind_now: false`, `relro` decided `partial` on a file whose
-    /// loader binds now, and the only record was an `ignored` entry for the section view
-    /// the segment had displaced, which the gate never reads.
     fn walk_dynamic(
         &self,
         sh_offset: u64,
@@ -2787,6 +2791,13 @@ impl<'a> Elf<'a> {
         let step: u64 = if self.elf64 { 16 } else { 8 };
         let count = sh_size.checked_div(step).unwrap_or(0);
         for i in 0..count {
+            if let Err(spent) = self.step() {
+                trunc.push(Truncation::unread(
+                    ElfTable::Dynamic,
+                    format!(".dynamic not read past entry {i} of {count}: {spent}"),
+                ));
+                return;
+            }
             let base = sh_offset.saturating_add(i.saturating_mul(step));
             let tag = if self.elf64 {
                 self.cur
@@ -2813,40 +2824,19 @@ impl<'a> Elf<'a> {
         trunc.push(Truncation::unread(
             ElfTable::Dynamic,
             format!(
-                ".dynamic at {sh_offset:#x}+{sh_size:#x} reached the end of the declared table \
-                 at entry {count} of {count} without DT_NULL, so the loader's table, which ends \
-                 at DT_NULL, was not read whole"
+                ".dynamic at {sh_offset:#x}+{sh_size:#x} reached the end of the declared table at entry {count} of {count} without DT_NULL"
             ),
         ));
     }
 
     /// Where the dynamic string table is, as `(offset, length)`, or `None` where the file
     /// has none to read.
-    ///
-    /// Computed once and handed to every [`Self::dyn_strings`] call, so the one note it can
-    /// record lands once. It was pushed from inside `dyn_strings`, which `facts` calls
-    /// three times, so the same sentence landed three times in `truncations`.
-    ///
-    /// `DT_STRTAB` first, translated through the containing `PT_LOAD`; `.dynstr` by name only
-    /// when the dynamic table named no string table at all.
     fn dyn_strtab(
         &self,
         dyn_entries: &[(i64, u64)],
         trunc: &mut Vec<Truncation>,
     ) -> Option<(u64, u64)> {
-        // The order is the one `dynamic` takes, in its sibling. Preferring the section would
-        // let a crafted file point `.dynstr` at zeroed bytes while the real `DT_STRTAB` names
-        // `libm.so.6`: `needed` would read `[""]`, and `as-needed`, whose detector asks
-        // whether any entry starts with `libm.`, would conclude the linker had dropped the
-        // unused library and report `on`. A false `on` from a forged section, on the one
-        // input THREAT_MODEL.md treats as attacker-supplied. `readelf -d` takes the section's
-        // reading, because it reads sections too; the loader does not.
-        //
-        // The fallback stays for a reason: without it `needed`, `rpath` and `runpath` would
-        // all be empty for a section-header-stripped binary, and an empty `rpath` reads as
-        // "no baked-in search path", a pass awarded for having read nothing.
-        // The last entry of each tag, as `ld.so` stores it (`LOADER_SINGLE_TAGS`): the
-        // repeat is recorded as the last read, so the last is what is read.
+        // The order is the one `dynamic` takes.
         let strtab_vaddr = dyn_entries
             .iter()
             .rfind(|(t, _)| *t == DT_STRTAB)
@@ -2854,16 +2844,8 @@ impl<'a> Elf<'a> {
         let from_segment = strtab_vaddr.and_then(|v| self.offset_of_vaddr(v));
         let located = match from_segment {
             Some(off) => {
-                // `DT_STRSZ` is the table's own declared length. A file carrying
-                // `DT_STRTAB` without it is missing a tag the loader also needs, so the
-                // containing segment's remaining bytes is the bound in that case, not
-                // the whole file: the same discipline `cstr_at` requires of every
-                // caller. Both come back `None` only when `DT_STRTAB` resolves to a
-                // vaddr `offset_of_vaddr` just placed inside a `PT_LOAD` segment and
-                // `segment_remaining_at` then cannot find that same segment — not
-                // reachable given the two share one containment check, but the table is
-                // dropped with a reason recorded rather than read as empty, on the
-                // chance that stops being true.
+                // `DT_STRSZ` is the table's declared length; without it the containing
+                // segment's remaining bytes bound the table, not the whole file.
                 let len = dyn_entries
                     .iter()
                     .rfind(|(t, _)| *t == DT_STRSZ)
@@ -2875,8 +2857,7 @@ impl<'a> Elf<'a> {
                     trunc.push(Truncation::unread(
                         ElfTable::DynStr,
                         format!(
-                            "DT_STRTAB at {off:#x} has neither DT_STRSZ nor a containing \
-                             PT_LOAD segment to bound it, so its strings were not read"
+                            "DT_STRTAB at {off:#x} has neither DT_STRSZ nor a containing PT_LOAD segment to bound it"
                         ),
                     ));
                     None
@@ -2884,17 +2865,14 @@ impl<'a> Elf<'a> {
             }
             None => self.dyn_strtab_by_name(dyn_entries, strtab_vaddr, trunc),
         };
-        // Held whole before a string is read from it. `cstr_at` answers "" for an offset
-        // past the end of the file, so a `PT_LOAD` whose `p_offset` lay past the end read
-        // `needed` as `[""]` and recorded nothing: `as-needed` found no `libm.` in a list
-        // of one empty name and published `on`.
+        // Held whole before a string is read from it: `cstr_at` answers "" for an offset
+        // past the end of the file, and `needed` read as `[""]` would publish `as-needed` `on`.
         let (off, len) = located?;
         if let Err(why) = self.cur.slice(off, len) {
             trunc.push(Truncation::unread(
                 ElfTable::DynStr,
                 format!(
-                    "the dynamic string table at {off:#x}+{len:#x} lies past the end of the \
-                     file ({why}), so no DT_NEEDED, DT_RPATH or DT_RUNPATH string was read"
+                    "the dynamic string table at {off:#x}+{len:#x} lies past the end of the file ({why})"
                 ),
             ));
             return None;
@@ -2905,16 +2883,6 @@ impl<'a> Elf<'a> {
     /// `.dynstr` by name, for a dynamic table whose `DT_STRTAB` lies in no `PT_LOAD` or
     /// that carries no `DT_STRTAB` at all, or `None` beside a `dynstr` record where the
     /// section cannot be found and an entry names a string through it.
-    ///
-    /// The `None` was silent: a `DT_STRTAB` at an address no segment maps, in a file
-    /// whose section names were stripped or could not be read, left `needed`, `rpath` and
-    /// `runpath` empty with nothing recorded, so `as-needed` decided `on` and
-    /// `rpath-absent` `off` over a string table the reader never located. Recorded when
-    /// `DT_STRTAB` is present and unmapped whatever the entries, since the loader needs
-    /// that table for every symbol it binds, and when it is absent only beside an entry
-    /// that names a string, since a dynamic table with nothing to read through it lacks
-    /// nothing. This is the one site for a `None` table: [`Self::dyn_strings`] relies on
-    /// it and records nothing of its own for a table it was not handed.
     fn dyn_strtab_by_name(
         &self,
         dyn_entries: &[(i64, u64)],
@@ -2931,15 +2899,11 @@ impl<'a> Elf<'a> {
             .collect();
         let detail = match strtab_vaddr {
             Some(vaddr) => format!(
-                "DT_STRTAB at vaddr {vaddr:#x} lies in no PT_LOAD segment and no .dynstr \
-                 section could be found by name, so no DT_NEEDED, DT_RPATH or DT_RUNPATH \
-                 string was read"
+                "DT_STRTAB at vaddr {vaddr:#x} lies in no PT_LOAD segment and no .dynstr section could be found by name"
             ),
-            None if !named.is_empty() => format!(
-                ".dynamic carries {} but no DT_STRTAB, and no .dynstr section could be found \
-                 by name, so no string it names was read",
-                named.join(", ")
-            ),
+            None if !named.is_empty() => {
+                format!(".dynamic carries {} but no DT_STRTAB", named.join(", "))
+            }
             None => return None,
         };
         trunc.push(Truncation::unread(ElfTable::DynStr, detail));
@@ -2947,14 +2911,6 @@ impl<'a> Elf<'a> {
     }
 
     /// The strings every `tag` entry names in the table [`Self::dyn_strtab`] located.
-    ///
-    /// An entry whose offset lies at or past the table's declared end names no string the
-    /// table holds: it is recorded under `dynstr` and left out of the list. `cstr_at`
-    /// answers "" for that offset, and a `DT_STRSZ` of 1 read `needed` as `[""]` with
-    /// nothing recorded, which `as-needed` published as `on` and `rpath-absent` as a
-    /// present search path. A `None` table beside an entry to read through it was
-    /// recorded by [`Self::dyn_strtab_by_name`], once, so nothing is recorded here for
-    /// the three tags it would have been recorded under.
     fn dyn_strings(
         &self,
         dyn_entries: &[(i64, u64)],
@@ -2978,13 +2934,26 @@ impl<'a> Elf<'a> {
         for (_, value) in wanted {
             match u32::try_from(*value) {
                 Ok(off) if u64::from(off) < strtab_len => {
-                    out.push(self.cur.cstr_at(strtab_off, off, strtab_len));
+                    match self.name_at(strtab_off, off, strtab_len) {
+                        Ok(name) => out.push(name),
+                        Err(fault) => {
+                            trunc.push(Truncation::unread(
+                                ElfTable::DynStr,
+                                format!(
+                                    "{} string at offset {value:#x} of the dynamic string \
+                                     table was not read, and neither were the entries after \
+                                     it: {fault}",
+                                    dyn_tag_name(tag)
+                                ),
+                            ));
+                            break;
+                        }
+                    }
                 }
                 _ => trunc.push(Truncation::unread(
                     ElfTable::DynStr,
                     format!(
-                        "{} string at offset {value:#x} lies past the {strtab_len:#x}-byte \
-                         dynamic string table, so the entry was not read",
+                        "{} string at offset {value:#x} lies past the {strtab_len:#x}-byte dynamic string table",
                         dyn_tag_name(tag)
                     ),
                 )),
@@ -2995,19 +2964,6 @@ impl<'a> Elf<'a> {
 
     /// The string table `sh_link` names for a symbol table, held whole, or `None` beside
     /// a `symbols` record of why its names cannot be resolved.
-    ///
-    /// An index past the end was always skipped; `0` was not, and `0` is `SHN_UNDEF`, the
-    /// null section header, whose `sh_offset` is 0, so names were read from file offset
-    /// zero, came back empty, were skipped one by one, and the table reported no symbols
-    /// at all. Reproduced: zeroing `.dynsym`'s `sh_link` is a four-byte edit that leaves a
-    /// file of identical length, parses cleanly, and flips `canary` to false and the eight
-    /// `__*_chk` counts to zero. A symbol table whose names cannot be resolved is
-    /// unreadable, and is recorded as such.
-    ///
-    /// The table is held whole before a name is read through it. `cstr_at` answers "" for
-    /// an offset past the end of the file, and a `.strtab` whose `sh_offset` lay past the
-    /// end read every symbol as unnamed: the table reported no symbols, `canary-emitted`
-    /// decided `off` over a discriminating triple, and nothing was recorded.
     fn symbol_strtab(&self, sh: &Shdr, table: &str, trunc: &mut Vec<Truncation>) -> Option<&Shdr> {
         let link = self
             .shdrs
@@ -3017,15 +2973,13 @@ impl<'a> Elf<'a> {
                 match self.cur.slice(link.sh_offset, link.sh_size) {
                     Ok(_) => return Some(link),
                     Err(why) => format!(
-                        "{table}: its string table at {:#x}+{:#x} lies past the end of the \
-                         file ({why}), so no symbol name can be resolved",
+                        "{table}: its string table at {:#x}+{:#x} lies past the end of the file ({why})",
                         link.sh_offset, link.sh_size
                     ),
                 }
             }
             Some(_) => format!(
-                "{table}: sh_link {} does not name a string table, so its symbol names \
-                 cannot be resolved",
+                "{table}: sh_link {} does not name a string table",
                 sh.sh_link
             ),
             None => format!(
@@ -3042,7 +2996,7 @@ impl<'a> Elf<'a> {
     /// a known kind, and `SymbolFact::tables` and `ElfFacts::symbol_tables` say which.
     fn symbol_table_label(&self, idx: usize, sh: &Shdr) -> String {
         match self.shnames.get(idx).filter(|n| !n.is_empty()) {
-            Some(name) => name.clone(),
+            Some(name) => label_of(name, idx),
             None if sh.sh_type == SHT_SYMTAB => "SHT_SYMTAB".to_owned(),
             None => "SHT_DYNSYM".to_owned(),
         }
@@ -3051,20 +3005,15 @@ impl<'a> Elf<'a> {
     /// A relocation section's label: its name where the file gave one, and its index where
     /// it did not.
     fn relocation_label(&self, idx: usize) -> String {
-        self.shnames
-            .get(idx)
-            .filter(|n| !n.is_empty())
-            .map_or_else(|| format!("relocation section [{idx}]"), Clone::clone)
+        self.shnames.get(idx).filter(|n| !n.is_empty()).map_or_else(
+            || format!("relocation section [{idx}]"),
+            |name| label_of(name, idx),
+        )
     }
 
     /// The stride section `idx` is read at: `record`, its type's record size, with the
     /// `ignored` record [`record_stride`] leaves pushed where `sh_entsize` differs, and kept
     /// once among the walks by [`once_each_stride_record`] when the facts are assembled.
-    ///
-    /// The only reader of `sh_entsize`. The label is decided here from the index and the
-    /// type (a symbol table on `symbols`, a relocation section on `relocations`), so the walks
-    /// that read one section write equal records, of which the facts keep the first, and none
-    /// can drop it.
     fn section_stride(
         &self,
         idx: usize,
@@ -3078,9 +3027,7 @@ impl<'a> Elf<'a> {
             (self.relocation_label(idx), ElfTable::Relocations)
         };
         // A name two sections carry (a relocatable object's COMDAT copies) would merge their
-        // records, so the index is added there. So it is for an unnamed symbol table, whose
-        // label is its type and so another's too; an unnamed relocation section's label is
-        // its index already.
+        // records, so the index is added there.
         let indexed = match self.shnames.get(idx).filter(|n| !n.is_empty()) {
             Some(name) => self.shared_names.contains(name),
             None => table == ElfTable::Symbols,
@@ -3102,13 +3049,6 @@ impl<'a> Elf<'a> {
 
     /// The entry size and whole-entry count of symbol table `idx`, or `None` where the table
     /// is too small to hold one entry.
-    ///
-    /// A real symbol table always holds the null symbol at index 0, so a nonzero `sh_size`
-    /// below one entry is a malformed table, not an empty one: read as zero entries it
-    /// listed the table and reported no symbols from it with nothing recorded, which is
-    /// the false absence a truncation record exists to name. A size that is not a multiple
-    /// of the entry size is read to its last whole entry, and the trailing partial entry
-    /// is recorded, since the bytes after it are a symbol the reader did not read.
     fn symbol_entries(
         &self,
         idx: usize,
@@ -3116,15 +3056,9 @@ impl<'a> Elf<'a> {
         table: &str,
         trunc: &mut Vec<Truncation>,
     ) -> Option<(u64, u64)> {
-        // The record size, whatever `sh_entsize` says (`section_stride`). `Sym` is 24 bytes
-        // on ELF64 and 16 on ELF32, and `sh_entsize` is meant to confirm that. A form before
-        // the floor special-cased 0 and accepted 1..=23, so `sh_entsize = 1` made `count`
-        // equal `sh_size` -- one "symbol" per byte instead of per record -- and each one called
-        // `cstr_at`, whose NUL scan runs to the end of the file when the string table
-        // holds no terminator. The product is quadratic: 200 KB of input took 4.2s, and
-        // the fitted rate puts a 10 MB file at roughly three hours. It is pure CPU with a
-        // flat 3.7 MB footprint, so unlike the header case nothing OOM-kills it -- it
-        // simply never returns.
+        // The record size, whatever `sh_entsize` says (`section_stride`): a smaller stride
+        // would read a symbol per byte, each a name scan that can run to the end of the
+        // file, which is quadratic in the input.
         let step = self.section_stride(idx, sh, symbol_record(self.elf64), trunc);
         // A `NonZeroU64` divisor: no zero entry size reaches here, so no arm reads one.
         let (count, partial) = (sh.sh_size / step, sh.sh_size % step);
@@ -3132,8 +3066,7 @@ impl<'a> Elf<'a> {
             trunc.push(Truncation::unread(
                 ElfTable::Symbols,
                 format!(
-                    "{table}: sh_size {:#x} is below one {step}-byte entry, so the table \
-                     holds not even the null symbol and was not read",
+                    "{table}: sh_size {:#x} is below one {step}-byte entry",
                     sh.sh_size
                 ),
             ));
@@ -3154,18 +3087,6 @@ impl<'a> Elf<'a> {
     }
 
     /// The symbol tables the file has, beside the symbols read from them.
-    ///
-    /// One walk for both, so `ElfFacts::symbol_tables` names exactly the tables the
-    /// symbols were read from: a table whose names cannot be resolved is listed and
-    /// recorded in `trunc`, and a file with no `SHT_SYMTAB` or `SHT_DYNSYM` lists nothing
-    /// and records nothing, since an absent table is the precondition's business.
-    ///
-    /// `SHT_SYMTAB` is read from its section header: the loader never reads it, and a
-    /// header is the only way to it. The dynamic symbol table is another matter, and where
-    /// a `PT_DYNAMIC` exists it is held to [`DynSymView`]: the loader reads the table
-    /// `DT_SYMTAB` names, not whatever a `SHT_DYNSYM` header says, so a header aimed
-    /// elsewhere (or a second header of the type) must not decide which symbols the object
-    /// imports.
     fn symbols(
         &self,
         dyn_entries: &[(i64, u64)],
@@ -3173,7 +3094,7 @@ impl<'a> Elf<'a> {
         trunc: &mut Vec<Truncation>,
     ) -> (Vec<String>, BTreeMap<String, SymbolFact>) {
         let mut tables = Vec::new();
-        let mut out: BTreeMap<String, SymbolFact> = BTreeMap::new();
+        let mut out = SymbolsRead::default();
         let view = self.dynsym_view(dyn_entries, dynstr, trunc);
         let mut loader_table_read = false;
         for (idx, sh) in self.shdrs.iter().enumerate() {
@@ -3192,10 +3113,7 @@ impl<'a> Elf<'a> {
                     DynSymView::Absent => {
                         trunc.push(Truncation::ignored(
                             ElfTable::Symbols,
-                            format!(
-                                "{table} was not read: the dynamic table names no DT_SYMTAB, \
-                                 so the loader has no dynamic symbol table"
-                            ),
+                            format!("{table} was not read: the dynamic table names no DT_SYMTAB"),
                         ));
                         continue;
                     }
@@ -3208,8 +3126,7 @@ impl<'a> Elf<'a> {
                             trunc.push(Truncation::ignored(
                                 ElfTable::Symbols,
                                 format!(
-                                    "{table} at {:#x} is not the table DT_SYMTAB names \
-                                     ({offset:#x}), which the loader reads, so it was not read",
+                                    "{table} at {:#x} is not the table DT_SYMTAB names ({offset:#x})",
                                     sh.sh_offset
                                 ),
                             ));
@@ -3227,22 +3144,18 @@ impl<'a> Elf<'a> {
             };
             if count < floor {
                 // The header claims a table shorter than the loader's hash and relocation
-                // tables reach. Those can only undercount (a symbol no lookup finds and no
-                // relocation names is in neither), so a longer claim stands and a shorter
-                // one does not.
+                // tables reach.
                 trunc.push(Truncation::ignored(
                     ElfTable::Symbols,
                     format!(
-                        "{table}: sh_size {:#x} holds {count} symbols and the dynamic hash \
-                         and relocation tables reach {floor}, so their count was read",
+                        "{table}: sh_size {:#x} holds {count} symbols and the dynamic hash and relocation tables reach {floor}",
                         sh.sh_size
                     ),
                 ));
                 count = floor;
             }
-            // Names come through the header's link, as they always did, while the link
-            // names the string table `DT_STRTAB` does. Where it names another, the
-            // header's table is not the loader's and the loader's is read, with the
+            // Names come through the header's link while it names the string table
+            // `DT_STRTAB` does; where it names another, the loader's is read and the
             // disagreement reported.
             let linked = self.linked_strtab_offset(sh);
             let strtab = match loader_strtab {
@@ -3250,9 +3163,7 @@ impl<'a> Elf<'a> {
                     trunc.push(Truncation::ignored(
                         ElfTable::Symbols,
                         format!(
-                            "{table}: sh_link {} is not the string table DT_STRTAB names \
-                             ({:#x}), which the loader reads, so the names were read through \
-                             DT_STRTAB",
+                            "{table}: sh_link {} is not the string table DT_STRTAB names ({:#x})",
                             sh.sh_link, loader.0
                         ),
                     ));
@@ -3265,24 +3176,19 @@ impl<'a> Elf<'a> {
                     (strtab.sh_offset, strtab.sh_size)
                 }
             };
-            self.read_symbols(&table, sh.sh_offset, step, count, strtab, &mut out, trunc);
+            self.read_symbols(&table, sh, step, count, strtab, &mut out, trunc);
         }
         if let DynSymView::At { offset, .. } = &view
             && !loader_table_read
         {
             // No header of the type is the loader's table: those there are aimed elsewhere,
-            // or there are none (a `.dynsym` header retyped away). Its length is not in the
-            // file, since the hash table gives a lower bound only, so what the loader reads
-            // cannot be read whole.
+            // or there are none (a `.dynsym` header retyped away).
             trunc.push(Truncation::unread(
                 ElfTable::Symbols,
-                format!(
-                    "no SHT_DYNSYM header lies at the {offset:#x} DT_SYMTAB names, and the \
-                     length of the table the loader reads is not otherwise in the file"
-                ),
+                format!("no SHT_DYNSYM header lies at the {offset:#x} DT_SYMTAB names"),
             ));
         }
-        (tables, out)
+        (tables, out.facts)
     }
 
     /// The file offset of the section a symbol header's `sh_link` names, where it names one.
@@ -3296,36 +3202,6 @@ impl<'a> Elf<'a> {
     }
 
     /// How the dynamic symbol table is reached: see [`DynSymView`].
-    ///
-    /// With a `PT_DYNAMIC`, the loader's table starts where `DT_SYMTAB` translates through
-    /// `PT_LOAD` and is named by `DT_STRTAB`. A forged `SHT_DYNSYM` header (a moved offset,
-    /// a second header) changed which symbols were read, and with them `__stack_chk_fail`
-    /// and the fortify counts, for a table the loader never consults.
-    ///
-    /// **The length is not the hash table's.** `DT_GNU_HASH` and `DT_HASH` bound the
-    /// symbols a lookup can find, and a symbol is indexed from a relocation without a
-    /// lookup: the Fedora 44 x86_64 `7z` executable (it exports nothing) carries a
-    /// `.gnu.hash` of one symbol over a `.dynsym` of 134 entries. Taken as the count it read 133
-    /// imports as absent, which is the false absence this exists to prevent. So the hash
-    /// tables give a floor, and the header's `sh_size` the length, where the header is at
-    /// the loader's offset; a longer reach than the header claims is the header
-    /// understating the table, and the reach is read.
-    ///
-    /// **The relocations are the floor an import has.** A hash floor of one bounds nothing
-    /// for that `7z`: with its `.dynsym` header cut from 3216 bytes to 48 it read one symbol,
-    /// no `__stack_chk_fail` and no `__memcpy_chk`, and recorded nothing. The loader resolves
-    /// an import through the relocation that names its index, so every `r_sym` in
-    /// `DT_RELA`, `DT_REL` and `DT_JMPREL` is an entry the table holds, and the highest one
-    /// plus one joins the floor. An import the program uses is named by a relocation, so it
-    /// lies under the floor whatever the header says. The residue is a header at the right
-    /// offset that claims too many symbols, read as symbols as before, and a symbol no
-    /// lookup finds and no relocation names, which is not one the loader binds.
-    ///
-    /// A table that cannot be located or whose hash tables cannot be read is `Unreadable`
-    /// and recorded `unread`, which withholds the checks reading `symbols`: an `ignored`
-    /// record would publish a verdict from the section's reading, the reading this exists
-    /// to refuse. `Absent` and the headers that are not the loader's are `ignored`, since
-    /// the facts read from the loader's view are whole.
     fn dynsym_view(
         &self,
         dyn_entries: &[(i64, u64)],
@@ -3333,13 +3209,7 @@ impl<'a> Elf<'a> {
         trunc: &mut Vec<Truncation>,
     ) -> DynSymView {
         // A file with no section headers has its symbol tables recorded `unread` by
-        // `structural_truncations`, and with no `PT_DYNAMIC` no loader reads the object. One
-        // with headers and none of type `SHT_DYNSYM` is held to the loader's view as any
-        // other is (2026-10-20): where `DT_SYMTAB` names a table the view is `At`,
-        // no header lies there, and `symbols` records the table `unread` as it does where
-        // the headers are aimed elsewhere. The view was `Sections` with nothing recorded
-        // before, so a `.dynsym` header retyped away read as an object with no dynamic
-        // symbols beside a loader that binds them.
+        // `structural_truncations`, and with no `PT_DYNAMIC` no loader reads the object.
         if self.shdrs.is_empty() || !self.phdrs.iter().any(|p| p.p_type == PT_DYNAMIC) {
             return DynSymView::Sections;
         }
@@ -3352,29 +3222,22 @@ impl<'a> Elf<'a> {
         };
         let Some(symtab) = value(DT_SYMTAB) else {
             // A dynamic table that was cut short, or yielded nothing, may have lost the tag,
-            // and the loader's table is then unlocatable rather than absent. Its own record
-            // is the gate; the headers stay the reading they were, and the comparison that
-            // could not be made is reported.
+            // and the loader's table is then unlocatable rather than absent.
             let cut = trunc
                 .iter()
                 .any(|t| t.table == ElfTable::Dynamic && t.kind == TruncationKind::Unread);
             if cut || dyn_entries.is_empty() {
                 // With headers of the type, they are the reading and the comparison that
-                // could not be made is reported. With none, nothing reads the table the
-                // loader may bind, so it is `unread`, not a reading of no dynamic symbols.
+                // could not be made is reported.
                 trunc.push(if headers {
                     Truncation::ignored(
                         ElfTable::Symbols,
-                        "the dynamic table was not read whole, so no SHT_DYNSYM header could \
-                         be compared with DT_SYMTAB"
-                            .to_owned(),
+                        "the dynamic table was not read whole".to_owned(),
                     )
                 } else {
                     Truncation::unread(
                         ElfTable::Symbols,
-                        "the dynamic table was not read whole and no section header is \
-                         SHT_DYNSYM, so whether DT_SYMTAB names a table the loader reads was \
-                         not established"
+                        "the dynamic table was not read whole and no section header is SHT_DYNSYM"
                             .to_owned(),
                     )
                 });
@@ -3388,8 +3251,7 @@ impl<'a> Elf<'a> {
         };
         let Some(offset) = self.offset_of_vaddr(symtab) else {
             return unreadable(format!(
-                "DT_SYMTAB at vaddr {symtab:#x} lies in no PT_LOAD segment, so the loader's \
-                 dynamic symbol table was not located"
+                "DT_SYMTAB at vaddr {symtab:#x} lies in no PT_LOAD segment"
             ));
         };
         let step = symbol_record(self.elf64).get();
@@ -3456,8 +3318,13 @@ impl<'a> Elf<'a> {
         self.cur
             .slice(buckets, bucket_bytes)
             .map_err(|why| format!("has buckets past the end of the file ({why})"))?;
+        let charge = || {
+            self.step()
+                .map_err(|spent| format!("was not read whole: {spent}"))
+        };
         let mut last = 0;
         for i in 0..nbuckets {
+            charge()?;
             last = last.max(word(buckets.saturating_add(i.saturating_mul(4)))?);
         }
         if last == 0 {
@@ -3470,6 +3337,7 @@ impl<'a> Elf<'a> {
         }
         let mut idx = last;
         loop {
+            charge()?;
             let at = chains.saturating_add(idx.saturating_sub(symoffset).saturating_mul(4));
             if word(at)? & 1 != 0 {
                 return Ok(idx.saturating_add(1));
@@ -3480,14 +3348,6 @@ impl<'a> Elf<'a> {
 
     /// The symbol count the dynamic relocation tables reach: one past the highest `r_sym`
     /// that `DT_RELA`, `DT_REL` or `DT_JMPREL` names, or 0 where none names a symbol.
-    ///
-    /// An entry is read at the record size whatever `DT_RELAENT` or `DT_RELENT` says
-    /// ([`record_stride`]), and a tag that says otherwise is returned beside the reach as an
-    /// `ignored` record on the dynamic table; `DT_JMPREL` takes its form from `DT_PLTREL`.
-    /// `r_info` follows `r_offset` in both forms. Its symbol index is the
-    /// high 32 bits on ELF64 and the high 24 on ELF32, except on 64-bit MIPS, whose field
-    /// is a 32-bit `r_sym` followed by four type bytes in file order: the high word on a
-    /// big-endian object and the low word on a little-endian one, as read.
     fn relocation_reach(
         &self,
         value: &dyn Fn(i64) -> Option<u64>,
@@ -3525,11 +3385,7 @@ impl<'a> Elf<'a> {
         match (value(DT_JMPREL), jmprel_form) {
             (None, _) => {}
             (Some(_), None) => {
-                return Err(
-                    "DT_JMPREL has no DT_PLTREL naming DT_RELA or DT_REL, so its entries \
-                     could not be read"
-                        .to_owned(),
-                );
+                return Err("DT_JMPREL has no DT_PLTREL naming DT_RELA or DT_REL".to_owned());
             }
             (Some(at), Some((size, ent))) => {
                 tables.push((
@@ -3571,6 +3427,8 @@ impl<'a> Elf<'a> {
             let count = len / ent;
             let ent = ent.get();
             for i in 0..count {
+                self.step()
+                    .map_err(|spent| format!("{name} was not read whole: {spent}"))?;
                 let info_at = off
                     .saturating_add(i.saturating_mul(ent))
                     .saturating_add(word);
@@ -3605,24 +3463,35 @@ impl<'a> Elf<'a> {
             .map_err(|why| format!("is unreadable ({why})"))
     }
 
-    /// `count` symbols of `step` bytes at `sym_off`, named through the string table at
-    /// `(strtab_off, strtab_len)`, folded into `out`.
-    #[allow(
+    /// `count` symbols of `step` bytes from the table `sh` heads, named through the string
+    /// table at `(strtab_off, strtab_len)` and spelled as its type spells a name
+    /// ([`Spelling::of`]), folded into `out`.
+    #[expect(
         clippy::too_many_arguments,
-        reason = "a symbol read is two tables, each an offset and a size, a label and the \
-                  two accumulators; a struct for the two call sites would only rename them"
+        reason = "a symbol read takes the table's label, header, entry size and count"
     )]
     fn read_symbols(
         &self,
         table: &str,
-        sym_off: u64,
+        sh: &Shdr,
         step: u64,
         count: u64,
         (strtab_off, strtab_len): (u64, u64),
-        out: &mut BTreeMap<String, SymbolFact>,
+        SymbolsRead {
+            facts: out,
+            spellings,
+        }: &mut SymbolsRead,
         trunc: &mut Vec<Truncation>,
     ) {
+        let (sym_off, names) = (sh.sh_offset, Spelling::of(sh.sh_type));
         for i in 0..count {
+            if let Err(spent) = self.step() {
+                trunc.push(Truncation::unread(
+                    ElfTable::Symbols,
+                    format!("{table} not read past symbol {i} of {count}: {spent}"),
+                ));
+                break;
+            }
             let base = sym_off.saturating_add(i.saturating_mul(step));
             let Ok(name_off) = self.cur.u32_at(base) else {
                 trunc.push(Truncation::unread(
@@ -3647,29 +3516,29 @@ impl<'a> Elf<'a> {
                 trunc.push(Truncation::unread(
                     ElfTable::Symbols,
                     format!(
-                        "{table}: symbol {i} of {count} names string offset {name_off:#x} \
-                         past its {strtab_len:#x}-byte string table, so the names from it on \
-                         were not read",
+                        "{table}: symbol {i} of {count} names string offset {name_off:#x} past its {strtab_len:#x}-byte string table",
                     ),
                 ));
                 break;
             }
-            let raw = self.cur.cstr_at(strtab_off, name_off, strtab_len);
-            // The two string tables spell one symbol two ways. `.dynstr` holds the
-            // bare name, and the version it binds to lives in `.gnu.version_r`, which
-            // `readelf` appends at display time. `.strtab` stores the version in the
-            // name itself: `__stack_chk_fail@GLIBC_2.4` for a reference,
-            // `name@@VERSION` for a default definition. Matched raw, the `.symtab`
-            // spelling never equalled the watched name, so every fortified binary
-            // reported the canary and the `__*_chk` symbols in `.dynsym` alone and
-            // counted `symbol_count` over both spellings. The key is the name before
-            // the first `@`; the spelling is kept in `versioned`. No C identifier
-            // carries `@`, so in what a compiler writes nothing else is cut. A `.dynsym`
-            // name given an `@` by hand is cut too: the assumption
-            // `dynamic-symbol-names-carry-no-version` in `report::ASSUMPTIONS`.
-            let (name, versioned) = match raw.split_once('@') {
-                Some((bare, _)) => (bare.to_owned(), Some(raw)),
-                None => (raw, None),
+            let raw = match self.name_at(strtab_off, name_off, strtab_len) {
+                Ok(raw) => raw,
+                Err(fault) => {
+                    trunc.push(Truncation::unread(
+                        ElfTable::Symbols,
+                        format!(
+                            "{table}: the name of symbol {i} of {count}, at string offset \
+                             {name_off:#x}, was not read, and neither were the symbols after \
+                             it: {fault}"
+                        ),
+                    ));
+                    break;
+                }
+            };
+            // The two string tables spell one symbol two ways ([`Spelling`]).
+            let (name, versioned) = match (names, raw.split_once('@')) {
+                (Spelling::Versioned, Some((bare, _))) => (bare.to_owned(), Some(raw)),
+                _ => (raw, None),
             };
             if name.is_empty() {
                 continue;
@@ -3682,74 +3551,82 @@ impl<'a> Elf<'a> {
             if shndx != 0 {
                 entry.defined = true;
             }
+            // The scan of the name's tables is charged too, by the bytes it can compare: `N`
+            // headers aliasing one table under `N` long names would make each of its symbols
+            // compare a list of `N` labels.
+            let listed = u64::try_from(entry.tables.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(table.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                );
+            if let Err(spent) = self.budget.spend(listed) {
+                trunc.push(Truncation::unread(
+                    ElfTable::Symbols,
+                    format!("{table} not read past symbol {i} of {count}: {spent}"),
+                ));
+                break;
+            }
             if !entry.tables.iter().any(|t| t == table) {
+                // Each symbol keeps its own copy of the table's label, so the copy is charged:
+                // one table under a long name holding many symbols would otherwise keep the
+                // name once per symbol.
+                let label = u64::try_from(table.len()).unwrap_or(u64::MAX);
+                if let Err(spent) = self.budget.spend(label) {
+                    trunc.push(Truncation::unread(
+                        ElfTable::Symbols,
+                        format!("{table} not read past symbol {i} of {count}: {spent}"),
+                    ));
+                    break;
+                }
                 entry.tables.push(table.to_owned());
             }
             if let Some(spelling) = versioned
-                && !entry.versioned.contains(&spelling)
+                && spellings.insert(spelling.clone())
             {
                 entry.versioned.push(spelling);
             }
         }
     }
 
+    /// Whether this file's marking is read from its sections rather than its segments: a
+    /// relocatable object, whatever program headers it carries, and a file with no program
+    /// headers at all. No loader of a program loads a relocatable object: the linker reads its
+    /// sections, as Linux's module loader does a kernel module's. Its notes ([`Self::notes`])
+    /// and an aarch64 relocatable object's build attributes
+    /// ([`Self::aarch64_attribute_word`]) are read from its sections.
+    /// [`Self::structural_truncations`] records `notes` unread for such a file where no
+    /// section header was read, so the two cannot disagree on which files they mean.
+    fn notes_from_sections(&self) -> bool {
+        self.e_type == ET_REL || self.phdrs.is_empty()
+    }
+
     /// The GNU notes, read through the headers the loader reads: the `PT_GNU_PROPERTY`
-    /// segment, `PT_NOTE` where there is none, and `SHT_NOTE` sections only where there are
-    /// no program headers at all. Within them the walk is the reader's own, and where it
-    /// differs from the kernel's is in `report::ASSUMPTIONS`: `one-property-note-per-object`,
-    /// `note-segments-align-to-four-or-eight` and `property-note-name-size-is-four`.
-    ///
-    /// **The segment wins**, the rule `dynamic()` follows for `.dynamic` and for the same
-    /// reason. `ld.so` and the kernel's `parse_elf_properties` consult program headers and
-    /// never a section header, so a section-first walk measured whatever bytes a crafted
-    /// header pointed at: a gcc 16.1.1 `-fcf-protection=none` binary whose
-    /// `.note.gnu.property` header was aimed at an appended `IBT|SHSTK` note, program headers
-    /// untouched, still ran and read `x86_ibt` and `x86_shstk` true while the
-    /// `GNU_PROPERTY` segment carried neither. A section whose bytes no note segment covers
-    /// is not read and is recorded as `ignored`: the facts are whole, from the segments.
-    /// Containment rather than equality, because a section sits inside the `PT_NOTE` that
-    /// groups it with its neighbours.
-    ///
-    /// Sections are the view only where the file has no program headers: a relocatable
-    /// object, which chard reads too, has no loader view and its sections are all there is.
-    /// A file with program headers and no note segment has no note the loader reads, so a
-    /// note section in it is dropped, not rescued. A file stripped of section headers has
-    /// nothing to drop and is read through its segments, as before.
-    ///
-    /// **`PT_GNU_PROPERTY` wins over `PT_NOTE`**, the same rule one level down. Where a file
-    /// has a `PT_GNU_PROPERTY` segment, the kernel's `parse_elf_properties` and glibc's
-    /// `_dl_process_pt_gnu_property` read the property note there and nowhere else, so the
-    /// notes are read from that segment alone. A `PT_NOTE` is read only in a file without
-    /// one, as a linker before `PT_GNU_PROPERTY` existed wrote it. Reading both measured a
-    /// note no loader reads: the same `-fcf-protection=none` binary with `PT_GNU_PROPERTY`
-    /// untouched and its first `PT_NOTE` repointed at an appended `IBT|SHSTK` note ran, and
-    /// read `x86_ibt` and `x86_shstk` true. A property note a `PT_NOTE` holds outside the
-    /// property segment is recorded as `ignored`, as a stray section is. A stop in that
-    /// walk is not recorded: it withholds nothing, and the ordinary file stops there. 107 of
-    /// 3958 ELF files under `/usr` on Fedora 44 x86_64 (samba's libraries among them) carry
-    /// one 8-aligned `PT_NOTE` over `.note.gnu.property` and two 4-aligned notes, which a walk
-    /// at the segment's alignment cannot step through, while `PT_GNU_PROPERTY` reads whole.
-    ///
-    /// The two segment types often cover the same bytes (`PT_GNU_PROPERTY` inside a `PT_NOTE`
-    /// as `lld` groups them), so a note is kept once, by where its descriptor sits; a second
-    /// copy would publish a count of two for a type a linker wrote once.
-    ///
-    /// `trunc` records a note table the walk could not finish. Every stop in `parse_notes`
-    /// was a silent `break` once: a note table cut mid-way yielded the notes before the cut
-    /// and nothing else, so a property note past it read as an object with no CET, BTI or GCS
-    /// marking at all, which is the false `absent` the typed truncation exists to name.
+    /// segment, `PT_NOTE` where there is none, and `SHT_NOTE` sections only in a file
+    /// [`Self::notes_from_sections`] names. It assumes one property note per object and
+    /// note segments aligned to four or eight bytes.
     fn notes(&self, trunc: &mut Vec<Truncation>) -> Vec<Note> {
         let mut out: Vec<Note> = Vec::new();
-        let segments: Vec<(u64, u64)> = self
-            .phdrs
-            .iter()
-            .filter(|p| p.p_type == PT_NOTE || p.p_type == PT_GNU_PROPERTY)
-            .map(|p| (p.p_offset, p.p_filesz))
-            .collect();
-        if self.phdrs.is_empty() {
+        // Each kept note's place in `out` by its descriptor's offset, a lookup and not a
+        // quadratic scan: a `PT_NOTE` of empty property notes holds one every 16 bytes, 33
+        // million of them at `MAX_OBJECT_BYTES`.
+        let mut kept: BTreeMap<u64, usize> = BTreeMap::new();
+        let segments = Spans::new(
+            self.phdrs
+                .iter()
+                .filter(|p| p.p_type == PT_NOTE || p.p_type == PT_GNU_PROPERTY)
+                .map(|p| (p.p_offset, p.p_offset.saturating_add(p.p_filesz)))
+                .collect(),
+        );
+        if self.notes_from_sections() {
             for sh in self.shdrs.iter().filter(|s| s.sh_type == SHT_NOTE) {
                 let align = note_alignment(sh.sh_addralign);
-                out.extend(self.parse_notes(sh.sh_offset, sh.sh_size, align, trunc));
+                for note in
+                    self.parse_notes(sh.sh_offset, sh.sh_size, align, GNU_PROPERTY_NOTE, trunc)
+                {
+                    keep_note(&mut kept, &mut out, note);
+                }
             }
             return out;
         }
@@ -3760,38 +3637,61 @@ impl<'a> Elf<'a> {
             .filter(|p| p.p_type == PT_GNU_PROPERTY || (!property_segment && p.p_type == PT_NOTE))
         {
             let align = note_alignment(p.p_align);
-            for note in self.parse_notes(p.p_offset, p.p_filesz, align, trunc) {
-                if !out.iter().any(|n| n.desc_off == note.desc_off) {
-                    out.push(note);
-                }
+            for note in self.parse_notes(p.p_offset, p.p_filesz, align, GNU_PROPERTY_NOTE, trunc) {
+                keep_note(&mut kept, &mut out, note);
             }
         }
         if property_segment {
+            let before = self.budget.exhausted();
+            // Each property note outside the property segments is recorded once, by its
+            // descriptor's offset, in the record of the first `PT_NOTE` that holds it, so
+            // headers that all name one region are one record.
+            let mut ignored = BTreeSet::new();
             for p in self.phdrs.iter().filter(|p| p.p_type == PT_NOTE) {
                 let align = note_alignment(p.p_align);
-                for note in self.parse_notes(p.p_offset, p.p_filesz, align, &mut Vec::new()) {
-                    if note.name == "GNU"
-                        && note.ntype == NT_GNU_PROPERTY_TYPE_0
-                        && !out.iter().any(|n| n.desc_off == note.desc_off)
-                    {
-                        trunc.push(Truncation::ignored(
-                            ElfTable::Notes,
-                            format!(
-                                "property note at {:#x}+{:#x} lies in a PT_NOTE outside every \
-                                 PT_GNU_PROPERTY segment and was not read; the loader reads \
-                                 PT_GNU_PROPERTY, so that segment is what was measured",
-                                note.desc_off, note.desc_len
-                            ),
-                        ));
+                let mut first = None;
+                let mut more: u64 = 0;
+                for note in self.parse_notes(
+                    p.p_offset,
+                    p.p_filesz,
+                    align,
+                    GNU_PROPERTY_NOTE,
+                    &mut Vec::new(),
+                ) {
+                    if !kept.contains_key(&note.desc_off) && ignored.insert(note.desc_off) {
+                        if first.is_none() {
+                            first = Some((note.desc_off, note.desc_len));
+                        } else {
+                            more = more.saturating_add(1);
+                        }
                     }
                 }
+                if let Some((desc_off, desc_len)) = first {
+                    let (others, lie, was) = match more {
+                        0 => (String::new(), "lies", "was"),
+                        n => (format!(" and {n} more after it"), "lie", "were"),
+                    };
+                    trunc.push(Truncation::ignored(
+                        ElfTable::Notes,
+                        format!(
+                            "property note at {desc_off:#x}+{desc_len:#x}{others} {lie} in a PT_NOTE outside every PT_GNU_PROPERTY segment and {was} not read"
+                        ),
+                    ));
+                }
+            }
+            // A stop in this walk is not recorded, but a spent budget is: the walk is
+            // where the budget ran out, and every later walk is cut by it.
+            if let (None, Some(spent)) = (before, self.budget.exhausted()) {
+                trunc.push(Truncation::unread(
+                    ElfTable::Notes,
+                    format!(
+                        "the PT_NOTE segments beside PT_GNU_PROPERTY were not all read: {spent}"
+                    ),
+                ));
             }
         }
-        // Only an allocated note section claims to be loaded, so only one of those outside
-        // the note segments is a view that disagrees with the loader's. A non-allocated note
-        // is never mapped and never was a loader view: annobin's `.gnu.build.attributes`,
-        // which Fedora's crt objects carry into every program linked there, is one, and
-        // recording it would put a warning on every artifact while saying nothing.
+        // Only an allocated note section claims to be loaded, so only one outside the note
+        // segments disagrees with the loader.
         for sh in self
             .shdrs
             .iter()
@@ -3799,19 +3699,12 @@ impl<'a> Elf<'a> {
         {
             let (off, size) = (sh.sh_offset, sh.sh_size);
             let end = off.saturating_add(size);
-            let contained = segments
-                .iter()
-                .any(|(p_off, p_size)| off >= *p_off && end <= p_off.saturating_add(*p_size));
-            if !contained {
-                // `Ignored`: the facts are whole, read from the segments. Recorded as
-                // unread it would let the forged view withhold the measurement it was
-                // dropped in order to protect.
+            if !segments.contains(off, end) {
+                // `Ignored`: the facts are whole, read from the segments.
                 trunc.push(Truncation::ignored(
                     ElfTable::Notes,
                     format!(
-                        "SHT_NOTE section at {off:#x}+{size:#x} lies outside every PT_NOTE and \
-                         PT_GNU_PROPERTY segment and was not read; the loader reads the \
-                         segments, so the segments are what was measured"
+                        "SHT_NOTE section at {off:#x}+{size:#x} lies outside every PT_NOTE and PT_GNU_PROPERTY segment and was not read"
                     ),
                 ));
             }
@@ -3819,21 +3712,107 @@ impl<'a> Elf<'a> {
         out
     }
 
-    /// The notes in one table, stopping at the first the file does not hold whole.
-    ///
-    /// A note is held whole when its header words are readable and its descriptor ends
-    /// inside both the table and the file. The second bound is the one that matters for
-    /// a cut file: a table declared past the end of the file has an `end` past the end
-    /// of the file, and a note whose name is cut but whose header was readable would
-    /// otherwise be pushed under a name that is not `GNU` and never decoded, leaving the
-    /// property bits false with nothing recorded.
+    /// The run witnesses of [`RUN_WITNESS_SECTION`] ([`ElfFacts::run_witness`]).
+    fn run_witness(&self, trunc: &mut Vec<Truncation>) -> Vec<String> {
+        let before = self.budget.exhausted();
+        let found = self.run_witnesses();
+        if let (None, Some(spent)) = (before, self.budget.exhausted()) {
+            trunc.push(Truncation::unread(
+                ElfTable::Notes,
+                format!("the run-witness notes were not all read: {spent}"),
+            ));
+        }
+        found
+    }
+
+    /// [`Self::run_witness`]'s walk.
+    fn run_witnesses(&self) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let sections: Vec<(u64, u64)> = self
+            .shnames
+            .iter()
+            .zip(&self.shdrs)
+            .filter(|(name, sh)| *name == RUN_WITNESS_SECTION && sh.sh_type == SHT_NOTE)
+            .map(|(_, sh)| (sh.sh_offset, sh.sh_size))
+            .collect();
+        // The segments, the other view of the same bytes, are read only where the file shows
+        // no `SHT_NOTE` section of the witness's name: beside the sections they add nothing a
+        // link of the run's objects wrote, so a witness note in a segment outside every such
+        // section is not seen, as `run-witness-is-written-by-this-runs-compile` says.
+        let named = !sections.is_empty();
+        let tables = if named {
+            sections
+        } else {
+            self.phdrs
+                .iter()
+                .filter(|p| p.p_type == PT_NOTE)
+                .map(|p| (p.p_offset, p.p_filesz))
+                .collect()
+        };
+        for (offset, size) in tables {
+            let mut stops = Vec::new();
+            let notes = self.parse_notes(
+                offset,
+                size,
+                RUN_WITNESS_ALIGN,
+                RUN_WITNESS_NOTE,
+                &mut stops,
+            );
+            // A section of the witness's own name that could not be followed to its end is
+            // no witness at all: a note past the stop is unseen, and a list that held this
+            // run's nonce alone would confirm a file that also carries another's.
+            if named && !stops.is_empty() {
+                return Vec::new();
+            }
+            for note in notes {
+                if usize::try_from(note.desc_len) != Ok(RUN_WITNESS_BYTES) {
+                    continue;
+                }
+                let Ok(desc) = self.cur.slice(note.desc_off, note.desc_len) else {
+                    continue;
+                };
+                let hex = hex_of(desc);
+                if !found.contains(&hex) {
+                    if found.len() == RUN_WITNESSES_KEPT {
+                        return found;
+                    }
+                    found.push(hex);
+                }
+            }
+        }
+        found
+    }
+
+    /// Do the bytes at `at` spell `owner` and a NUL, inside the note table that ends at `end`?
+    /// Read from the file whatever `n_namesz` declares, so a note declaring a name shorter than
+    /// its owner's over the owner's bytes is told from a note of another name.
+    fn spells_owner(&self, at: u64, end: u64, owner: &str) -> bool {
+        let named = u64::try_from(owner.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        at.saturating_add(named) <= end
+            && self
+                .cur
+                .slice(at, named)
+                .is_ok_and(|bytes| bytes.split_last() == Some((&0, owner.as_bytes())))
+    }
+
+    /// The notes of one owner and type in one table, every note of it walked and charged,
+    /// stopping at the first the file does not hold whole: the GNU property notes for
+    /// [`Self::notes`], the run witness for [`Self::run_witness`].
     fn parse_notes(
         &self,
         base: u64,
         len: u64,
         align: u64,
+        kind: NoteKind,
         trunc: &mut Vec<Truncation>,
     ) -> Vec<Note> {
+        let NoteKind {
+            owner,
+            ntype: kept,
+            name_size_held,
+        } = kind;
         let mut out = Vec::new();
         let end = base.saturating_add(len);
         let file_end = u64::try_from(self.cur.data.len()).unwrap_or(u64::MAX);
@@ -3845,6 +3824,10 @@ impl<'a> Elf<'a> {
             ));
         };
         while pos.saturating_add(12) <= end {
+            if let Err(spent) = self.step() {
+                stop(pos, &spent.to_string());
+                break;
+            }
             let (Ok(namesz), Ok(descsz), Ok(ntype)) = (
                 self.cur.u32_at(pos),
                 self.cur.u32_at(pos.saturating_add(4)),
@@ -3856,36 +3839,54 @@ impl<'a> Elf<'a> {
             let name = if namesz == 0 {
                 String::new()
             } else {
-                self.cur
-                    .cstr_at(pos.saturating_add(12), 0, u64::from(namesz))
+                match self.name_at(pos.saturating_add(12), 0, u64::from(namesz)) {
+                    Ok(name) => name,
+                    Err(fault) => {
+                        stop(pos, &fault.to_string());
+                        break;
+                    }
+                }
             };
-            // The padding rule this module's header warns about: align the
-            // absolute descriptor offset, measured from the note's own start.
-            let Some(rel) = align_up(12u64.saturating_add(u64::from(namesz)), align) else {
-                stop(pos, "a note's name length overflows the descriptor offset");
-                break;
+            let span = match note_span(pos, namesz, descsz, align, end, file_end) {
+                Ok(span) => span,
+                Err(NoteRefusal::Overflows) => {
+                    stop(pos, "a note's name length overflows the descriptor offset");
+                    break;
+                }
+                Err(NoteRefusal::PastTheEnd) => {
+                    stop(
+                        pos,
+                        "a note's descriptor runs past the end of the table or the file",
+                    );
+                    break;
+                }
             };
-            let desc_off = pos.saturating_add(rel);
-            let desc_len = u64::from(descsz);
-            let note_end = desc_off.saturating_add(desc_len);
-            if note_end > end || note_end > file_end {
-                stop(
-                    pos,
-                    "a note's descriptor runs past the end of the table or the file",
-                );
-                break;
+            let (desc_off, desc_len) = (span.desc_off, u64::from(descsz));
+            // Every note is walked and charged; only those of the owner and type asked for are
+            // kept.
+            if ntype == kept {
+                let named = owner.len().saturating_add(1);
+                if name_size_held
+                    && usize::try_from(namesz) != Ok(named)
+                    && (name == owner || self.spells_owner(pos.saturating_add(12), end, owner))
+                {
+                    stop(
+                        pos,
+                        &format!(
+                            "a note named {owner} declares n_namesz {namesz}, not the \
+                             {named} bytes of its name and NUL"
+                        ),
+                    );
+                    break;
+                }
+                if name == owner {
+                    out.push(Note::read(desc_off, desc_len));
+                }
             }
-            out.push(Note {
-                name,
-                ntype,
-                desc_off,
-                desc_len,
-            });
-            let Some(desc_pad) = align_up(desc_len, align) else {
+            let Some(next) = span.next else {
                 stop(pos, "a note's descriptor length overflows the next offset");
                 break;
             };
-            let next = desc_off.saturating_add(desc_pad);
             if next <= pos {
                 // No forward progress: malformed, so the walk stops rather than spins.
                 stop(pos, "a note advances the walk nowhere");
@@ -3897,25 +3898,23 @@ impl<'a> Elf<'a> {
     }
 
     /// `pr_type -> (merged word, notes seen)` from every `NT_GNU_PROPERTY_TYPE_0` note.
-    ///
-    /// A type that names a feature word on this machine is AND-reduced across notes,
-    /// the linker's rule for `*_FEATURE_1_AND` applied once more; `gnu_property_notes`
-    /// says why a second note is counted. Every other type keeps the first word seen and
-    /// is never decoded: an `x86` `ISA_1_USED` is an OR, a type in the processor range
-    /// on a machine this reader does not know is anything at all, and `facts` reads
-    /// neither.
-    ///
-    /// `trunc` records a descriptor the walk could not finish. `parse_notes` holds every
-    /// note it returns whole, so a stop here is reachable only through a property word past
-    /// the end of the file; every stop here is recorded on the same rule as `parse_notes`,
-    /// where each was a silent `break`. A property whose data runs past its descriptor inside
-    /// the file is read, not stopped: the assumption `property-word-lies-in-its-descriptor`
-    /// in `report::ASSUMPTIONS`.
     fn gnu_properties(&self, trunc: &mut Vec<Truncation>) -> BTreeMap<u32, Property> {
         let mut props: BTreeMap<u32, Property> = BTreeMap::new();
         let align: u64 = if self.elf64 { 8 } else { 4 };
-        for note in self.notes(trunc) {
-            if note.name != "GNU" || note.ntype != NT_GNU_PROPERTY_TYPE_0 {
+        let notes = self.notes(trunc);
+        self.notes_kept
+            .set(Some(u64::try_from(notes.len()).unwrap_or(u64::MAX)));
+        // A descriptor two headers read at two lengths is not walked, and the notes so read are
+        // recorded once, by the first and how many follow: which length the loader takes
+        // depends on which header it reads (`one-property-note-per-object` says which Linux
+        // reads), so neither length's walk is the measurement.
+        let mut disagreeing: Option<(&Note, u64)> = None;
+        'notes: for note in &notes {
+            if note.short_len != note.desc_len {
+                match &mut disagreeing {
+                    Some((_, more)) => *more = more.saturating_add(1),
+                    None => disagreeing = Some((note, 0)),
+                }
                 continue;
             }
             let end = note.desc_off.saturating_add(note.desc_len);
@@ -3929,25 +3928,56 @@ impl<'a> Elf<'a> {
                     ),
                 ));
             };
-            while pos.saturating_add(8) <= end {
+            while pos < end {
+                if let Err(spent) = self.step() {
+                    // A spent budget stays spent, so every note after this one would meet it on
+                    // its first step: one record says the property notes were not all read.
+                    stop(pos, &spent.to_string());
+                    break 'notes;
+                }
+                // Each property lies whole in its descriptor, its data padded to the class's
+                // alignment, as Linux 7.3-rc1's `parse_elf_property` (`fs/binfmt_elf.c`) holds
+                // it: fewer than 8 bytes left, a `pr_datasz` past what is left, and a padded
+                // step past it each return `ENOEXEC` there, and binutils `readelf` prints such a
+                // property corrupt.
+                let left = end.saturating_sub(pos);
+                if left < 8 {
+                    stop(
+                        pos,
+                        &format!(
+                            "the descriptor's last {left} bytes hold no whole property header"
+                        ),
+                    );
+                    break;
+                }
                 let (Ok(pr_type), Ok(pr_datasz)) =
                     (self.cur.u32_at(pos), self.cur.u32_at(pos.saturating_add(4)))
                 else {
                     stop(pos, "a property header lies past the end of the file");
                     break;
                 };
-                let data_off = pos.saturating_add(8);
+                let PropertySpan { data_off, next } =
+                    match property_span(pos, pr_datasz, align, end) {
+                        Ok(span) => span,
+                        Err(PropertyRefusal::Overflows) => {
+                            stop(pos, "a property's data length overflows the next offset");
+                            break;
+                        }
+                        Err(PropertyRefusal::PastTheEnd { pad }) => {
+                            stop(
+                                pos,
+                                &format!(
+                                    "a property's {pr_datasz}-byte data, padded to {pad}, runs \
+                                     past the descriptor"
+                                ),
+                            );
+                            break;
+                        }
+                    };
                 let feature_word = self.feature_word_type(pr_type);
                 // A feature word is a 4-byte bitmap and is decoded only at that width;
                 // one of any other width is recorded as present with value 0 rather
-                // than guessed. clang 7.0.1 under `-fcf-protection` writes
-                // `X86_FEATURE_1_AND` with `pr_datasz` 8, which readelf prints as
-                // `<corrupt length: 0x8>` and ld 2.31.1 reports as a corrupt x86 feature
-                // size while keeping the note; reading its first word published
-                // `cet-marked` `on` for a marking neither tool accepts. A word the file
-                // does not hold is a stop, since `0` is the reading that says every
-                // feature is off. That a word of another width reads as no feature, with
-                // nothing recorded, is `feature-word-is-four-bytes` in `report::ASSUMPTIONS`.
+                // than guessed.
                 let value = if feature_word && pr_datasz != 4 {
                     0
                 } else if pr_datasz >= 4 {
@@ -3968,11 +3998,6 @@ impl<'a> Elf<'a> {
                         }
                     })
                     .or_insert(Property { value, notes: 1 });
-                let Some(pad) = align_up(u64::from(pr_datasz), align) else {
-                    stop(pos, "a property's data length overflows the next offset");
-                    break;
-                };
-                let next = data_off.saturating_add(pad);
                 if next <= pos {
                     stop(pos, "a property advances the walk nowhere");
                     break;
@@ -3980,15 +4005,11 @@ impl<'a> Elf<'a> {
                 pos = next;
             }
         }
+        record_disagreeing(disagreeing, trunc);
         props
     }
 
     /// Is `pr_type` a feature word this reader decodes on this object's machine?
-    ///
-    /// The machine is part of the question. `0xc0000002` is `X86_FEATURE_1_AND` on
-    /// `EM_386` and `EM_X86_64` and nothing anywhere else; `0xc0000000` is
-    /// `AARCH64_FEATURE_1_AND` on `EM_AARCH64` and, on x86, the pre-2.32 binutils
-    /// spelling of an ISA bitmap. Below `GNU_PROPERTY_LOPROC` no type is a feature word.
     fn feature_word_type(&self, pr_type: u32) -> bool {
         if pr_type < GNU_PROPERTY_LOPROC {
             return false;
@@ -4006,6 +4027,58 @@ impl<'a> Elf<'a> {
             return 0;
         }
         props.get(&pr_type).map_or(0, |p| p.value)
+    }
+
+    /// The aarch64 feature word an unlinked object states in its build attributes: the
+    /// `aeabi_feature_and_bits` subsection of each `SHT_AARCH64_ATTRIBUTES` section, as
+    /// [`AARCH64_FEATURE_1_BTI`], [`AARCH64_FEATURE_1_PAC`] and [`AARCH64_FEATURE_1_GCS`] bits,
+    /// the words of several subsections combined by AND, as the linker combines inputs.
+    /// `None` on any machine but aarch64, on any type but `ET_REL`, and where no section
+    /// carries the subsection.
+    fn aarch64_attribute_word(&self, trunc: &mut Vec<Truncation>) -> Option<u32> {
+        if self.e_machine != EM_AARCH64 || self.e_type != ET_REL {
+            return None;
+        }
+        let mut word: Option<u32> = None;
+        for sh in self
+            .shdrs
+            .iter()
+            .filter(|s| s.sh_type == SHT_AARCH64_ATTRIBUTES)
+        {
+            let at = sh.sh_offset;
+            let mut stop = |why: String| {
+                trunc.push(Truncation::unread(
+                    ElfTable::Notes,
+                    format!("build attributes at {at:#x}+{:#x}: {why}", sh.sh_size),
+                ));
+            };
+            let bytes = match self.section_bytes(sh) {
+                Ok(b) => b,
+                Err(e) => {
+                    stop(format!("{e}"));
+                    continue;
+                }
+            };
+            // An empty attributes section holds no format version: it is no statement of the
+            // marking, and reading it as one that marks nothing would be a guess.
+            if bytes.is_empty() {
+                stop("the section holds no bytes".to_owned());
+                continue;
+            }
+            // Charged by the byte, since `feature_and_bits` walks the section whole, and
+            // headers aliasing one section would walk it once each.
+            let units = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if let Err(spent) = self.budget.spend(units) {
+                stop(spent.to_string());
+                break;
+            }
+            match feature_and_bits(bytes, self.cur.little) {
+                Ok(None) => {}
+                Ok(Some(found)) => word = Some(word.map_or(found, |w| w & found)),
+                Err(why) => stop(why),
+            }
+        }
+        word
     }
 
     /// [`ElfFacts::data_in_code_pages`]: the allocated, non-code sections with bytes in a
@@ -4038,6 +4111,10 @@ impl<'a> Elf<'a> {
         if pages.is_empty() || !self.shdrs.iter().any(|sh| allocated(&sh)) {
             return None;
         }
+        // Sorted once and searched per section, and the names kept found by a set: a scan of
+        // the pages and of the names found per section is quadratic in the headers.
+        let pages = Spans::new(pages);
+        let mut seen = BTreeSet::new();
         let mut found = Vec::new();
         for (i, sh) in self.shdrs.iter().enumerate() {
             let name = self.shnames.get(i).map_or("", String::as_str);
@@ -4050,7 +4127,7 @@ impl<'a> Elf<'a> {
                 continue;
             }
             let end = sh.sh_offset.saturating_add(sh.sh_size);
-            if pages.iter().any(|&(lo, hi)| sh.sh_offset < hi && end > lo) {
+            if pages.overlaps(sh.sh_offset, end) {
                 // A section whose name could not be read is named by its index, so the
                 // reading still says which header it was.
                 let named = if name.is_empty() {
@@ -4058,7 +4135,7 @@ impl<'a> Elf<'a> {
                 } else {
                     name.to_owned()
                 };
-                if !found.contains(&named) {
+                if seen.insert(named.clone()) {
                     found.push(named);
                 }
             }
@@ -4068,17 +4145,12 @@ impl<'a> Elf<'a> {
 
     /// [`ElfFacts::code_relocations`]: every named relocation in a section that patches
     /// code, on a relocatable object with a section-header table.
-    ///
-    /// A section the walk cannot follow, or stops in, is recorded as an `unread`
-    /// [`ElfTable::Relocations`] entry and the walk goes on to the next section, so a cut
-    /// table keeps the entries read before the cut beside a record saying the list is
-    /// partial. A relocation section whose target is not code is skipped without a read,
-    /// so a fault in one is not recorded: nothing reads it.
     fn code_relocations(&self, trunc: &mut Vec<Truncation>) -> Option<Vec<String>> {
         if self.e_type != ET_REL || self.shdrs.is_empty() {
             return None;
         }
         let mut found = BTreeSet::new();
+        let mut read = RelocationsRead::default();
         for (idx, sh) in self.shdrs.iter().enumerate() {
             let rela = match sh.sh_type {
                 SHT_RELA => true,
@@ -4093,8 +4165,7 @@ impl<'a> Elf<'a> {
                 trunc.push(Truncation::unread(
                     ElfTable::Relocations,
                     format!(
-                        "{label}: sh_info {} is past the section-header table, so the section \
-                         its entries patch is unknown and they were not read",
+                        "{label}: sh_info {} is past the section-header table",
                         sh.sh_info
                     ),
                 ));
@@ -4113,7 +4184,13 @@ impl<'a> Elf<'a> {
             };
             match names {
                 Ok(tables) => {
-                    self.code_relocation_entries(sh, step, &tables, &mut stop, &mut found);
+                    self.code_relocation_entries(
+                        sh,
+                        step,
+                        &tables,
+                        &mut stop,
+                        (&mut found, &mut read),
+                    );
                 }
                 Err(why) => stop(why),
             }
@@ -4127,19 +4204,13 @@ impl<'a> Elf<'a> {
         &self,
         sh: &Shdr,
         trunc: &mut Vec<Truncation>,
-    ) -> std::result::Result<RelocationNames<'_>, String> {
+    ) -> Result<RelocationNames<'_>, String> {
         let link = usize::try_from(sh.sh_link).unwrap_or(usize::MAX);
         let symtab = self
             .shdrs
             .get(link)
             .filter(|s| s.sh_type == SHT_SYMTAB || s.sh_type == SHT_DYNSYM)
-            .ok_or_else(|| {
-                format!(
-                    "sh_link {} does not name a symbol table, so no entry's symbol can be \
-                     named",
-                    sh.sh_link
-                )
-            })?;
+            .ok_or_else(|| format!("sh_link {} does not name a symbol table", sh.sh_link))?;
         let strtab = self
             .shdrs
             .get(usize::try_from(symtab.sh_link).unwrap_or(usize::MAX))
@@ -4147,8 +4218,7 @@ impl<'a> Elf<'a> {
             .filter(|s| self.cur.slice(s.sh_offset, s.sh_size).is_ok())
             .ok_or_else(|| {
                 format!(
-                    "its symbol table's sh_link {} names no string table the file holds, \
-                     so no entry's symbol can be named",
+                    "its symbol table's sh_link {} names no string table the file holds",
                     symtab.sh_link
                 )
             })?;
@@ -4170,19 +4240,22 @@ impl<'a> Elf<'a> {
         step: NonZeroU64,
         names: &RelocationNames<'_>,
         stop: &mut dyn FnMut(String),
-        found: &mut BTreeSet<String>,
+        (found, read): (&mut BTreeSet<String>, &mut RelocationsRead),
     ) {
         let (count, partial) = (sh.sh_size / step, sh.sh_size % step);
         let step = step.get();
         if partial != 0 {
             stop(format!(
-                "sh_size {:#x} is {count} whole {step}-byte entries and a partial one, \
-                 which was not read",
+                "sh_size {:#x} is {count} whole {step}-byte entries and a partial one",
                 sh.sh_size
             ));
         }
         let (symtab, strtab, sym_count) = (names.symtab, names.strtab, names.sym_count);
         for i in 0..count {
+            if let Err(spent) = self.step() {
+                stop(format!("not read past entry {i} of {count}: {spent}"));
+                return;
+            }
             let base = sh.sh_offset.saturating_add(i.saturating_mul(step));
             let info = if self.elf64 {
                 self.cur.u64_at(base.saturating_add(8))
@@ -4203,68 +4276,106 @@ impl<'a> Elf<'a> {
             }
             if sym >= sym_count {
                 stop(format!(
-                    "entry {i} of {count} names symbol {sym}, past its symbol table of \
-                     {sym_count}, so the entries from it on were not read"
+                    "entry {i} of {count} names symbol {sym}, past its symbol table of {sym_count}"
                 ));
                 return;
             }
             let at = symtab
                 .sh_offset
                 .saturating_add(sym.saturating_mul(names.sym_step));
-            let Ok(name_off) = self.cur.u32_at(at) else {
-                stop(format!(
-                    "entry {i} of {count} names symbol {sym}, which the file does not hold"
-                ));
-                return;
-            };
-            if u64::from(name_off) >= strtab.sh_size {
-                stop(format!(
-                    "entry {i} of {count} names symbol {sym}, whose name offset \
-                     {name_off:#x} is past its {:#x}-byte string table",
-                    strtab.sh_size
-                ));
-                return;
+            let kind = u32::try_from(kind).unwrap_or(u32::MAX);
+            // The string table's size is in the key with its offset: it bounds the name and
+            // decides the stop for an offset past it, so two headers over one table at two
+            // sizes name a symbol two ways.
+            let key = (at, strtab.sh_offset, strtab.sh_size);
+            if read.listed.contains(&(kind, key)) {
+                continue;
             }
-            let mut name = self.cur.cstr_at(strtab.sh_offset, name_off, strtab.sh_size);
-            if name.is_empty() {
-                match self.section_symbol_label(at) {
-                    Ok(Some(label)) => name = label,
-                    Ok(None) => continue,
+            if let std::collections::btree_map::Entry::Vacant(slot) = read.names.entry(key) {
+                match self.relocation_symbol(at, strtab, (i, count, sym)) {
+                    Ok(named) => slot.insert(named),
                     Err(why) => {
-                        stop(format!("entry {i} of {count} names symbol {sym}, {why}"));
+                        stop(why);
                         return;
                     }
-                }
+                };
             }
-            // st_other's low two bits; a section symbol is local and carries none.
-            let other_at = at.saturating_add(if self.elf64 { 5 } else { 13 });
-            let Ok([other]) = self.cur.slice(other_at, 1) else {
-                stop(format!(
-                    "entry {i} of {count} names symbol {sym}, whose st_other the file does \
-                     not hold"
-                ));
-                return;
+            let Some(Some((name, visibility))) = read.names.get(&key) else {
+                continue;
             };
-            let visibility = other & 0x3;
-            let kind = u32::try_from(kind).unwrap_or(u32::MAX);
-            let kind = reloc_type_name(self.e_machine, kind);
-            found.insert(match visibility_label(visibility) {
-                Some(vis) if !name.starts_with('[') => format!("{kind} {name} {vis}"),
-                _ => format!("{kind} {name}"),
-            });
+            if let Err(spent) = self.list_relocation(found, kind, name, *visibility) {
+                stop(format!("not read past entry {i} of {count}: {spent}"));
+                return;
+            }
+            read.listed.insert((kind, key));
         }
+    }
+
+    /// The name and visibility a relocation lists for the symbol whose entry is at `at`,
+    /// `None` for an unnamed symbol that names nothing, or the sentence that stops the walk.
+    fn relocation_symbol(
+        &self,
+        at: u64,
+        strtab: &Shdr,
+        (i, count, sym): (u64, u64, u64),
+    ) -> Result<Option<(String, u8)>, String> {
+        let Ok(name_off) = self.cur.u32_at(at) else {
+            return Err(format!("entry {i} of {count} names symbol {sym}"));
+        };
+        if u64::from(name_off) >= strtab.sh_size {
+            return Err(format!(
+                "entry {i} of {count} names symbol {sym}, whose name offset {name_off:#x} is \
+                 past its {:#x}-byte string table",
+                strtab.sh_size
+            ));
+        }
+        let mut name = self
+            .name_at(strtab.sh_offset, name_off, strtab.sh_size)
+            .map_err(|fault| {
+                format!(
+                    "entry {i} of {count} names symbol {sym}, whose name was not read, and \
+                     neither were the entries after it: {fault}"
+                )
+            })?;
+        if name.is_empty() {
+            match self.section_symbol_label(at) {
+                Ok(Some(label)) => name = label,
+                Ok(None) => return Ok(None),
+                Err(why) => return Err(format!("entry {i} of {count} names symbol {sym}, {why}")),
+            }
+        }
+        // st_other's low two bits; a section symbol is local and carries none.
+        let other_at = at.saturating_add(if self.elf64 { 5 } else { 13 });
+        let Ok([other]) = self.cur.slice(other_at, 1) else {
+            return Err(format!("entry {i} of {count} names symbol {sym}"));
+        };
+        Ok(Some((name, other & 0x3)))
+    }
+
+    /// One `code_relocations` entry, charged its length: each kind of relocation through
+    /// each symbol is listed once, so a name is copied once per kind, not once per entry.
+    fn list_relocation(
+        &self,
+        found: &mut BTreeSet<String>,
+        kind: u32,
+        name: &str,
+        visibility: u8,
+    ) -> Result<(), Spent> {
+        self.budget
+            .spend(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
+        let kind = reloc_type_name(self.e_machine, kind);
+        found.insert(match visibility_label(visibility) {
+            Some(vis) if !name.starts_with('[') => format!("{kind} {name} {vis}"),
+            _ => format!("{kind} {name}"),
+        });
+        Ok(())
     }
 
     /// The label a relocation through the unnamed symbol at `at` is listed under: for a
     /// section symbol, `[` the name of the section it stands for `]`, or `[section N]`
     /// where that section has no name the reader holds; `None` for an unnamed symbol of
     /// any other type, which names nothing. `Err` says which byte the file does not hold.
-    ///
-    /// Bracketed so it never reads as a symbol: a reference to a local or section-anchored
-    /// object goes through its section's symbol, and an `indeterminate` cell of a check
-    /// keyed on a symbol then shows `R_AARCH64_ADR_PREL_PG_HI21 [.data]` rather than
-    /// nothing, which tells "reached through `.data`" from "not referenced".
-    fn section_symbol_label(&self, at: u64) -> std::result::Result<Option<String>, String> {
+    fn section_symbol_label(&self, at: u64) -> Result<Option<String>, String> {
         // st_info and st_shndx sit at different offsets in the two widths.
         let (info_at, shndx_at) = if self.elf64 { (4, 6) } else { (12, 14) };
         let info = match self.cur.slice(at.saturating_add(info_at), 1) {
@@ -4286,9 +4397,17 @@ impl<'a> Elf<'a> {
         ))
     }
 
-    /// One symbol-table entry's name, type, section index, value and size. The name is
-    /// read through `strtab` and cut at its first `@`, as [`Self::symbols`] cuts it.
-    fn symbol_at(&self, sh: &Shdr, strtab: &Shdr, step: u64, i: u64) -> Read<SymbolEntry> {
+    /// One `SHT_SYMTAB` entry's name, type, section index, value and size, or why not: the
+    /// file does not hold the entry, or its name was not read ([`Self::name_at`]). The name is
+    /// read through `strtab` and cut at its first `@`, as [`Self::symbols`] cuts a `.symtab`
+    /// name ([`Spelling::Versioned`]).
+    fn symbol_at(
+        &self,
+        sh: &Shdr,
+        strtab: &Shdr,
+        step: u64,
+        i: u64,
+    ) -> Result<SymbolEntry, EntryStop> {
         let base = sh.sh_offset.saturating_add(i.saturating_mul(step));
         let (info_at, shndx_at, value_at, size_at) = if self.elf64 {
             (4, 6, 8, 16)
@@ -4308,9 +4427,8 @@ impl<'a> Elf<'a> {
             .addr_at(base.saturating_add(value_at), self.elf64)?;
         let size = self.cur.addr_at(base.saturating_add(size_at), self.elf64)?;
         let name = if u64::from(name_off) < strtab.sh_size {
-            let raw = self.cur.cstr_at(strtab.sh_offset, name_off, strtab.sh_size);
-            // The `@` cut of `read_symbols`, and the same assumption:
-            // `dynamic-symbol-names-carry-no-version` in `report::ASSUMPTIONS`.
+            let raw = self.name_at(strtab.sh_offset, name_off, strtab.sh_size)?;
+            // The `@` cut of `read_symbols` for `.symtab`: this reads that table alone.
             match raw.split_once('@') {
                 Some((bare, _)) => bare.to_owned(),
                 None => raw,
@@ -4328,13 +4446,6 @@ impl<'a> Elf<'a> {
     }
 
     /// Every entry of one symbol table, or `None` where the table cannot be read whole.
-    ///
-    /// Each way this returns `None` is a stop [`Self::symbols`] records against
-    /// [`ElfTable::Symbols`] over the same table, so the reason is in the facts already
-    /// and is not recorded twice; the sentences go to a scratch list here only to learn
-    /// whether there were any, and an entry that cannot be read is the stop `symbols`
-    /// records at the same index. A partial table is not used, since it would leave a
-    /// function out and read it as one with no references.
     fn symbol_table_entries(&self, idx: usize) -> Option<Vec<SymbolEntry>> {
         let sh = self.shdrs.get(idx)?;
         let mut scratch = Vec::new();
@@ -4342,6 +4453,10 @@ impl<'a> Elf<'a> {
         let strtab = self.symbol_strtab(sh, "", &mut scratch)?;
         let mut entries = Vec::new();
         for i in 0..count {
+            // A spent budget is named by the caller, which reads it from the budget.
+            if self.step().is_err() {
+                return None;
+            }
             let Ok(entry) = self.symbol_at(sh, strtab, step, i) else {
                 return None;
             };
@@ -4394,11 +4509,6 @@ impl<'a> Elf<'a> {
 
     /// The per-function relocation targets of a relocatable object; see
     /// [`ElfFacts::function_references`].
-    ///
-    /// The work is linear in the relocations and the functions but for overlapping
-    /// function ranges, which a compiler emits only for aliases: each section's ranges are
-    /// sorted by start beside a running maximum of their ends, so the search for the
-    /// ranges holding an offset stops at the first range no earlier one can reach past.
     fn function_references(&self, trunc: &mut Vec<Truncation>) -> Option<Vec<String>> {
         if self.e_type != ET_REL || (self.elf64 && self.e_machine == EM_MIPS) {
             return None;
@@ -4406,26 +4516,30 @@ impl<'a> Elf<'a> {
         let symtab_idx = self.shdrs.iter().position(|s| s.sh_type == SHT_SYMTAB)?;
         // The walk reads every field of every entry, where the symbol reader reads a name,
         // a type and a section, so a table cut inside the last entries' values or sizes
-        // stops this walk alone. Returned as `None` with nothing recorded, that moved the
-        // field to absent unannounced, found 2026-10-07 by `tests/elf_truncations.rs`'s
-        // `every_fact_a_cut_changes_is_covered_by_a_recorded_truncation` once a longer
-        // watch list changed what its seeded objects hold.
+        // stops this walk alone, and it records its own stop: `None` with nothing recorded
+        // would move the field to absent unannounced.
         let Some(symbols) = self.symbol_table_entries(symtab_idx) else {
             if !trunc
                 .iter()
                 .any(|t| t.table == ElfTable::Symbols && t.kind == TruncationKind::Unread)
             {
+                let why = self.budget.exhausted().map_or_else(
+                    || "an entry's value or size could not be read".to_owned(),
+                    |spent| spent.to_string(),
+                );
                 trunc.push(Truncation::unread(
                     ElfTable::Symbols,
-                    "SHT_SYMTAB: an entry's value or size could not be read, so no \
-                     function's range is known and no reference was attributed"
-                        .to_owned(),
+                    format!(
+                        "SHT_SYMTAB: {why}, so no function's range is known and no reference \
+                         was attributed"
+                    ),
                 ));
             }
             return None;
         };
         let (mut functions, ranges) = Self::function_ranges(&symbols);
         let mut unattributed = BTreeSet::new();
+        let mut seen = Attributed::default();
         for (idx, sh) in self.shdrs.iter().enumerate() {
             if sh.sh_type == SHT_RELA || sh.sh_type == SHT_REL {
                 self.attribute_relocations(
@@ -4434,7 +4548,7 @@ impl<'a> Elf<'a> {
                     symtab_idx,
                     &symbols,
                     &ranges,
-                    (&mut functions, &mut unattributed),
+                    (&mut functions, &mut unattributed, &mut seen),
                     trunc,
                 );
             } else if self.undecoded_relocations(sh, &ranges) {
@@ -4446,9 +4560,7 @@ impl<'a> Elf<'a> {
                 trunc.push(Truncation::unread(
                     ElfTable::Relocations,
                     format!(
-                        "{label}: type {:#x} carries relocations against a section holding \
-                         functions or code in an encoding this reader does not decode, so its \
-                         references were not read",
+                        "{label}: type {:#x} carries relocations against a section holding functions or code in an encoding this reader does not decode",
                         sh.sh_type
                     ),
                 ));
@@ -4469,25 +4581,8 @@ impl<'a> Elf<'a> {
 
     /// A section that is neither `SHT_REL` nor `SHT_RELA` and still holds relocations
     /// against a section with functions in it or a section of code: its `sh_info` names
-    /// such a section, and it
-    /// is `SHT_CREL` or carries `SHF_INFO_LINK`, which makes `sh_info` a section index.
-    ///
-    /// Skipped without a word, such a section left every function it covers listed with no
-    /// references, which `ssp-level-emitted` read as no canary: measured 2026-10-02 with
-    /// clang 22.1.8 on Fedora 44 x86_64 under `-fstack-protector-strong -Wa,--crel,
-    /// --allow-experimental-crel`, whose canaries sat in a `.crel.text` of type
-    /// `0x40000014`. The relocation sections are recorded unread instead, so the reading
-    /// is withheld. A type the reader has never seen is named by the flag rather than by
-    /// its number, so the next encoding a toolchain adopts withholds the same way; a
-    /// section whose target holds no function and is not code (`.crel.eh_frame`) holds
-    /// nothing this field reads.
-    ///
-    /// A target that is code and holds no function counts. clang's
-    /// `-fbasic-block-sections=all` puts a function's canary failure call in a section
-    /// whose only symbol is a `NOTYPE` `<fn>.__part.N` (measured with clang 22.1.8 on
-    /// Fedora 44 x86_64), and [`Self::attribute_relocations`] reads such a section's
-    /// references as unattributed; in an encoding it does not decode, the section is
-    /// recorded unread for the same reason.
+    /// such a section, and it is `SHT_CREL` or carries `SHF_INFO_LINK`, which makes `sh_info`
+    /// a section index.
     fn undecoded_relocations(&self, sh: &Shdr, ranges: &SectionRanges) -> bool {
         let into_functions = u16::try_from(sh.sh_info).is_ok_and(|t| ranges.contains_key(&t));
         (into_functions || self.relocates_code(sh))
@@ -4506,24 +4601,7 @@ impl<'a> Elf<'a> {
 
     /// One relocation section's references, added to the functions whose ranges hold them,
     /// and to `unattributed` where the section relocates code no function's range holds.
-    ///
-    /// A target section that is code (`SHF_EXECINSTR`) and holds no function symbol, or an
-    /// offset in code that falls outside every function's range, is code the reader cannot
-    /// place in a function. Skipped, its references left the function they belong to
-    /// reading as one without them: measured 2026-10-02 with clang 22.1.8 on Fedora 44
-    /// x86_64 under `-O2 -fstack-protector-strong -fbasic-block-sections=all`, each
-    /// canaried function's `__stack_chk_fail` call sat in a section of its own whose only
-    /// symbol is a `NOTYPE` `<fn>.__part.N`, the calls `ssp_use` and `ssp_escape` stayed in
-    /// the function's own range, and `ssp-level-emitted` published `off`. clang's
-    /// `-fsplit-machine-functions` with a profile (`-fprofile-instr-use`) did the same the
-    /// same day, its fragments in `.text.split.<fn>` under a `NOTYPE` `<fn>.cold`, which the
-    /// predicate's `.cold` reading does not reach since only `STT_FUNC` symbols get a range.
-    /// Recorded under [`UNATTRIBUTED_REFERENCE`] instead, which the predicate withholds over when the name
-    /// is a canary target. The `__part` symbols are not attributed to the function their
-    /// name begins with: that would read a level off a naming convention, where withholding
-    /// reads nothing. A target that is not code (`.eh_frame`, debug sections) holds no
-    /// reference this field reads.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "the walk's own state, threaded rather than bundled into a struct used once"
     )]
@@ -4534,7 +4612,11 @@ impl<'a> Elf<'a> {
         symtab_idx: usize,
         symbols: &'s [SymbolEntry],
         ranges: &SectionRanges,
-        (functions, unattributed): (&mut [FunctionRefs<'s>], &mut BTreeSet<&'s str>),
+        (functions, unattributed, seen): (
+            &mut [FunctionRefs<'s>],
+            &mut BTreeSet<&'s str>,
+            &mut Attributed,
+        ),
         trunc: &mut Vec<Truncation>,
     ) {
         let label = self.relocation_label(idx);
@@ -4550,13 +4632,12 @@ impl<'a> Elf<'a> {
         }
         // Checked after the target, so that a section this field does not read (debug
         // information, `.eh_frame`) records nothing against `ElfTable::Relocations`, whose
-        // scope `code_relocations` shares (2026-10-02).
+        // scope `code_relocations` shares.
         if usize::try_from(sh.sh_link) != Ok(symtab_idx) {
             trunc.push(Truncation::unread(
                 ElfTable::Relocations,
                 format!(
-                    "{label}: sh_link {} does not name the symbol table at [{symtab_idx}], \
-                     so its references cannot be named",
+                    "{label}: sh_link {} does not name the symbol table at [{symtab_idx}]",
                     sh.sh_link
                 ),
             ));
@@ -4576,14 +4657,17 @@ impl<'a> Elf<'a> {
             trunc.push(Truncation::unread(
                 ElfTable::Relocations,
                 format!(
-                    "{label}: {:#x} bytes at {:#x} are not {count} whole {step}-byte entries \
-                     inside the file, so its references were not read",
+                    "{label}: {:#x} bytes at {:#x} are not {count} whole {step}-byte entries inside the file",
                     sh.sh_size, sh.sh_offset
                 ),
             ));
             return;
         }
+        let at = |i: u64| format!("{label}: not read past entry {i} of {count}");
         for i in 0..count {
+            if self.out_of_budget(ElfTable::Relocations, trunc, || at(i)) {
+                return;
+            }
             let base = sh.sh_offset.saturating_add(i.saturating_mul(step));
             let (offset, info) = match (
                 self.cur.addr_at(base, self.elf64),
@@ -4606,8 +4690,7 @@ impl<'a> Elf<'a> {
                 trunc.push(Truncation::unread(
                     ElfTable::Relocations,
                     format!(
-                        "{label}: entry {i} of {count} names symbol {sym_idx}, past the \
-                         {}-entry symbol table, so the entries from it on were not read",
+                        "{label}: entry {i} of {count} names symbol {sym_idx}, past the {}-entry symbol table",
                         symbols.len()
                     ),
                 ));
@@ -4616,63 +4699,71 @@ impl<'a> Elf<'a> {
             if sym.name.is_empty() {
                 continue;
             }
-            let upto = list.partition_point(|&(start, _, _)| start <= offset);
-            let mut placed = false;
-            for k in (0..upto).rev() {
-                if reach.get(k).is_none_or(|&r| r <= offset) {
-                    break;
+            let Some(placed) = self.place_reference(
+                offset,
+                (list, reach),
+                (sym.name.as_str(), sym_idx, &mut *functions, &mut seen.pairs),
+                trunc,
+                &|| at(i),
+            ) else {
+                return;
+            };
+            if !placed && code && seen.unattributed.insert(sym_idx) {
+                let units = sym.name.len();
+                if self.out_of_budget_for(units, ElfTable::Relocations, trunc, || at(i)) {
+                    return;
                 }
-                if let Some(&(_, end, f)) = list.get(k)
-                    && offset < end
-                    && let Some((_, refs)) = functions.get_mut(f)
-                {
-                    refs.insert(sym.name.as_str());
-                    placed = true;
-                }
-            }
-            if !placed && code {
                 unattributed.insert(sym.name.as_str());
             }
         }
     }
 
+    /// Attribute a relocation at `offset` through `name` to every function whose range holds
+    /// it: whether one did, or `None` where the budget ran out, recorded at the place `at`
+    /// names.
+    fn place_reference<'s>(
+        &self,
+        offset: u64,
+        (list, reach): (&[(u64, u64, usize)], &[u64]),
+        (name, symbol, functions, pairs): (
+            &'s str,
+            u64,
+            &mut [FunctionRefs<'s>],
+            &mut BTreeSet<(usize, u64)>,
+        ),
+        trunc: &mut Vec<Truncation>,
+        at: &dyn Fn() -> String,
+    ) -> Option<bool> {
+        let upto = list.partition_point(|&(start, _, _)| start <= offset);
+        let mut placed = false;
+        for k in (0..upto).rev() {
+            if reach.get(k).is_none_or(|&r| r <= offset) {
+                break;
+            }
+            if self.out_of_budget(ElfTable::Relocations, trunc, at) {
+                return None;
+            }
+            if let Some(&(_, end, f)) = list.get(k)
+                && offset < end
+                && let Some((function, refs)) = functions.get_mut(f)
+            {
+                // A pair is found by the function's and the symbol's index, not by comparing
+                // names, which share a prefix as long as a crafted file makes them.
+                if pairs.insert((f, symbol)) {
+                    let units = function.len().saturating_add(name.len());
+                    if self.out_of_budget_for(units, ElfTable::Relocations, trunc, at) {
+                        return None;
+                    }
+                    refs.insert(name);
+                }
+                placed = true;
+            }
+        }
+        Some(placed)
+    }
+
     /// The `PT_GNU_STACK` header the loader acts on, the last, with an `unread`
     /// [`ElfTable::GnuStack`] entry in `trunc` where two disagree on `PF_X`.
-    ///
-    /// The loaders take the last header, not the first.
-    /// Linux's `load_elf_binary` (`fs/binfmt_elf.c`) walks every program header and sets
-    /// `executable_stack` at each `PT_GNU_STACK` without leaving the loop; glibc assigns
-    /// `stack_flags` the same way in the main program's walk in `rtld.c` and in
-    /// `_dl_map_object_from_fd` for each shared object; `FreeBSD`'s `imgact_elf.c` sets
-    /// `stack_prot` per header in its loop. That is a reading of the sources, not a
-    /// measurement, and OpenBSD's handling was not read. Linux's was measured, 2026-10-05 on Fedora 44
-    /// x86_64, kernel 7.3, glibc 2.43: a gcc 16.1.1 `-O2` executable printing its own
-    /// `[stack]` mapping, with one other program header retyped by hand to a `PT_GNU_STACK`
-    /// carrying `PF_X`, mapped the stack `rwxp` with that header after the linker's `RW` one
-    /// and `rw-p` with it before. Over such a pair the first is the opposite of what Linux
-    /// does with the file.
-    ///
-    /// Two headers that agree read normally: whichever a loader takes, it takes the same
-    /// `PF_X`. Two that disagree are withheld rather than read as the last, for three
-    /// reasons. The loaders' agreement on the last rests on the reading above, and one that
-    /// took the first would turn a read-the-last verdict into the clean-looking wrong
-    /// reading this project cannot tolerate. No linker chard has measured writes two, so a
-    /// pair arrives from a hand edit, a linker script's `PHDRS` or a hostile file, and a
-    /// verdict over it says nothing about the flag under test. And withholding costs no
-    /// reading on any toolchain output measured. The published facts still carry the last
-    /// header, so the fact store states what Linux acts on and agrees with `readelf`'s last
-    /// row; the entry is what keeps a check from concluding from them.
-    ///
-    /// Only `PF_X` is compared, since it is the one bit a fact here carries; `FreeBSD` maps
-    /// the read and write bits too, and a pair that differs only there changes nothing
-    /// published. The gate's unit is the table, and the entry names [`ElfTable::GnuStack`],
-    /// which only the checks reading the stack header declare (`noexecstack` and
-    /// `linker-default-noexecstack`, the two over this predicate), so `pie`, `relro` and
-    /// `textrel-absent` read over the pair. Each of those reads a fact the pair does not
-    /// touch, `PT_INTERP`, `PT_GNU_RELRO` and the dynamic section, whose readings no loader
-    /// choice between the two headers changes; withholding them would say nothing about
-    /// the stack and cost three readings. A program-header table `parse` refuses withholds
-    /// every check, through `elf_error`.
     fn gnu_stack(&self, trunc: &mut Vec<Truncation>) -> Option<&Phdr> {
         let stacks: Vec<(usize, &Phdr)> = self
             .phdrs
@@ -4690,10 +4781,7 @@ impl<'a> Elf<'a> {
             trunc.push(Truncation::unread(
                 ElfTable::GnuStack,
                 format!(
-                    "{} PT_GNU_STACK headers disagree on PF_X (program headers {}, PF_X at \
-                     {}); a loader that takes the last and one that takes the first \
-                     would give the stack different permissions, so whether it is executable \
-                     was not read",
+                    "{} PT_GNU_STACK headers disagree on PF_X (program headers {}, PF_X at {})",
                     stacks.len(),
                     at.join(", "),
                     executable.join(", ")
@@ -4703,14 +4791,18 @@ impl<'a> Elf<'a> {
         stacks.last().map(|&(_, p)| p)
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
-        reason = "one struct literal, a field to a line, with the reads each field needs \
-                  above it; split, the fields would be filled away from the struct they belong \
-                  to"
+        reason = "one struct literal, a field to a line"
     )]
     pub fn facts(&self) -> ElfFacts {
+        // Each reading spends from where the parse left the budget, so two readings of one
+        // `Elf` are the same reading.
+        self.budget.restart();
         let mut truncations = self.structural_truncations();
+        // Before every other walk: an honest artifact large enough to spend the budget
+        // elsewhere must still be told from one that carries no witness.
+        let run_witness = self.run_witness(&mut truncations);
         let dyn_entries = self.dynamic(&mut truncations);
         let tags: BTreeSet<i64> = dyn_entries.iter().map(|(t, _)| *t).collect();
         // The last entry of a repeated tag, as `ld.so` stores it (`LOADER_SINGLE_TAGS`).
@@ -4725,15 +4817,31 @@ impl<'a> Elf<'a> {
 
         let props = self.gnu_properties(&mut truncations);
         let x86 = self.feature_word(&props, GNU_PROPERTY_X86_FEATURE_1_AND);
-        let arm = self.feature_word(&props, GNU_PROPERTY_AARCH64_FEATURE_1_AND);
+        let noted = self.feature_word(&props, GNU_PROPERTY_AARCH64_FEATURE_1_AND);
+        // An unlinked aarch64 object with no property note is marked by its build attributes
+        // (`aarch64_attribute_word`, none on a linked object).
+        let arm = match self.aarch64_attribute_word(&mut truncations) {
+            None => noted,
+            Some(stated) if !props.contains_key(&GNU_PROPERTY_AARCH64_FEATURE_1_AND) => stated,
+            Some(stated) => {
+                let bits = AARCH64_FEATURE_1_BTI | AARCH64_FEATURE_1_PAC | AARCH64_FEATURE_1_GCS;
+                if stated & bits != noted & bits {
+                    truncations.push(Truncation::unread(
+                        ElfTable::Notes,
+                        format!(
+                            "the property note's aarch64 feature word {noted:#x} and the build attributes' {stated:#x} disagree"
+                        ),
+                    ));
+                }
+                noted & stated
+            }
+        };
 
         let has_interp = self.phdrs.iter().any(|p| p.p_type == PT_INTERP);
         let has_dynamic = !dyn_entries.is_empty();
         let kind = link_kind(self.e_type, has_interp, &tags, flags1);
         let flat = kind.map(LinkKind::flatten);
-        // Each of these is a fact about a linked object, so each is `None` where there is
-        // no linked object to be a fact about. `Option::map` on the kind is what makes
-        // that hold for every field at once.
+        // Each is a fact about a linked object, so each is `None` where there is none.
         let linked = |fact: bool| kind.map(|_| fact);
         let gnu_stack = self.gnu_stack(&mut truncations);
         let gnu_relro = self.phdrs.iter().any(|p| p.p_type == PT_GNU_RELRO);
@@ -4778,14 +4886,15 @@ impl<'a> Elf<'a> {
             bind_now: linked(bind_now),
             gnu_stack_present: linked(gnu_stack.is_some()),
             gnu_stack_executable: linked(gnu_stack.is_some_and(|p| p.p_flags & PF_X != 0)),
+            rwx_segment: linked(self.phdrs.iter().any(|p| {
+                (p.p_type == PT_LOAD || p.p_type == PT_TLS)
+                    && p.p_flags & PF_W != 0
+                    && p.p_flags & PF_X != 0
+            })),
             df_1_noopen: flags1 & DF_1_NOOPEN != 0,
-            // Two spellings, like `bind_now` three lines of this struct away, and for
-            // the same reason: bfd emits `DT_FLAGS` only when `info->flags` is non-zero,
-            // so a spec-conformant link may record a text relocation solely as the
-            // standalone `DT_TEXTREL` entry. Reading only the flag word answered `false`
-            // there — a reassuring absence on a check whose polarity makes absence the
-            // good news. The reader's own synthetic fixtures carried `DT_FLAGS`, so they
-            // mirrored the blind spot rather than exposing it.
+            // Two spellings, like `bind_now`: bfd emits `DT_FLAGS` only when `info->flags`
+            // is non-zero, so a link may record a text relocation solely as the standalone
+            // `DT_TEXTREL` entry, where the flag word alone would read a reassuring `false`.
             textrel: flags & DF_TEXTREL != 0 || dyn_value(DT_TEXTREL).is_some(),
             dt_relr: tags.contains(&DT_RELR),
             dt_debug: tags.contains(&DT_DEBUG),
@@ -4820,6 +4929,7 @@ impl<'a> Elf<'a> {
             symbol_tables,
             symbol_count: symbols.len(),
             watched_symbols: watched,
+            run_witness,
             self_report: self.section_text(SELF_REPORT_SECTION, &mut truncations),
             recorded_command_line: self.section_text(".GCC.command.line", &mut truncations),
             comment: self.section_lines(COMMENT_SECTION, &mut truncations),
@@ -4829,6 +4939,18 @@ impl<'a> Elf<'a> {
             truncations: once_each_stride_record(truncations),
         }
     }
+}
+
+/// `bytes` as lowercase hex, two digits a byte: how a run witness is spelled
+/// ([`ElfFacts::run_witness`], `compile::RunWitness::nonce_hex`).
+#[must_use]
+pub fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        // Writing to a `String` does not fail.
+        crate::error::best_effort(write!(out, "{byte:02x}"));
+        out
+    })
 }
 
 /// The entries of `symbols` that [`WATCHED_SYMBOLS`] names.
@@ -4841,37 +4963,27 @@ fn watched_of(symbols: &BTreeMap<String, SymbolFact>) -> BTreeMap<String, Symbol
 }
 
 /// Largest object this reader will hold in memory: 512 mebibytes.
-///
-/// The whole file is slurped, which is right for what chard builds — probe binaries are
-/// kilobytes — and wrong for whatever a caller points `chard elf` at, which is not
-/// chard's to trust. Nothing before this cap looks past the four magic bytes, so any file
-/// at all can claim to be an object: a sparse file occupying four kibibytes on disk drove
-/// peak resident memory to four gibibytes.
-///
-/// The cap is far above any real linked object — the largest on a typical distribution
-/// image is a debug-heavy shared library in the low hundreds of megabytes — and far below
-/// what would exhaust a build machine. An object above it is reported as unparseable
-/// rather than skipped silently, so it stays visible instead of thinning a denominator.
 const MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Read `path` and extract facts. The whole file is slurped because probe
-/// binaries are kilobytes and holding them lets the parser hand out borrowed
-/// slices without a second read.
-///
-/// A regular file is held to `MAX_OBJECT_BYTES` from its metadata, before the open. A
-/// FIFO is read too, since a pipe can carry an object (`chard elf <(...)`, `chard elf
-/// /dev/stdin` behind a pipe) and refusing the shape refused the bytes with it; its
-/// `len()` is 0, so the cap is held on the bytes as they arrive by `read_under_cap`. A
-/// directory, a device or a socket is refused from the metadata: none carries an object,
-/// and a `read` on a device or a socket answers with an errno the envelope can only
-/// report as chard's own. An `open` on a FIFO with no writer blocks, as it does for
-/// `readelf -h` and for `chard table`.
+/// Read `path` and extract facts. The whole file is held, so the parser hands out
+/// borrowed slices without a second read.
 ///
 /// # Errors
 ///
 /// Errors when the file cannot be read, is a directory, a device or a socket, holds more
 /// than `MAX_OBJECT_BYTES`, or is not a parseable ELF object.
 pub fn facts_for(path: &Path) -> Result<ElfFacts, ElfError> {
+    facts_from(path, &read_object(path)?)
+}
+
+/// The bytes `facts_for` reads from `path`: the same metadata refusals, the same size cap and
+/// one `open`.
+///
+/// # Errors
+///
+/// Errors when the file cannot be read, is a directory, a device or a socket, or holds more
+/// than `MAX_OBJECT_BYTES`.
+pub fn read_object(path: &Path) -> Result<Vec<u8>, ElfError> {
     use std::os::unix::fs::FileTypeExt as _;
     let io = |op: &'static str| {
         move |source: std::io::Error| ElfError::Io {
@@ -4892,8 +5004,7 @@ pub fn facts_for(path: &Path) -> Result<ElfFacts, ElfError> {
         });
     }
     // Size checked before reading where the metadata carries it: the point is not to
-    // hold it. The bounded read below holds the same cap on a stream, and on a file that
-    // grew between this stat and the read.
+    // hold it.
     if kind.is_file() && meta.len() > MAX_OBJECT_BYTES {
         return Err(ElfError::TooLarge {
             path: path.to_path_buf(),
@@ -4902,25 +5013,28 @@ pub fn facts_for(path: &Path) -> Result<ElfFacts, ElfError> {
         });
     }
     let file = std::fs::File::open(path).map_err(io("opening"))?;
-    let data = read_under_cap(file, MAX_OBJECT_BYTES)
+    read_under_cap(file, MAX_OBJECT_BYTES)
         .map_err(io("reading"))?
         .ok_or_else(|| ElfError::TooLarge {
             path: path.to_path_buf(),
             size: None,
             cap: MAX_OBJECT_BYTES,
-        })?;
-    Ok(Elf::parse(&data)
+        })
+}
+
+/// The facts of `data`, the bytes [`read_object`] read from `path`.
+///
+/// # Errors
+///
+/// Errors when `data` is not a parseable ELF object.
+pub fn facts_from(path: &Path, data: &[u8]) -> Result<ElfFacts, ElfError> {
+    Ok(Elf::parse(data)
         .map_err(|refusal| refusal.with_path(path))?
         .facts())
 }
 
 /// Read `source` to its end, holding at most `cap` bytes: the bytes when the stream
 /// ended within the cap, `None` when it went past it.
-///
-/// The reader takes `cap + 1` bytes and stops, so the most it ever holds is one byte over
-/// the cap, and that byte is what tells a stream that filled the cap exactly from one
-/// that went past it. This is the cap for a source whose length the metadata cannot
-/// report; a regular file's is checked from its `len()` before the open.
 fn read_under_cap(source: impl std::io::Read, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
     let mut data = Vec::new();
@@ -4929,10 +5043,8 @@ fn read_under_cap(source: impl std::io::Read, cap: u64) -> std::io::Result<Optio
     Ok(within.then_some(data))
 }
 
-// Kani proofs live in `proofs/`, gated on `cfg(kani)` and `#[path]`-included here rather
-// than from the crate root, so they reach `Cursor`'s private fields as a child module and
-// nothing has to be widened to `pub(crate)` for a proof to see it. Invisible to normal
-// builds, tests and clippy. Run with `make kani`.
+// Kani proofs live in `proofs/`, included here under `cfg(kani)` rather than from the crate
+// root so they reach `Cursor`'s private fields as a child module.
 #[cfg(kani)]
 #[path = "../proofs/cursor_reads_total.rs"]
 mod cursor_proofs;
@@ -4941,15 +5053,12 @@ mod cursor_proofs;
 #[path = "../proofs/align_up_is_least_multiple.rs"]
 mod align_up_proofs;
 
+#[cfg(kani)]
+#[path = "../proofs/note_walk_stays_in_its_table.rs"]
+mod note_walk_proofs;
+
 #[cfg(test)]
 mod tests {
-    /// Every machine `machine_name` names is the family of some architecture
-    /// `toolchain::machine_family` maps, so an artifact of a named machine can agree with
-    /// a target: an arm `machine_name` gains without a mapping there would read every run
-    /// on that machine as `unmapped`, and a renamed one as `disagrees`. The loop runs over
-    /// every `e_machine` value rather than a list of the named ones, so it cannot drift
-    /// from the `match`. The same architecture's kernel is held to run the machine
-    /// natively, for `report::emulation_limitation`.
     #[test]
     fn every_named_machine_is_a_family_the_target_can_name() {
         let mut named = 0;
@@ -4965,13 +5074,8 @@ mod tests {
                 Some(name.as_str()),
                 "e_machine {em}"
             );
-            // And a kernel of that architecture runs it natively at the width and in the
-            // byte order its read spelling carries, so `report::emulation_limitation` never
-            // withholds a native artifact for want of a row in `env::runs_natively`. A
-            // spelling that carries no order (`mips`, `mips64`) names none whatever chard's
-            // build, and the reading is withheld there rather than published: that is the
-            // one family the row cannot name from a spelling, and `env::kernel_byte_order`
-            // says so.
+            // A kernel of that architecture runs it natively at the width and byte order its
+            // spelling carries.
             let kernel = crate::env::NativeMachine::read(arch);
             let runs = |order| {
                 [32, 64].into_iter().any(|class| {
@@ -4993,14 +5097,6 @@ mod tests {
 
     use super::*;
 
-    /// The spelling `as_str` gives a table or a kind is the spelling serde writes into the
-    /// report, for every variant.
-    ///
-    /// The schema's `table` and `kind` enums are pinned to `as_str` in
-    /// `tests/schema_conformance.rs`, and the gate's reason and the diagnostics quote it,
-    /// so a variant serde spells differently is one the schema admits under a name the
-    /// report never carries. `DynStr` was the case: kebab-case wrote `dyn-str` while
-    /// `as_str` said `dynstr`, and no fixture carried the entry to show it.
     #[test]
     fn a_tables_serialized_spelling_is_its_as_str() {
         for table in ElfTable::ALL {
@@ -5021,9 +5117,41 @@ mod tests {
         assert_eq!(align_up(5, 1).unwrap(), 5);
     }
 
-    /// The exact off-by-four that reported a `-fcf-protection=full` binary as
-    /// having no CET markings: for a GNU note with `namesz == 4` and align 8 the
-    /// descriptor begins at `note_start + 16`, because 12 + 4 is already aligned.
+    #[test]
+    fn align_up_is_the_least_multiple_or_refuses_on_overflow_at_sampled_alignments() {
+        let top = u64::MAX;
+        let aligns = (1..=257_u64).chain([top / 2, top / 2 + 1, top / 2 + 2, top - 1, top]);
+        for align in aligns {
+            let last_served = top - (align - 1);
+            let values = [
+                0,
+                1,
+                align - 1,
+                align,
+                align.saturating_add(1),
+                top - align,
+                last_served,
+                last_served.saturating_add(1),
+                top,
+            ];
+            for value in values {
+                let refuses = align >= 2 && value.checked_add(align - 1).is_none();
+                match align_up(value, align) {
+                    None => assert!(refuses, "align_up({value}, {align}) refused"),
+                    Some(m) => {
+                        assert!(!refuses, "align_up({value}, {align}) served {m}");
+                        assert_eq!(m % align, 0, "align_up({value}, {align}) = {m}");
+                        assert!(
+                            m >= value && m - value < align,
+                            "align_up({value}, {align}) = {m}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(align_up(1 << 63 | 1, 1 << 63 | 1), None);
+    }
+
     #[test]
     fn note_descriptor_offset_is_absolutely_aligned() {
         let namesz: u64 = 4; // "GNU\0"
@@ -5034,8 +5162,8 @@ mod tests {
         assert_ne!(correct, tempting_and_wrong);
     }
 
-    /// A minimal ELF64 header, so the three tests below differ only in the field each
-    /// is about. `phnum`/`shnum` and their entsizes are the whole subject.
+    /// A minimal ELF64 `ET_DYN` header for x86_64 with the program-header table at 64, and
+    /// the section-header table there too where `shnum` is nonzero.
     fn elf64_header(phnum: u16, phentsize: u16, shnum: u16, shentsize: u16) -> Vec<u8> {
         let mut d = vec![0u8; 64];
         d[..4].copy_from_slice(b"\x7fELF");
@@ -5045,10 +5173,8 @@ mod tests {
         d[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
         d[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         d[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-        // `e_shoff` is written only when there are sections to find there. Zero is what
-        // the specification and every stripped file use for "no section-header table",
-        // and a nonzero offset with `e_shnum == 0` is the escape that says the count is
-        // in `shdr[0]`, which here would be the first program header.
+        // Zero is no section-header table, and a nonzero offset with `e_shnum == 0` is the
+        // escape to a count in `shdr[0]`, which here would be the first program header.
         if shnum > 0 {
             d[40..48].copy_from_slice(&64u64.to_le_bytes()); // e_shoff
         }
@@ -5060,19 +5186,9 @@ mod tests {
         d
     }
 
-    /// A table stride below the record size is refused at the header.
-    ///
-    /// `base + i * entsize` with `entsize` under the real record size makes the declared
-    /// entries overlap; at zero every index names the same bytes. A 16 KB file with
-    /// `e_shentsize = 0` and `e_shnum = 65535` aliased one `SHT_DYNAMIC` header onto 65535
-    /// logical sections and drove 4.79 GB of resident memory and a 1.09 GB report before
-    /// this check existed. The input-size cap could not have caught it: the derived
-    /// iteration count is unrelated to input size.
     #[test]
-    fn a_stride_below_the_record_size_is_refused_rather_than_walked() {
-        // Zero, the aliasing case, and one below the real size, the overlapping case.
-        // 65534, since 65535 is `PN_XNUM`, which means "the count is in
-        // `shdr[0].sh_info`" and is no count of its own.
+    fn a_header_stride_other_than_the_record_is_never_walked() {
+        // Zero aliases, one below the real size overlaps.
         for bad in [0u16, 1, 63] {
             assert!(
                 Elf::parse(&elf64_header(0, 56, 65534, bad)).is_err(),
@@ -5083,17 +5199,186 @@ mod tests {
                 "e_phentsize {bad} must be refused"
             );
         }
-        // Exactly the record size, and larger: the spec permits padding, so both stand.
-        assert!(Elf::parse(&elf64_header(1, 56, 1, 64)).is_ok());
-        assert!(Elf::parse(&elf64_header(1, 72, 1, 80)).is_ok());
-        // A count of zero says nothing about the stride, so it is not grounds to refuse.
-        assert!(Elf::parse(&elf64_header(0, 0, 0, 0)).is_ok());
+        let section_header_causes = |elf: &Elf<'_>| -> Vec<Truncation> {
+            elf.facts()
+                .truncations
+                .into_iter()
+                .filter(|t| t.table == ElfTable::SectionHeaders)
+                .collect()
+        };
+        // Exactly the record size stands, and reads its one section header.
+        let bytes = elf64_header(1, 56, 1, 64);
+        let exact = Elf::parse(&bytes).expect("record-size strides");
+        assert_eq!(exact.shdrs.len(), 1);
+        assert_eq!(section_header_causes(&exact), Vec::new());
+        // Above it, a program-header table is refused, since the loaders disagree on it.
+        for above in [57u16, 64, 72, 112, u16::MAX] {
+            let Err(ElfError::Malformed { what, .. }) = Elf::parse(&elf64_header(1, above, 0, 64))
+            else {
+                panic!("e_phentsize {above} must be refused as malformed");
+            };
+            assert!(
+                what.starts_with(&format!(
+                    "e_phentsize is {above}, not the 56-byte program header"
+                )),
+                "{what}"
+            );
+        }
+        // And a section-header table is not read: no section, and the cause recorded once.
+        for above in [65u16, 80, 128, u16::MAX] {
+            let bytes = elf64_header(1, 56, 1, above);
+            let elf = Elf::parse(&bytes)
+                .unwrap_or_else(|e| panic!("e_shentsize {above} is withheld, not refused: {e:?}"));
+            assert_eq!(
+                elf.shdrs.len(),
+                0,
+                "e_shentsize {above}: no section is read"
+            );
+            let causes = section_header_causes(&elf);
+            let [cause] = causes.as_slice() else {
+                panic!("e_shentsize {above}: one cause, got {causes:?}");
+            };
+            assert_eq!(cause.kind, TruncationKind::Unread);
+            assert!(
+                cause.detail.starts_with(&format!(
+                    "section-header table: e_shentsize is {above} where the record is 64 bytes"
+                )),
+                "{}",
+                cause.detail
+            );
+        }
+        // A count of zero says nothing about the stride, so it is not grounds to refuse or
+        // to withhold: an object with no program headers writes `e_phentsize` 0, and one
+        // stripped of its section headers `e_shentsize` 0.
+        for (phentsize, shentsize) in [(0, 0), (112, 128), (u16::MAX, u16::MAX)] {
+            let bytes = elf64_header(0, phentsize, 0, shentsize);
+            let elf = Elf::parse(&bytes)
+                .unwrap_or_else(|e| panic!("({phentsize}, {shentsize}) with no tables: {e:?}"));
+            assert_eq!(section_header_causes(&elf), Vec::new());
+        }
+    }
+
+    /// [`elf64_header`]'s ELF32 counterpart: an `ET_DYN` for i386 with both tables at 52.
+    fn elf32_header(phnum: u16, phentsize: u16, shnum: u16, shentsize: u16) -> Vec<u8> {
+        let mut d = vec![0u8; 52];
+        d[..4].copy_from_slice(b"\x7fELF");
+        d[4] = 1; // ELFCLASS32
+        d[5] = 1; // little-endian
+        d[6] = 1;
+        d[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        d[18..20].copy_from_slice(&3u16.to_le_bytes()); // EM_386
+        d[28..32].copy_from_slice(&52u32.to_le_bytes()); // e_phoff
+        if shnum > 0 {
+            d[32..36].copy_from_slice(&52u32.to_le_bytes()); // e_shoff
+        }
+        d[42..44].copy_from_slice(&phentsize.to_le_bytes());
+        d[44..46].copy_from_slice(&phnum.to_le_bytes());
+        d[46..48].copy_from_slice(&shentsize.to_le_bytes());
+        d[48..50].copy_from_slice(&shnum.to_le_bytes());
+        d.resize(4096, 0);
+        d
+    }
+
+    #[test]
+    fn an_elf32_header_stride_other_than_its_record_is_never_walked() {
+        let exact = elf32_header(1, 32, 1, 40);
+        let elf = Elf::parse(&exact).expect("record-size strides");
+        assert_eq!(elf.shdrs.len(), 1);
+        for other in [31u16, 33, 40, 56] {
+            let Err(ElfError::Malformed { what, .. }) = Elf::parse(&elf32_header(1, other, 0, 40))
+            else {
+                panic!("ELF32 e_phentsize {other} must be refused as malformed");
+            };
+            assert!(
+                what.starts_with(&format!("e_phentsize is {other}")),
+                "{what}"
+            );
+            if other < 32 {
+                assert!(
+                    what.contains("below the 32-byte program header"),
+                    "the below-record arm refuses {other}: {what}"
+                );
+            }
+        }
+        for above in [41u16, 64, 128] {
+            let bytes = elf32_header(1, 32, 1, above);
+            let elf = Elf::parse(&bytes)
+                .unwrap_or_else(|e| panic!("ELF32 e_shentsize {above} is withheld: {e:?}"));
+            assert_eq!(elf.shdrs.len(), 0, "ELF32 e_shentsize {above}");
+            assert!(
+                elf.facts().truncations.iter().any(|t| {
+                    t.table == ElfTable::SectionHeaders
+                    && t.kind == TruncationKind::Unread
+                    && t.detail.starts_with(&format!(
+                        "section-header table: e_shentsize is {above} where the record is 40 bytes"
+                    ))
+                }),
+                "ELF32 e_shentsize {above}"
+            );
+        }
+        let Err(ElfError::Malformed { what, .. }) = Elf::parse(&elf32_header(1, 32, 1, 39)) else {
+            panic!("ELF32 e_shentsize 39 must be refused as malformed");
+        };
+        assert!(
+            what.starts_with("e_shentsize is 39, below the 40-byte section header"),
+            "{what}"
+        );
+    }
+
+    #[test]
+    fn sections_declared_at_no_offset_are_not_read() {
+        let mut bytes = elf64_header(1, 56, 2, 64);
+        bytes[40..48].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+        let elf = Elf::parse(&bytes).expect("sections at no offset are withheld, not refused");
+        assert_eq!(elf.shdrs.len(), 0);
+        let facts = elf.facts();
+        let causes: Vec<&Truncation> = facts
+            .truncations
+            .iter()
+            .filter(|t| t.table == ElfTable::SectionHeaders)
+            .collect();
+        let [cause] = causes.as_slice() else {
+            panic!("one cause, got {causes:?}");
+        };
+        assert_eq!(cause.kind, TruncationKind::Unread);
+        assert!(
+            cause
+                .detail
+                .starts_with("section-header table: e_shoff is 0, which says the file has none"),
+            "{}",
+            cause.detail
+        );
+    }
+
+    #[test]
+    fn an_escaped_section_count_is_withheld_at_another_stride() {
+        let mut bytes = elf64_header(1, 56, 1, 128);
+        bytes[40..48].copy_from_slice(&1024u64.to_le_bytes()); // e_shoff, clear of the phdr
+        bytes[60..62].copy_from_slice(&0u16.to_le_bytes()); // e_shnum: the count escape
+        bytes[1024 + 32..1024 + 40].copy_from_slice(&2u64.to_le_bytes()); // shdr[0].sh_size
+        let elf = Elf::parse(&bytes).expect("an escaped count at another stride is withheld");
+        assert_eq!(elf.shdrs.len(), 0);
+        let causes: Vec<Truncation> = elf
+            .facts()
+            .truncations
+            .into_iter()
+            .filter(|t| t.table == ElfTable::SectionHeaders)
+            .collect();
+        let [cause] = causes.as_slice() else {
+            panic!("one cause, got {causes:?}");
+        };
+        assert_eq!(cause.kind, TruncationKind::Unread);
+        assert!(
+            cause.detail.starts_with(
+                "section-header table: e_shentsize is 128 where the record is 64 bytes, so its 2 \
+                 headers"
+            ),
+            "{}",
+            cause.detail
+        );
     }
 
     /// Build an ELF64 whose derived facts are decided by the inputs named here.
-    ///
-    /// One `PT_DYNAMIC` segment carrying the given tags, optionally a `PT_INTERP`, a
-    /// `PT_GNU_RELRO` and a `PT_GNU_STACK` with the given flags.
     fn synth(
         e_type: u16,
         tags: &[(i64, u64)],
@@ -5106,10 +5391,6 @@ mod tests {
 
     /// As `synth`, plus an optional `PT_NOTE` carrying one
     /// `GNU_PROPERTY_X86_FEATURE_1_AND` with the given bits.
-    ///
-    /// The descriptor offset is `note_start + align_up(12 + namesz, 8)`, which for
-    /// `"GNU\0"` is already aligned and so has no padding -- the exact rule the module
-    /// header calls the one that must not be got wrong.
     fn synth_with_note(
         e_type: u16,
         tags: &[(i64, u64)],
@@ -5129,9 +5410,6 @@ mod tests {
     }
 
     /// The same object with a GNU property note of any type, not only x86's.
-    ///
-    /// The builder hardcoded `GNU_PROPERTY_X86_FEATURE_1_AND`, which is why the aarch64
-    /// bits had no paired test: there was no way to write the note that carries them.
     fn synth_with_property(
         e_type: u16,
         tags: &[(i64, u64)],
@@ -5175,10 +5453,11 @@ mod tests {
         if let Some((prop_type, bits)) = property {
             let n = usize::try_from(note_at).unwrap();
             d[n..n + 4].copy_from_slice(&4u32.to_le_bytes()); // namesz "GNU\0"
-            d[n + 4..n + 8].copy_from_slice(&12u32.to_le_bytes()); // descsz
+            d[n + 4..n + 8].copy_from_slice(&16u32.to_le_bytes()); // descsz
             d[n + 8..n + 12].copy_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
             d[n + 12..n + 16].copy_from_slice(b"GNU\0");
-            // desc begins at align_up(12 + 4, 8) == 16, i.e. no padding at all.
+            // desc at align_up(12 + 4, 8) == 16, 16 bytes: the property padded to 8 as a
+            // linker writes it.
             d[n + 16..n + 20].copy_from_slice(&prop_type.to_le_bytes());
             d[n + 20..n + 24].copy_from_slice(&4u32.to_le_bytes()); // pr_datasz
             d[n + 24..n + 28].copy_from_slice(&bits.to_le_bytes());
@@ -5195,6 +5474,66 @@ mod tests {
 
     fn facts_of(bytes: &[u8]) -> ElfFacts {
         Elf::parse(bytes).expect("synthetic ELF parses").facts()
+    }
+
+    /// An `ET_EXEC` whose program headers are `phdrs` (`p_type`, `p_flags`) and nothing else.
+    fn with_phdrs(phdrs: &[(u32, u32)]) -> Vec<u8> {
+        let mut d = elf64_header(u16::try_from(phdrs.len()).unwrap(), 56, 0, 64);
+        d[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        for (i, (p_type, p_flags)) in phdrs.iter().enumerate() {
+            let b = 64 + i * 56;
+            d[b..b + 4].copy_from_slice(&p_type.to_le_bytes());
+            d[b + 4..b + 8].copy_from_slice(&p_flags.to_le_bytes());
+        }
+        d
+    }
+
+    #[test]
+    fn rwx_segment_reads_one_segment_writable_and_executable() {
+        const R: u32 = 0x4;
+        let read = |phdrs: &[(u32, u32)]| facts_of(&with_phdrs(phdrs)).rwx_segment;
+        assert_eq!(
+            read(&[(PT_LOAD, R | PF_X), (PT_LOAD, R), (PT_LOAD, R | PF_W)]),
+            Some(false),
+            "the default split layout"
+        );
+        assert_eq!(
+            read(&[(PT_LOAD, R | PF_W | PF_X)]),
+            Some(true),
+            "one RWX PT_LOAD"
+        );
+        assert_eq!(
+            read(&[
+                (PT_LOAD, R | PF_X),
+                (PT_LOAD, R | PF_W),
+                (PT_TLS, R | PF_W | PF_X)
+            ]),
+            Some(true),
+            "an RWX PT_TLS beside split loads"
+        );
+        assert_eq!(
+            read(&[(PT_LOAD, R | PF_X), (PT_LOAD, R | PF_W), (PT_TLS, R | PF_X)]),
+            Some(false),
+            "a PT_TLS executable and not writable is not read as RWX"
+        );
+        assert_eq!(
+            read(&[
+                (PT_LOAD, R | PF_X),
+                (PT_LOAD, R | PF_W),
+                (PT_GNU_STACK, R | PF_W | PF_X)
+            ]),
+            Some(false),
+            "an executable stack is noexecstack's to read"
+        );
+        assert_eq!(
+            read(&[
+                (PT_LOAD, R | PF_W),
+                (PT_LOAD, R | PF_X),
+                (PT_NOTE, R | PF_W | PF_X)
+            ]),
+            Some(false),
+            "a program header other than PT_LOAD and PT_TLS is not read"
+        );
     }
 
     /// A program laid out from `loads` (`p_flags`, `p_offset`, `p_filesz`, `p_align`) and
@@ -5254,12 +5593,6 @@ mod tests {
         d
     }
 
-    /// `data_in_code_pages` on the three layouts the linkers produce, built in bytes: GNU
-    /// ld's `-z noseparate-code`, one executable segment holding `.rodata` beside `.text`;
-    /// lld's and mold's, a `.text` segment of its own whose first page shares file bytes
-    /// with the read-only segment before it; and `-z separate-code`, the same segments
-    /// padded to page boundaries. The second is the layout segment membership reads as
-    /// separated, and the reason the fact is read by page.
     #[test]
     fn data_in_code_pages_reads_the_pages_an_executable_segment_maps() {
         const PROGBITS: u32 = 1;
@@ -5291,9 +5624,7 @@ mod tests {
             facts_of(&shared_page).data_in_code_pages,
             Some(vec![".rodata".to_owned(), ".eh_frame".to_owned()])
         );
-        // Padded: `.text` alone on its page, the read-only data on the next. The build-id
-        // note on the code page is not counted, nor is a code section the allowlist in the
-        // recipe would not know, nor `.bss`, which has no file bytes.
+        // Padded: `.text` alone on its page, the read-only data on the next.
         let separated = laid_out(
             &[
                 (PF_X | 0x4, 0x1000, 0x400, page),
@@ -5311,9 +5642,7 @@ mod tests {
         assert_eq!(facts_of(&separated).data_in_code_pages, Some(Vec::new()));
         // The layout `-Wl,-z,separate-code -Wl,-z,max-page-size=0x10` gave GNU ld 2.46.1 on
         // Fedora 44 x86_64: a code segment at 0 ending at 0x4b9, aligned to 16 bytes, and
-        // the read-only segment at 0x4c0 holding `.dynsym`, `.rodata` and `.eh_frame`. At
-        // its own alignment nothing shares its range; on the 4096-byte page a kernel maps,
-        // all three do.
+        // the read-only segment at 0x4c0 holding `.dynsym`, `.rodata` and `.eh_frame`.
         let sub_page = laid_out(
             &[(PF_X | 0x4, 0, 0x4b9, 0x10), (0x4, 0x4c0, 0x300, 0x10)],
             &[
@@ -5356,16 +5685,6 @@ mod tests {
         assert_eq!(facts_of(&stripped).data_in_code_pages, None);
     }
 
-    /// `openbsd_nobtcfi` is read from a program header of type `0x65a3dbe8`, written here
-    /// as a literal so a typo in the reader's constant fails rather than agreeing with
-    /// itself. The value is OpenBSD 7.9's (`/usr/include/llvm/BinaryFormat/ELF.h`), and the
-    /// header lld 22.1.8 writes under `-z nobtcfi`, which readelf prints as
-    /// `OPENBSD_NOBTCF`. The replay case in `tests/detector_replay.rs` reads the recorded
-    /// fact, not bytes, so without this test a wrong constant would pass every Mac and Linux
-    /// gate.
-    ///
-    /// The paired object retypes the same header to its neighbours on either side, and
-    /// one has no program header of that kind at all.
     #[test]
     fn the_nobtcfi_header_is_read_from_its_program_header_type() {
         let tagged = |p_type: u32| {
@@ -5537,19 +5856,6 @@ mod tests {
         cases
     }
 
-    /// Every derived hardening fact flips with the input that decides it, and with nothing
-    /// else.
-    ///
-    /// Without this test, `cargo mutants` over this file leaves survivors exactly here:
-    /// `flags & DF_BIND_NOW` mutated to `flags | DF_BIND_NOW` survives the whole suite, so
-    /// nothing would notice `bind_now` reading true for every binary on earth. Same for
-    /// `&` -> `^`, for the `!=` comparisons against each mask, and for the `&&`/`||` in
-    /// `static_pie`, `shared_object` and `statically_linked`. The other tests that parse
-    /// real binaries only assert that they do not panic.
-    ///
-    /// Table-driven and paired: each row states an input that should produce the fact and
-    /// an input that should not, so a mutant that hard-wires either answer dies. A one-
-    /// sided test would have passed against `| MASK`.
     #[test]
     fn each_derived_fact_is_decided_by_its_own_bit() {
         let cases = derived_fact_cases();
@@ -5597,21 +5903,6 @@ mod tests {
         ));
     }
 
-    /// The link classification is one value flattened five ways, and only for an object
-    /// the loader can run.
-    ///
-    /// Reproduced with `gcc -c` on a canary: `chard elf t.o` printed `elf_type: "ET_1"`,
-    /// `statically_linked: true`, `relro: "none"`, `gnu_stack_present: false`, for a file
-    /// `readelf -h` describes as `REL` with no program headers. Every one of those was
-    /// the falsy default for a question the object cannot answer, and `relro: "none"` is
-    /// a false `off` by another route. And on a linked file, `static_pie: true` sat
-    /// beside `statically_linked: false`, because "statically linked" was defined as "no
-    /// dynamic section" and a static PIE has one.
-    ///
-    /// The grid is every `e_type` the reader names or ranges, crossed with the four
-    /// inputs that decide the kind and `DT_SONAME`, which must not. `LinkKind` makes the
-    /// contradictory pairs unrepresentable; this pins the flattening, which is where they
-    /// could come back.
     #[test]
     fn link_facts_are_one_classification_and_only_for_an_object_the_loader_runs() {
         let mut linked_seen = 0;
@@ -5735,9 +6026,7 @@ mod tests {
         tags
     }
 
-    /// `(interp, dynamic, df_1_pie, dt_debug, dt_soname)` for the classification grid:
-    /// every combination, less the ones that name a dynamic tag on an object with no
-    /// dynamic section, which cannot carry one.
+    /// Every grid row, less those naming a dynamic tag on an object with no dynamic section.
     fn grid_inputs() -> Vec<GridRow> {
         let mut rows = Vec::new();
         for interp in [false, true] {
@@ -5749,16 +6038,6 @@ mod tests {
         rows
     }
 
-    /// `DT_DEBUG` is executable output with or without `DT_SONAME`, and `DT_SONAME` alone
-    /// is a shared object.
-    ///
-    /// The first pair is what `-soname` on an executable link writes: measured on
-    /// 2026-09-28 for static PIEs from GNU ld 2.46.1, lld 22.1.8, mold 2.40.4 and lld
-    /// 10.0.0, the last with no `DT_FLAGS_1` at all, while every shared object measured
-    /// lacked `DT_DEBUG`. A classifier that let the name veto the marker would read the
-    /// lld 10.0.0 executable as a library and its `pie` as `off`. So the pair is pinned
-    /// here, on bytes, with the other three corners beside it so that neither tag can be
-    /// dropped from the rule; `LinkKind::StaticPie` records the runs.
     #[test]
     fn debug_marks_executable_output_whatever_the_soname() {
         let read = |tags: &[(i64, u64)]| facts_of(&synth(ET_DYN, tags, false, false, None));
@@ -5787,12 +6066,6 @@ mod tests {
         assert_eq!(corners, 4, "every corner of the pair ran");
     }
 
-    /// The link classification is required in a recording, as `null` or a value.
-    ///
-    /// serde reads a missing `Option` field as `None`, which here would let a recording
-    /// with no such field pass for a measurement of "this object carries no
-    /// classification". `probe` and `measure` deserialize their fixtures so that a missing
-    /// field fails loudly; this is what keeps that true for these nine.
     #[test]
     fn a_recording_must_carry_the_link_classification_even_as_null() {
         let facts = facts_of(&synth(ET_DYN, &[], true, false, None));
@@ -5809,8 +6082,7 @@ mod tests {
             "the error names the field: {err}"
         );
 
-        // And a relocatable object serializes the classification as null, so a report
-        // reader sees `null` where the object could not carry the fact.
+        // A relocatable object serializes the classification as null.
         let rel = serde_json::to_value(facts_of(&synth(ET_REL, &[], false, true, Some(0))))
             .expect("serializes");
         for field in ["pie", "relro", "gnu_stack_present", "statically_linked"] {
@@ -5822,32 +6094,9 @@ mod tests {
         }
     }
 
-    /// A `.symtab` is read, its `sh_link` is believed only when it names a string table,
-    /// and a symbol's definedness comes from its own `st_shndx`.
-    ///
-    /// Five survivors sat in `symbols` with nothing to catch them, and each publishes a
-    /// wrong answer about the stack protector, whose verdict is `__stack_chk_fail` in
-    /// `watched_symbols`:
-    ///
-    /// - `sh_type != SHT_SYMTAB` to `==` skips `.symtab` while leaving `.dynsym` working,
-    ///   so it is invisible to every test that links dynamically — which the existing
-    ///   canary test does — and blinds the check on a statically linked binary.
-    /// - the `sh_link != 0 && link.sh_type == SHT_STRTAB` guard to `true`, or its `&&` to
-    ///   `||`, restores the exact defect the comment inside `symbols` records as
-    ///   reproduced: names read from file offset zero come back empty, every symbol is
-    ///   skipped, and the table reports no symbols rather than reporting itself unreadable.
-    /// - `st_shndx != 0` to `==` swaps defined for undefined, which is the distinction
-    ///   between a binary that *references* the canary and one that statically links libssp.
-    /// - deleting the `!` in `!entry.tables.contains(&table)` records one table twice for a
-    ///   name that appears in it twice.
-    ///
-    /// Built as bytes rather than compiled, because no compiler emits a symbol table whose
-    /// `sh_link` is zero. That case arises from stripping, corruption, or a file chard did
-    /// not build — which is the input this reader exists to survive.
     #[test]
     fn a_symbol_table_is_read_only_through_a_string_table_that_exists() {
-        // One SHT_NULL, one SHT_SYMTAB, one SHT_STRTAB holding both section and symbol
-        // names. No program headers: symbols come from sections alone.
+        // SHT_NULL, SHT_SYMTAB, and one SHT_STRTAB for section and symbol names.
         const SYMS: usize = 0x400;
         const STRS: usize = 0x600;
         const NAME_SYMTAB: u32 = 1;
@@ -5882,8 +6131,7 @@ mod tests {
             d[STRS + 17..STRS + 34].copy_from_slice(b"__stack_chk_fail\0");
             d[STRS + 34..STRS + 57].copy_from_slice(b"__stack_chk_fail_local\0");
 
-            // Three records: the canary symbol defined, the same name a second time so the
-            // table-dedup has something to dedup, and a watched symbol left undefined.
+            // The canary defined, the same name again, and a watched symbol undefined.
             for (i, (name, shndx)) in [(NAME_FAIL, 1u16), (NAME_FAIL, 1u16), (NAME_LOCAL, 0u16)]
                 .iter()
                 .enumerate()
@@ -5915,8 +6163,7 @@ mod tests {
             "st_shndx 0 is SHN_UNDEF: a reference, not a definition"
         );
 
-        // sh_link 0 is SHN_UNDEF, whose sh_offset is 0. Believing it reads names from the
-        // start of the file, which yields nothing and looks like an empty table.
+        // sh_link 0 is SHN_UNDEF: believing it reads names from the start of the file.
         let broken = Elf::parse(&build(0)).expect("parses").facts();
         assert!(
             broken.watched_symbols.is_empty(),
@@ -5933,15 +6180,8 @@ mod tests {
             broken.truncations
         );
 
-        // A third case, because the two above do not separate the guard's `&&` from `||`:
-        // with `sh_link` zero *both* operands are false, so either operator rejects. Only a
-        // link that exists and is not a string table tells them apart — here `sh_link` names
-        // the symbol table itself.
-        //
-        // The observable is the truncation, not the symbol set. Reading names through a
-        // symbol table lands in a record's zero padding, so the names come back empty and
-        // the symbols are skipped either way: an `||` that wrongly accepts this link is
-        // silent, and silence is what the truncation exists to break.
+        // A link that exists and is not a string table (here the symbol table itself) is the
+        // case `sh_link` zero cannot tell from an `||` guard.
         let wrong_kind = Elf::parse(&build(1)).expect("parses").facts();
         assert!(
             wrong_kind.truncations.iter().any(|t| {
@@ -5958,10 +6198,8 @@ mod tests {
         );
     }
 
-    /// A relocatable object laid out for [`Elf::code_relocations`]: `.text` (code),
-    /// `.rela.text` applying to it, `.symtab`, `.strtab` (which also names the sections),
-    /// `.data`, and `.rela.data` applying to that. Symbols: the null symbol, a section
-    /// symbol for `.text`, the undefined `chard_no_plt_callee`, and a defined caller.
+    /// A relocatable object laid out for [`Elf::code_relocations`]: `.text`, `.rela.text`,
+    /// `.symtab`, `.strtab` (which also names the sections), `.data` and `.rela.data`.
     /// `text_relocs` is `(symbol, type)` per `.rela.text` record.
     struct RelObject {
         e_type: u16,
@@ -6041,8 +6279,7 @@ mod tests {
             for (at, text) in strings {
                 d[STRS + at..STRS + at + text.len()].copy_from_slice(text);
             }
-            // Symbols: [1] the `.text` section symbol, [2] the callee, undefined, [3] the
-            // caller, defined in `.text`.
+            // [1] the `.text` section symbol, [2] the callee, undefined, [3] the caller.
             for (i, (name, info, shndx)) in [(0u32, 3u8, 1u16), (51, 0x12, 0), (71, 0x12, 1)]
                 .iter()
                 .enumerate()
@@ -6077,10 +6314,6 @@ mod tests {
             .collect()
     }
 
-    /// The reader records a code section's relocations against named symbols, defined or
-    /// not, as `TYPE SYMBOL`, once each, and one through a section symbol by its section in
-    /// brackets: not those against the null symbol, not those applying to a data section,
-    /// and an unnamed type by number.
     #[test]
     fn code_relocations_name_the_symbols_code_reaches() {
         let facts = RelObject::new(vec![(2, 4), (2, 4), (3, 2), (1, 2), (0, 0), (2, 99)]).facts();
@@ -6115,12 +6348,6 @@ mod tests {
         );
     }
 
-    /// Each stop in the walk is recorded against `relocations`, and the records read before
-    /// it are kept.
-    ///
-    /// The `function_references` walk reads the same sections and records its own stop
-    /// beside this walk's where it stops too, so each case asserts this walk's record among
-    /// the section's records rather than the only one.
     #[test]
     fn a_relocation_section_the_reader_cannot_finish_is_recorded() {
         let mut partial = RelObject::new(vec![(2, 41)]);
@@ -6165,10 +6392,6 @@ mod tests {
         assert!(facts.unread(&[ElfTable::Relocations]).is_some());
     }
 
-    /// The names the reader gives are elf.h's, by machine, and every other number renders
-    /// as `reloc-type-` and hex, so no unnamed type reads as a named one. RISC-V's 19 read
-    /// `reloc-type-0x13` until the table gained `EM_RISCV` (2026-10-05); `EM_LOONGARCH` has no
-    /// table, and 42 is a number RISC-V leaves unassigned.
     #[test]
     fn relocation_types_are_named_by_machine() {
         assert_eq!(reloc_type_name(EM_X86_64, 4), "R_X86_64_PLT32");
@@ -6187,16 +6410,6 @@ mod tests {
         assert_eq!(reloc_type_name(EM_X86_64, 40), "reloc-type-0x28");
     }
 
-    /// A `.symtab` name is keyed on what comes before its `@`, and `.dynsym`'s bare
-    /// spelling lands on the same key.
-    ///
-    /// Reproduced with `gcc -O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong`: `chard elf`
-    /// listed `__stack_chk_fail` and `__strcpy_chk` with `tables: [".dynsym"]` and
-    /// `symbol_count: 40`, while `readelf -sW` shows both in `.symtab` too and the raw
-    /// `.strtab` holds `__stack_chk_fail@GLIBC_2.4`. Forty distinct raw names, thirty-five
-    /// once the versions are cut. Built as bytes, since no compiler here emits ELF; the
-    /// `readelf` differential in `tests/elf_readelf.rs` pins it against a real `.strtab`
-    /// on a Linux host.
     #[test]
     fn a_versioned_symtab_name_is_keyed_on_the_name_before_its_version() {
         // Sections: null, .dynsym (link 3), .symtab (link 4), .dynstr, .strtab, .shstrtab.
@@ -6242,7 +6455,7 @@ mod tests {
             let at = usize::try_from(at).unwrap();
             d[at..at + bytes.len()].copy_from_slice(bytes);
         }
-        // Symbol records: (table offset, st_name). All undefined, after the null symbol.
+        // Symbol records: (table offset, st_name).
         for (at, names) in [(DYNSYM_AT, vec![0u32, 1]), (SYMTAB_AT, vec![0u32, 1, 28])] {
             for (i, name) in names.iter().enumerate() {
                 let b = usize::try_from(at).unwrap() + i * 24;
@@ -6285,19 +6498,6 @@ mod tests {
         );
     }
 
-    /// The size cap is the size it says, on both sides of it.
-    ///
-    /// Without this test nothing holds `MAX_OBJECT_BYTES` to its value: mutating
-    /// `512 * 1024 * 1024` to `512 + 1024 * 1024` or `512 * 1024 + 1024`, a cap of one
-    /// megabyte or of half a one, survives the whole suite. Every other test parses bytes in
-    /// memory through `Elf::parse`, which never consults the cap, so this is the only test
-    /// of the code path that reads it. A cap that quietly shrinks refuses real objects as
-    /// unparseable, and
-    /// this reader reports a refusal as absence of evidence.
-    ///
-    /// Both files are sparse: `set_len` writes no blocks, and the oversize one is refused
-    /// from its metadata without ever being opened for reading, which is the property that
-    /// makes the cap worth having.
     #[test]
     fn the_object_size_cap_is_enforced_at_the_size_it_states() {
         let dir = std::env::temp_dir().join(format!("chard-cap-{}", std::process::id()));
@@ -6338,28 +6538,9 @@ mod tests {
             "the refusal is typed as the cap, with the size and the cap it compared: {err:?}"
         );
 
-        // Propagated rather than `.ok()`-ed: `tests/discarded_failures.rs` counts every
-        // construct in this file that turns a failure into a value, and a cleanup discard
-        // is indistinguishable from a measurement one to a counter. A test that cannot
-        // remove what it wrote should say so.
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
-    /// The aarch64 feature bits are read per flag, not as a word.
-    ///
-    /// The x86 pair is pinned this way against `flags & DF_BIND_NOW` mutating to
-    /// `flags | DF_BIND_NOW`. The aarch64 three are pinned against six mutants across
-    /// `aarch64_pac` and `aarch64_gcs`: `&` to `|`, `&` to `^`, and `!=` to `==` on each.
-    ///
-    /// Each of those six is a wrong hardening verdict on aarch64, because `gcs-marked`
-    /// reads `aarch64_gcs` and `branch-protection-marked` reads `aarch64_pac`. `&` to `|`
-    /// reads PAC as present whenever *any* feature bit is, which for a BTI-only build
-    /// publishes protection the binary does not have. The aarch64 artifact channel rests
-    /// on exactly these three lines.
-    ///
-    /// Paired per bit for the reason the CET test gives: the property is an AND-reduction
-    /// of independent flags, so a mutant returning the whole word reads one bit as
-    /// another, and only an input that must *not* produce the fact catches it.
     #[test]
     fn the_aarch64_feature_bits_are_read_independently() {
         // On an aarch64 object, since the word is decoded only there.
@@ -6416,13 +6597,6 @@ mod tests {
         );
     }
 
-    /// The CET bits are read per flag, not as a word.
-    ///
-    /// Split out of the table above only because the two together exceeded the line cap.
-    /// Paired per bit: the property is an AND-reduction of two independent flags, so a
-    /// mutant returning the whole word, or flipping the comparison, reads one bit as the
-    /// other. The note also exercises `align_up(12 + namesz, 8)` -- the rule the module
-    /// header calls the one that must not be got wrong.
     #[test]
     fn the_cet_bits_are_read_independently() {
         let both = synth_with_note(
@@ -6462,11 +6636,6 @@ mod tests {
 
     /// An ELF64 with one `PT_NOTE` holding two notes: a build-id-shaped one of the given
     /// descriptor size, then the `GNU_PROPERTY_X86_FEATURE_1_AND` note carrying IBT.
-    ///
-    /// `second_at` is where the second note is written, relative to the segment, and it is
-    /// passed in rather than computed with `align_up`. Deriving it here would move the
-    /// fixture and the parser together under a mutation of that function, and the test
-    /// would pass against the mutant.
     fn two_note_segment(p_align: u64, first_descsz: u32, second_at: u64) -> Vec<u8> {
         let note_at: u64 = 0x600;
         let mut d = elf64_header(1, 56, 0, 64);
@@ -6475,16 +6644,15 @@ mod tests {
         let b = 64;
         d[b..b + 4].copy_from_slice(&PT_NOTE.to_le_bytes());
         d[b + 8..b + 16].copy_from_slice(&note_at.to_le_bytes());
-        d[b + 32..b + 40].copy_from_slice(&second_at.saturating_add(28).to_le_bytes());
+        d[b + 32..b + 40].copy_from_slice(&second_at.saturating_add(32).to_le_bytes());
         d[b + 48..b + 56].copy_from_slice(&p_align.to_le_bytes());
 
         write_two_notes(&mut d, note_at, first_descsz, second_at);
         d
     }
 
-    /// The same two notes in a `SHT_NOTE` *section*, which is the path a binary with
-    /// section headers actually takes -- `notes()` only falls back to `PT_NOTE` when the
-    /// section walk yields nothing.
+    /// The same two notes in a `SHT_NOTE` *section* of a file with no program headers,
+    /// which `notes_from_sections` names, so `notes()` reads the section.
     fn two_note_section(sh_addralign: u64, first_descsz: u32, second_at: u64) -> Vec<u8> {
         let note_at: u64 = 0x600;
         // No program headers: `e_phoff` and `e_shoff` are both 64 in this header, so the
@@ -6495,7 +6663,7 @@ mod tests {
         let b = 64;
         d[b + 4..b + 8].copy_from_slice(&SHT_NOTE.to_le_bytes());
         d[b + 24..b + 32].copy_from_slice(&note_at.to_le_bytes());
-        d[b + 32..b + 40].copy_from_slice(&second_at.saturating_add(28).to_le_bytes());
+        d[b + 32..b + 40].copy_from_slice(&second_at.saturating_add(32).to_le_bytes());
         d[b + 48..b + 56].copy_from_slice(&sh_addralign.to_le_bytes());
 
         write_two_notes(&mut d, note_at, first_descsz, second_at);
@@ -6503,8 +6671,7 @@ mod tests {
     }
 
     /// A build-id-shaped note of `first_descsz` bytes, then the IBT property note at
-    /// `second_at`. Both names are `"GNU\0"`, so what separates them is type and position
-    /// rather than a name the walk could shortcut on.
+    /// `second_at`, both named `"GNU\0"`, so type and position alone separate them.
     fn write_two_notes(d: &mut [u8], note_at: u64, first_descsz: u32, second_at: u64) {
         const NT_GNU_BUILD_ID: u32 = 3;
         let n = usize::try_from(note_at).unwrap();
@@ -6518,7 +6685,7 @@ mod tests {
 
         let s = n + usize::try_from(second_at).unwrap();
         d[s..s + 4].copy_from_slice(&4u32.to_le_bytes());
-        d[s + 4..s + 8].copy_from_slice(&12u32.to_le_bytes());
+        d[s + 4..s + 8].copy_from_slice(&16u32.to_le_bytes());
         d[s + 8..s + 12].copy_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
         d[s + 12..s + 16].copy_from_slice(b"GNU\0");
         d[s + 16..s + 20].copy_from_slice(&GNU_PROPERTY_X86_FEATURE_1_AND.to_le_bytes());
@@ -6526,38 +6693,20 @@ mod tests {
         d[s + 24..s + 28].copy_from_slice(&X86_FEATURE_1_IBT.to_le_bytes());
     }
 
-    /// The alignment a note container declares decides where the *next* note begins.
-    ///
-    /// A single note cannot show this. For `"GNU\0"` the descriptor sits at
-    /// `align_up(12 + 4, a)`, which is 16 at every alignment an ELF note carries — and at
-    /// zero too, since `align_up` returns the value unchanged for `align <= 1`. So one note
-    /// parses identically however the alignment is read, which is why the whole fallback
-    /// went untested while the tests looked thorough. It takes a second note, placed past a
-    /// descriptor whose padding differs between the candidate alignments, to see it.
-    ///
-    /// Both cases put the second note at +24 and reach it by different routes, which is the
-    /// point: a reader that ignores the declared 8 looks at +20, and one that treats a
-    /// declared 0 as an alignment rather than falling back to 4 looks at +21. Either way
-    /// the property note is missed and the object reads as having no CET markings -- the
-    /// same class of silent wrong verdict as the off-by-four above, reached through the
-    /// other operand.
     #[test]
     fn a_second_note_is_found_at_the_alignment_the_container_declares() {
         // Declared 8, first descriptor 4 bytes: 4 padded to 8 puts the second note at +24.
         let declared_8 = two_note_segment(8, 4, 24);
-        // Declared 0 is not an alignment. The fallback is 4, and a 5-byte descriptor padded
-        // to 8 lands at +24 as well; left unpadded at 0 it would be +21.
+        // Declared 0 is not an alignment.
         let declared_0 = two_note_segment(0, 5, 24);
 
-        // The same two cases through the section walk, which is the path a binary with
-        // section headers takes. Both containers declare their alignment in their own
-        // field, and each is read by its own line.
+        // The same two cases through the section walk, which a file with no program
+        // headers takes; each container declares its alignment in its own field.
         let section_8 = two_note_section(8, 4, 24);
         let section_0 = two_note_section(0, 5, 24);
-        // Declared 1 is what annobin writes on its `.gnu.build.attributes` sections. It is
-        // below the 4 every note is padded to, so it reads as 4 and lands at +24 too; taken
-        // at its word it would be +21, the declared-0 failure reached through a value the
-        // `> 0` test let through.
+        // Declared 1 is what annobin writes on its `.gnu.build.attributes` sections: below
+        // the 4 every note is padded to, it reads as 4 and lands at +24 too; taken at its
+        // word it would be +21.
         let section_1 = two_note_section(1, 5, 24);
         let segment_1 = two_note_segment(1, 5, 24);
 
@@ -6586,13 +6735,6 @@ mod tests {
         }
     }
 
-    /// A stripped object says what it could not read, and an intact one stays quiet.
-    ///
-    /// Paired, because a one-sided test passes against a function that returns the message
-    /// unconditionally. The message is evidence a reader acts on: it separates "the canary
-    /// is absent" from "the canary could not be looked for", and the doc comment on
-    /// `structural_truncations` puts an understated truncation on the same footing as an
-    /// overstated verdict.
     #[test]
     fn a_stripped_object_reports_what_it_could_not_read() {
         // Same notes either way; what differs is whether a section-header table exists.
@@ -6616,16 +6758,6 @@ mod tests {
         );
     }
 
-    /// A property note the file does not hold whole is recorded, and the bits it would
-    /// have carried read as unread.
-    ///
-    /// The same two-note segment, cut at three places inside the second note: its
-    /// header, its name and its descriptor. Each cut leaves `x86_ibt` false, which is the
-    /// reading a `-fcf-protection=none` build produces, and before the notes walk
-    /// recorded anything the two were the same fact. The name cut is the case the
-    /// file-end bound in `parse_notes` exists for: the header is readable, so without
-    /// that bound the note is pushed under a cut name, never decoded, and nothing says
-    /// so. The control is the whole file, which decodes the bit and records nothing.
     #[test]
     fn a_cut_property_note_is_recorded_as_unread() {
         let whole = two_note_segment(8, 4, 24);
@@ -6646,7 +6778,7 @@ mod tests {
         );
 
         // The second note begins at 0x600 + 24: header to 0x624, name to 0x628,
-        // descriptor to 0x634.
+        // descriptor to 0x638.
         let mut cuts = 0;
         for (cut, inside) in [(0x61c, "header"), (0x626, "name"), (0x62c, "descriptor")] {
             let short = whole
@@ -6671,7 +6803,7 @@ mod tests {
                 });
             assert_eq!(note.kind, TruncationKind::Unread, "cut inside the {inside}");
             assert!(
-                note.detail.starts_with("note table at 0x600+0x34:"),
+                note.detail.starts_with("note table at 0x600+0x38:"),
                 "the record names the table it was walking: {}",
                 note.detail
             );
@@ -6680,13 +6812,6 @@ mod tests {
         assert_eq!(cuts, 3, "three cuts examined");
     }
 
-    /// `facts().sections` holds the *named* sections, not the unnamed ones.
-    ///
-    /// The filter drops the empty name that index 0 always carries. Inverted, the list
-    /// becomes those empty names and every real section disappears -- a report field that
-    /// silently empties rather than erroring, which is the shape this project treats as
-    /// worse than a crash. Read from a real object, since the synthetic builders here carry
-    /// no section-name table.
     #[test]
     fn the_section_list_holds_named_sections_and_drops_the_unnamed() {
         let Some(object) = a_real_object("that the section list drops the unnamed section") else {
@@ -6715,13 +6840,6 @@ mod tests {
         d
     }
 
-    /// The segment a virtual address falls in is a half-open interval, and both ends matter.
-    ///
-    /// This is the only route to `.dynamic` in an object whose section headers are gone, so
-    /// a wrong answer here is not a lookup failure -- it resolves `DT_STRTAB` to the wrong
-    /// bytes and the library list is read out of whatever sits there. Both operands of the
-    /// bounds test get their own case, because either one alone is satisfied by an address
-    /// in the middle.
     #[test]
     fn a_virtual_address_is_inside_a_segment_only_within_both_bounds() {
         const BASE: u64 = 0x1000;
@@ -6753,11 +6871,6 @@ mod tests {
         );
     }
 
-    /// A `SHT_DYNAMIC` section reaching outside its segment is reported, at either end.
-    ///
-    /// The containment test has two operands and the existing case only exercises one. A
-    /// section that begins *before* the segment is the other, and it is the one a crafted
-    /// file would use: the bytes before `PT_DYNAMIC` are not the tags the loader reads.
     #[test]
     fn a_dynamic_section_starting_before_its_segment_is_reported() {
         const SHOFF: usize = 256;
@@ -6789,12 +6902,9 @@ mod tests {
 
     /// One note view per call: program headers of the given types all covering a property
     /// note at `SEG_AT` that carries `segment_word`, and, where `section_word` is given, one
-    /// `SHT_NOTE` section header aimed at a second property note at `SECTION_AT`. With
-    /// `sections` false the section-header table is absent (`e_shnum` 0), as after
+    /// `SHT_NOTE` section header aimed at a second property note at `SECTION_AT`. With no
+    /// `section_word` the section-header table is absent (`e_shnum` 0), as after
     /// `objcopy --strip-section-headers`.
-    ///
-    /// The builder for the forged-note shape: a binary whose segments say one thing and
-    /// whose `.note.gnu.property` section header says another.
     fn note_view(
         machine: u16,
         segment_types: &[u32],
@@ -6818,7 +6928,7 @@ mod tests {
         let mut put = |at: u64, word: u32| {
             let n = usize::try_from(at).unwrap();
             d[n..n + 4].copy_from_slice(&4u32.to_le_bytes());
-            d[n + 4..n + 8].copy_from_slice(&12u32.to_le_bytes());
+            d[n + 4..n + 8].copy_from_slice(&16u32.to_le_bytes());
             d[n + 8..n + 12].copy_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
             d[n + 12..n + 16].copy_from_slice(b"GNU\0");
             d[n + 16..n + 28].copy_from_slice(&property(pr_type, word, false));
@@ -6837,9 +6947,6 @@ mod tests {
         d
     }
 
-    /// A note section that is not allocated is never mapped, so outside the segments it is
-    /// no disagreeing view: annobin's `.gnu.build.attributes` is that shape in every program
-    /// Fedora's crt objects are linked into, and it records nothing.
     #[test]
     fn an_unallocated_note_section_outside_the_segments_records_nothing() {
         let mut d = note_view(
@@ -6867,14 +6974,6 @@ mod tests {
         })
     }
 
-    /// The loader reads the segment, so a note section aimed at other bytes is not measured.
-    ///
-    /// Reproduced with a gcc 16.1.1 `-fcf-protection=none` binary whose `.note.gnu.property`
-    /// header was pointed at an appended `X86_FEATURE_1_AND` note of `IBT|SHSTK`, program
-    /// headers untouched: the file ran, `chard elf` read `x86_ibt` and `x86_shstk` true, and
-    /// the `GNU_PROPERTY` segment carried neither. The section walk went first and the
-    /// segment was read only when it found nothing. Both segment types are covered, and the
-    /// forged view is recorded as `ignored`, the kind `dynamic()` uses for its own.
     #[test]
     fn a_note_section_outside_every_note_segment_is_not_the_measurement() {
         let both = X86_FEATURE_1_IBT | X86_FEATURE_1_SHSTK;
@@ -6903,8 +7002,6 @@ mod tests {
         }
     }
 
-    /// The reverse direction: the segment carries the marking and a section aimed
-    /// elsewhere does not erase it.
     #[test]
     fn a_note_section_elsewhere_does_not_hide_the_segments_marking() {
         let f = facts_of(&note_view(
@@ -6918,9 +7015,6 @@ mod tests {
         assert!(ignored_note_section(&f).is_some(), "{:?}", f.truncations);
     }
 
-    /// `PT_GNU_PROPERTY` and a `PT_NOTE` over the same bytes is what a linker writes, and
-    /// the note is read once: a second read would publish a count of two, "a file no linker
-    /// wrote".
     #[test]
     fn a_property_note_under_both_segment_types_is_read_once() {
         let f = facts_of(&note_view(
@@ -6957,7 +7051,7 @@ mod tests {
         );
         d[64 + 8..64 + 16].copy_from_slice(&0x680u64.to_le_bytes()); // p_offset
         d[0x680..0x684].copy_from_slice(&4u32.to_le_bytes());
-        d[0x684..0x688].copy_from_slice(&12u32.to_le_bytes());
+        d[0x684..0x688].copy_from_slice(&16u32.to_le_bytes());
         d[0x688..0x68c].copy_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
         d[0x68c..0x690].copy_from_slice(b"GNU\0");
         d[0x690..0x69c].copy_from_slice(&property(
@@ -6976,12 +7070,6 @@ mod tests {
         })
     }
 
-    /// Where a `PT_GNU_PROPERTY` exists the loader reads the property there, so a `PT_NOTE`
-    /// aimed at other bytes is not measured.
-    ///
-    /// Reproduced with a gcc 16.1.1 `-fcf-protection=none` binary, `PT_GNU_PROPERTY`
-    /// untouched and the first `PT_NOTE` repointed at an appended `X86_FEATURE_1_AND` note of
-    /// `IBT|SHSTK`: the file ran, and a reader of every note segment read both bits true.
     #[test]
     fn a_property_note_outside_the_property_segment_is_not_the_measurement() {
         let f = facts_of(&stray_property_note(
@@ -7006,8 +7094,6 @@ mod tests {
         );
     }
 
-    /// The reverse direction: the property segment carries the marking and a `PT_NOTE`
-    /// aimed elsewhere does not clear it by the AND a second note would get.
     #[test]
     fn a_property_note_outside_the_property_segment_does_not_hide_its_marking() {
         let f = facts_of(&stray_property_note(
@@ -7018,9 +7104,6 @@ mod tests {
         assert!(ignored_property_note(&f).is_some(), "{:?}", f.truncations);
     }
 
-    /// A `PT_NOTE` cut short beside a `PT_GNU_PROPERTY` hides no property the loader reads,
-    /// so its stop withholds nothing and is not recorded: the shape of an 8-aligned
-    /// `PT_NOTE` over 4-aligned notes, which samba's libraries on Fedora 44 carry.
     #[test]
     fn a_cut_note_segment_beside_a_property_segment_records_nothing() {
         let mut d = note_view(
@@ -7043,8 +7126,6 @@ mod tests {
         assert!(facts_of(&d).unread(&[ElfTable::Notes]).is_some());
     }
 
-    /// A note section inside its segment is the ordinary file and records nothing, and a
-    /// file with no section headers is read through its segments alone.
     #[test]
     fn a_note_section_inside_its_segment_records_nothing() {
         let mut d = note_view(
@@ -7082,8 +7163,6 @@ mod tests {
         );
     }
 
-    /// Program headers that name no note segment leave a note section unread: the loader
-    /// reads no note from such a file, so the section is not the file's marking.
     #[test]
     fn a_note_section_in_a_file_with_program_headers_but_no_note_segment_is_not_read() {
         let f = facts_of(&note_view(
@@ -7097,7 +7176,6 @@ mod tests {
         assert!(ignored_note_section(&f).is_some(), "{:?}", f.truncations);
     }
 
-    /// The same rule serves the aarch64 feature word: BTI and PAC come from the segment.
     #[test]
     fn a_forged_note_section_does_not_mark_aarch64_either() {
         let f = facts_of(&note_view(
@@ -7109,6 +7187,229 @@ mod tests {
         ));
         assert!(!f.aarch64_bti && f.aarch64_pac, "{f:?}");
         assert!(ignored_note_section(&f).is_some(), "{:?}", f.truncations);
+    }
+
+    /// The `.ARM.attributes` gcc 16.1.1 (Fedora 44's aarch64 cross compiler, binutils 2.46)
+    /// writes to an object under `-mbranch-protection=standard`, its bytes copied from such
+    /// an object, with each feature tag's value given here.
+    fn gcc16_attributes(bti: u8, pac: u8, gcs: u8) -> Vec<u8> {
+        let mut a = b"A\x23\0\0\0aeabi_feature_and_bits\0\x01\x00".to_vec();
+        a.extend_from_slice(&[0, bti, 1, pac, 2, gcs]);
+        assert_eq!(
+            a.len(),
+            36,
+            "the section is 0x24 bytes in the witness object"
+        );
+        a
+    }
+
+    /// An aarch64 file of `e_type` with no program headers: a `SHT_AARCH64_ATTRIBUTES`
+    /// section holding `attributes`, and, where `note_word` is given, a `SHT_NOTE` section
+    /// holding one property note with that aarch64 feature word.
+    fn attributes_object(e_type: u16, attributes: &[u8], note_word: Option<u32>) -> Vec<u8> {
+        const SHOFF: usize = 512;
+        const ATTR_AT: u64 = 0x800;
+        const NOTE_AT: u64 = 0x900;
+        let shnum = 2 + u16::from(note_word.is_some());
+        let mut d = elf64_header(0, 56, shnum, 64);
+        d[16..18].copy_from_slice(&e_type.to_le_bytes());
+        d[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        d[40..48].copy_from_slice(&(SHOFF as u64).to_le_bytes());
+        let mut shdr = |i: usize, kind: u32, off: u64, size: u64, align: u64| {
+            let b = SHOFF + i * 64;
+            d[b + 4..b + 8].copy_from_slice(&kind.to_le_bytes());
+            d[b + 24..b + 32].copy_from_slice(&off.to_le_bytes());
+            d[b + 32..b + 40].copy_from_slice(&size.to_le_bytes());
+            d[b + 48..b + 56].copy_from_slice(&align.to_le_bytes());
+        };
+        let size = u64::try_from(attributes.len()).unwrap();
+        shdr(1, SHT_AARCH64_ATTRIBUTES, ATTR_AT, size, 1);
+        if note_word.is_some() {
+            shdr(2, SHT_NOTE, NOTE_AT, 32, 8);
+        }
+        let a = usize::try_from(ATTR_AT).unwrap();
+        d[a..a + attributes.len()].copy_from_slice(attributes);
+        if let Some(word) = note_word {
+            let n = usize::try_from(NOTE_AT).unwrap();
+            d[n..n + 4].copy_from_slice(&4u32.to_le_bytes());
+            d[n + 4..n + 8].copy_from_slice(&16u32.to_le_bytes());
+            d[n + 8..n + 12].copy_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
+            d[n + 12..n + 16].copy_from_slice(b"GNU\0");
+            d[n + 16..n + 32].copy_from_slice(&property(
+                GNU_PROPERTY_AARCH64_FEATURE_1_AND,
+                word,
+                true,
+            ));
+        }
+        d
+    }
+
+    fn marking(f: &ElfFacts) -> [bool; 3] {
+        [f.aarch64_bti, f.aarch64_pac, f.aarch64_gcs]
+    }
+
+    fn notes_unread(f: &ElfFacts) -> Vec<&str> {
+        f.truncations
+            .iter()
+            .filter(|t| t.table == ElfTable::Notes && t.kind == TruncationKind::Unread)
+            .map(|t| t.detail.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_unlinked_aarch64_object_is_marked_by_its_build_attributes() {
+        for (tags, expected) in [
+            ((1, 1, 1), [true, true, true]),
+            ((1, 0, 0), [true, false, false]),
+            ((0, 1, 0), [false, true, false]),
+            ((0, 0, 1), [false, false, true]),
+            ((0, 0, 0), [false, false, false]),
+        ] {
+            let (bti, pac, gcs) = tags;
+            let f = facts_of(&attributes_object(
+                ET_REL,
+                &gcc16_attributes(bti, pac, gcs),
+                None,
+            ));
+            assert_eq!(marking(&f), expected, "{tags:?}: {f:?}");
+            assert!(notes_unread(&f).is_empty(), "{tags:?}: {:?}", f.truncations);
+            assert!(
+                f.gnu_property_types.is_empty(),
+                "no property type is invented"
+            );
+        }
+    }
+
+    #[test]
+    fn a_linked_aarch64_program_is_never_marked_by_its_build_attributes() {
+        for e_type in [ET_EXEC, ET_DYN] {
+            let f = facts_of(&attributes_object(e_type, &gcc16_attributes(1, 1, 1), None));
+            assert_eq!(marking(&f), [false; 3], "e_type {e_type}: {f:?}");
+            assert!(notes_unread(&f).is_empty(), "{:?}", f.truncations);
+        }
+    }
+
+    #[test]
+    fn build_attributes_are_read_on_aarch64_alone() {
+        let mut d = attributes_object(ET_REL, &gcc16_attributes(1, 1, 1), None);
+        d[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
+        let f = facts_of(&d);
+        assert_eq!(marking(&f), [false; 3], "{f:?}");
+        assert!(notes_unread(&f).is_empty(), "{:?}", f.truncations);
+    }
+
+    #[test]
+    fn a_note_and_attributes_that_disagree_leave_the_marking_unread() {
+        let all = AARCH64_FEATURE_1_BTI | AARCH64_FEATURE_1_PAC | AARCH64_FEATURE_1_GCS;
+        let agree = facts_of(&attributes_object(
+            ET_REL,
+            &gcc16_attributes(1, 1, 1),
+            Some(all),
+        ));
+        assert_eq!(marking(&agree), [true; 3], "{agree:?}");
+        assert!(notes_unread(&agree).is_empty(), "{:?}", agree.truncations);
+
+        for (note, tags, expected) in [
+            (all, (0, 0, 0), [false; 3]),
+            (0, (1, 1, 1), [false; 3]),
+            (AARCH64_FEATURE_1_BTI, (1, 1, 0), [true, false, false]),
+        ] {
+            let (bti, pac, gcs) = tags;
+            let f = facts_of(&attributes_object(
+                ET_REL,
+                &gcc16_attributes(bti, pac, gcs),
+                Some(note),
+            ));
+            assert_eq!(marking(&f), expected, "note {note:#x} tags {tags:?}");
+            let unread = notes_unread(&f);
+            assert!(
+                unread.len() == 1 && unread[0].contains("disagree"),
+                "note {note:#x} tags {tags:?}: {unread:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_build_attributes_are_recorded_and_mark_nothing() {
+        let good = gcc16_attributes(1, 1, 1);
+        let mut cut = good.clone();
+        cut[1] = 0x24; // one byte longer than the section holds
+        let mut version = good.clone();
+        version[0] = b'a';
+        let mut strings = good.clone();
+        strings[29] = 1;
+        let mut value = good.clone();
+        value[31] = 2;
+        let mut twice = good.clone();
+        twice[32] = 0; // PAC's tag rewritten as BTI's
+        // GCS's value continues past the end of the subsection.
+        let mut cut_value = good.clone();
+        cut_value[35] = 0x81;
+        // The subsection one byte shorter: GCS's tag with no value after it, and that tag
+        // continuing past the end.
+        let mut no_value = good[..35].to_vec();
+        no_value[1] = 0x22;
+        let mut cut_tag = no_value.clone();
+        cut_tag[34] = 0x82;
+        // BTI's value as a ULEB128 of eleven bytes, past 64 bits, and as one of ten whose last
+        // byte carries a bit above bit 63, which a reader dropping it would take as 0.
+        let with_value = |value: &[u8]| {
+            let mut b = good[..30].to_vec();
+            b.push(0); // BTI's tag
+            b.extend_from_slice(value);
+            b[1] = u8::try_from(b.len() - 1).unwrap();
+            b
+        };
+        let long = with_value(&[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+        ]);
+        let wide = with_value(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        for (name, bytes) in [
+            ("length", cut),
+            ("version", version),
+            ("encoding", strings),
+            ("value", value),
+            ("repeated tag", twice),
+            ("cut-off value", cut_value),
+            ("no value", no_value),
+            ("cut-off tag", cut_tag),
+            ("empty section", Vec::new()),
+            ("eleven-byte value", long),
+            ("value past bit 63", wide),
+        ] {
+            let f = facts_of(&attributes_object(ET_REL, &bytes, None));
+            assert_eq!(marking(&f), [false; 3], "{name}: {f:?}");
+            assert_eq!(notes_unread(&f).len(), 1, "{name}: {:?}", f.truncations);
+        }
+        // Another subsection, unread by name, beside the feature one is skipped.
+        let mut other = b"A\x0b\0\0\0vendor\0".to_vec();
+        other.extend_from_slice(&good[1..]);
+        let f = facts_of(&attributes_object(ET_REL, &other, None));
+        assert_eq!(marking(&f), [true; 3], "{f:?}");
+        assert!(notes_unread(&f).is_empty(), "{:?}", f.truncations);
+    }
+
+    #[test]
+    fn the_attributes_are_compared_on_their_three_bits_and_read_in_the_files_byte_order() {
+        let all = AARCH64_FEATURE_1_BTI | AARCH64_FEATURE_1_PAC | AARCH64_FEATURE_1_GCS;
+        let f = facts_of(&attributes_object(
+            ET_REL,
+            &gcc16_attributes(1, 1, 1),
+            Some(all | 0x8),
+        ));
+        assert_eq!(marking(&f), [true; 3], "{f:?}");
+        assert!(notes_unread(&f).is_empty(), "{:?}", f.truncations);
+
+        let little = gcc16_attributes(1, 0, 1);
+        let mut big = little.clone();
+        big[1..5].copy_from_slice(&0x23u32.to_be_bytes());
+        let both = AARCH64_FEATURE_1_BTI | AARCH64_FEATURE_1_GCS;
+        assert_eq!(feature_and_bits(&little, true), Ok(Some(both)));
+        assert_eq!(feature_and_bits(&big, false), Ok(Some(both)));
+        assert!(
+            feature_and_bits(&big, true).is_err(),
+            "the length read in the wrong order"
+        );
     }
 
     /// One `PT_NOTE` holding a single `"GNU\0"` note of the given type and descriptor.
@@ -7143,15 +7444,10 @@ mod tests {
         v
     }
 
-    /// Only `NT_GNU_PROPERTY_TYPE_0` notes carry properties, name notwithstanding.
-    ///
-    /// `"GNU\0"` is the name on the build-id note too, so the type is the whole of what
-    /// separates them. Read the wrong one and a build id -- arbitrary bytes -- is decoded as
-    /// a feature bitmap, which is a hardening verdict invented out of a hash.
     #[test]
     fn a_gnu_named_note_of_another_type_carries_no_properties() {
         const NT_GNU_BUILD_ID: u32 = 3;
-        let desc = property(GNU_PROPERTY_X86_FEATURE_1_AND, X86_FEATURE_1_IBT, false);
+        let desc = property(GNU_PROPERTY_X86_FEATURE_1_AND, X86_FEATURE_1_IBT, true);
 
         let as_property = facts_of(&one_note(NT_GNU_PROPERTY_TYPE_0, &desc));
         assert!(as_property.x86_ibt, "the property note must be read");
@@ -7168,20 +7464,13 @@ mod tests {
         );
     }
 
-    /// A descriptor holding two properties yields both, not just the first.
-    ///
-    /// The walk advances by the padded size of each record, and a mutation that stops after
-    /// one is invisible while every fixture carries a single property. The second record is
-    /// an aarch64 one behind an x86 one. On an x86-64 object it is listed and left undecoded;
-    /// on an aarch64 object it is the one that decodes, so a stalled walk reads as "no
-    /// branch protection" there -- a specific wrong answer rather than an empty one.
     #[test]
     fn every_property_in_one_descriptor_is_read() {
         let mut desc = property(GNU_PROPERTY_X86_FEATURE_1_AND, X86_FEATURE_1_IBT, true);
         desc.extend(property(
             GNU_PROPERTY_AARCH64_FEATURE_1_AND,
             AARCH64_FEATURE_1_BTI,
-            false,
+            true,
         ));
         let both = vec!["0xc0000000".to_owned(), "0xc0000002".to_owned()];
 
@@ -7213,11 +7502,8 @@ mod tests {
     }
 
     /// One `PT_NOTE` holding one `NT_GNU_PROPERTY_TYPE_0` note per `(type, word)` given,
-    /// on an object of machine `machine`.
-    ///
-    /// Each note is 28 bytes and the next begins at 32, the descriptor's 12 bytes padded
-    /// to the ELF64 note alignment. A linker emits one merged note; this builder is for
-    /// the files a linker did not merge.
+    /// on an object of machine `machine`: the files a linker, which emits one merged note,
+    /// did not write.
     fn property_notes(machine: u16, notes: &[(u32, u32)]) -> Vec<u8> {
         let note_at: u64 = 0x600;
         let mut d = elf64_header(1, 56, 0, 64);
@@ -7231,7 +7517,7 @@ mod tests {
         for (i, (pr_type, word)) in notes.iter().enumerate() {
             let n = usize::try_from(note_at).unwrap() + i * 32;
             d[n..n + 4].copy_from_slice(&4u32.to_le_bytes());
-            d[n + 4..n + 8].copy_from_slice(&12u32.to_le_bytes());
+            d[n + 4..n + 8].copy_from_slice(&16u32.to_le_bytes());
             d[n + 8..n + 12].copy_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
             d[n + 12..n + 16].copy_from_slice(b"GNU\0");
             d[n + 16..n + 28].copy_from_slice(&property(*pr_type, *word, false));
@@ -7239,12 +7525,6 @@ mod tests {
         d
     }
 
-    /// A feature word of any width but 4 marks nothing.
-    ///
-    /// The descriptor is the one clang 7.0.1 wrote under `-fcf-protection` in Debian 10 and
-    /// Fedora 29, byte for byte: `X86_FEATURE_1_AND`, `pr_datasz` 8, IBT and SHSTK in the
-    /// first word. readelf 2.31.1 and 2.46.1 print `<corrupt length: 0x8>`; read by its
-    /// first word it published `x86_ibt` and `x86_shstk` true and `cet-marked` `on`.
     #[test]
     fn a_feature_word_of_the_wrong_width_marks_nothing() {
         let wide: [u8; 16] = [
@@ -7264,22 +7544,13 @@ mod tests {
 
         let mut exact = wide;
         exact[4] = 4;
-        let f = facts_of(&one_note(NT_GNU_PROPERTY_TYPE_0, &exact[..12]));
+        let f = facts_of(&one_note(NT_GNU_PROPERTY_TYPE_0, &exact));
         assert!(
             f.x86_ibt && f.x86_shstk,
             "the same word at width 4 is decoded"
         );
     }
 
-    /// A processor-specific property means what `e_machine` says, and nothing without it.
-    ///
-    /// Reproduced with a synthetic `EM_X86_64` object whose only property was
-    /// `(0xc0000000, 3)`: `chard elf` printed `aarch64_bti: true, aarch64_pac: true` on an
-    /// x86-64 binary, while `readelf -n` printed `x86 ISA used: i486, 586`, because that
-    /// type was `GNU_PROPERTY_X86_ISA_1_USED` in binutils before 2.32 and still is in
-    /// objects those linkers produced. The type is listed either way; the word is
-    /// decoded only on the machine whose feature word it is, and on a machine this
-    /// reader does not know it is decoded as nothing.
     #[test]
     fn a_processor_specific_property_is_decoded_only_on_the_machine_that_defines_it() {
         let legacy_isa = (GNU_PROPERTY_AARCH64_FEATURE_1_AND, 3);
@@ -7327,15 +7598,6 @@ mod tests {
         assert_eq!(bits(&unknown), [false; 4], "and neither is decoded");
     }
 
-    /// Two notes carrying one feature word are combined by AND, in either order, and counted.
-    ///
-    /// `props.insert` overwrote: `(0, then IBT|SHSTK)` published CET on and the reverse
-    /// order published it off, on files `readelf -n` printed both notes for. The linker's
-    /// rule for `*_FEATURE_1_AND` is an AND across inputs, emitted in one note, so a
-    /// second note is a file no linker wrote and the word is the AND of both, the same
-    /// rule applied once more. The count beside it is how a reader tells a file with no
-    /// property note from one with two, and `gnu_property_notes` says what the loader
-    /// does with the second.
     #[test]
     fn repeated_feature_words_are_anded_in_either_order_and_counted() {
         let t = GNU_PROPERTY_X86_FEATURE_1_AND;
@@ -7390,16 +7652,16 @@ mod tests {
         assert_eq!(one.gnu_property_notes.get(key), Some(&1));
         let none = facts_of(&property_notes(EM_X86_64, &[]));
         assert!(none.gnu_property_notes.is_empty());
-        assert!(none.gnu_property_types.is_empty());
+        assert!(
+            none.gnu_property_types.is_empty(),
+            "an object with no property note has no property type: {:?}",
+            none.gnu_property_types
+        );
     }
 
     /// What `.chard.report` holds, once `section_text` has turned its NULs into newlines.
     const REPORT_TEXT: &str = "fortify=2\nstack_protector=strong";
 
-    /// A `.chard.report` listed and cut is recorded against the section-names table with
-    /// an entry that opens on the section's name, which `report::self_report_entries` reads
-    /// to tell a section the reader could not finish from one the list lacks; the facts
-    /// then read as an artifact that gave no account, with that entry quoted.
     #[test]
     fn a_cut_self_report_is_named_at_the_head_of_its_entry() {
         const SHOFF: usize = 256;
@@ -7431,11 +7693,6 @@ mod tests {
 
     /// An object with a real section-name table: a null section, the name table itself,
     /// a `.chard.report` holding the self report, and a `.bss` that is `SHT_NOBITS`.
-    ///
-    /// `.bss` deliberately points at `.chard.report`'s bytes. A `NOBITS` section occupies no
-    /// file space, so its `sh_offset` names bytes belonging to something else -- and a
-    /// reader that forgets to check the type returns those bytes as if they were the
-    /// section's own. Pointing it somewhere harmless would make that mistake invisible.
     fn object_with_named_sections() -> Vec<u8> {
         const SHT_PROGBITS: u32 = 1;
         const SHOFF: usize = 256;
@@ -7475,10 +7732,6 @@ mod tests {
 
     /// An object whose only named section besides the name table is a `.comment` of
     /// `sh_type`, `size` bytes at `offset`, holding `payload` where the file has room.
-    ///
-    /// `offset` and `size` are parameters so one builder can produce the three shapes the
-    /// reader must tell apart: a section it can read, a `NOBITS` one that occupies no file
-    /// space, and one whose header points past the end of the file.
     fn object_with_comment(sh_type: u32, offset: u64, size: u64, payload: &[u8]) -> Vec<u8> {
         const SHOFF: usize = 256;
         const STRTAB_AT: u64 = 0x800;
@@ -7512,17 +7765,6 @@ mod tests {
         d
     }
 
-    /// `.comment` reaches the facts as one line per producer, and the three ways of
-    /// carrying nothing stay distinct.
-    ///
-    /// `toolchain::artifact_agreement` reads `comment` to decide whether the linker the
-    /// banner named is the one that produced the artifact, and it reads an empty list as
-    /// "no linker signed this object" only when the section was read to its end. So the
-    /// absent section, the `NOBITS` section and the section the reader could not reach
-    /// are each pinned here: the first two are empty with no truncation, the third is
-    /// empty with a truncation `comment_truncation` finds, and a reader that returned an
-    /// empty list for the third would turn an unreadable file into a clean-looking
-    /// absence.
     #[test]
     fn the_comment_section_reaches_the_facts() {
         const SHT_PROGBITS: u32 = 1;
@@ -7567,7 +7809,11 @@ mod tests {
         assert!(nobits.comment_truncation().is_none());
 
         let past_eof = facts_of(&object_with_comment(SHT_PROGBITS, 0x10_0000, size, payload));
-        assert!(past_eof.comment.is_empty());
+        assert!(
+            past_eof.comment.is_empty(),
+            "a .comment past the end of the file reads no line: {:?}",
+            past_eof.comment
+        );
         let why = past_eof
             .comment_truncation()
             .expect("a .comment the reader could not reach is named in truncations");
@@ -7581,15 +7827,18 @@ mod tests {
         );
 
         // No section-header table at all, as `objcopy --strip-section-headers` leaves a
-        // file: the section could not be looked up, which is a fourth way of carrying
-        // nothing and reads as the third. Without this entry the file counted as read to
-        // its end with no lines, and under an lld banner that was a false `disagrees`.
+        // file: a fourth way of carrying nothing, which reads as the third; read as a
+        // section read to its end, it would make an lld banner a false `disagrees`.
         let mut headerless = object_with_comment(SHT_PROGBITS, AT, size, payload);
         headerless[40..48].copy_from_slice(&0u64.to_le_bytes());
         headerless[60..62].copy_from_slice(&0u16.to_le_bytes());
         headerless[62..64].copy_from_slice(&0u16.to_le_bytes());
         let unlisted = facts_of(&headerless);
-        assert!(unlisted.comment.is_empty());
+        assert!(
+            unlisted.comment.is_empty(),
+            "an object with no section headers reads no .comment line: {:?}",
+            unlisted.comment
+        );
         assert!(unlisted.sections.is_empty(), "{:?}", unlisted.sections);
         let why = unlisted
             .comment_truncation()
@@ -7600,13 +7849,6 @@ mod tests {
         );
     }
 
-    /// The self report reaches the facts from the section that carries it.
-    ///
-    /// `probe.rs` reads `facts().self_report` and parses it into the key/value pairs the
-    /// runtime channel answers with, and its own tests build `ElfFacts` with the string
-    /// already in place. So the parsing was covered while the step before it -- finding
-    /// `.chard.report` in the object and reading its bytes -- was not, and an accessor
-    /// returning nothing would have emptied the channel without an error anywhere.
     #[test]
     fn the_self_report_section_reaches_the_facts() {
         let facts = facts_of(&object_with_named_sections());
@@ -7614,14 +7856,13 @@ mod tests {
         assert!(facts.sections.iter().any(|s| s == SELF_REPORT_SECTION));
         // A section that is absent reads as empty, which is what makes the case above
         // meaningful rather than a value that appears whatever is asked for.
-        assert!(facts.recorded_command_line.is_empty());
+        assert!(
+            facts.recorded_command_line.is_empty(),
+            "an absent section reads as empty: {:?}",
+            facts.recorded_command_line
+        );
     }
 
-    /// A `NOBITS` section has no bytes in the file, whatever its offset says.
-    ///
-    /// `.bss` is the everyday case. Its `sh_offset` is a placeholder pointing into a
-    /// neighbour, so reading it as an ordinary section returns that neighbour's contents --
-    /// here, the self report -- and a caller cannot tell the difference.
     #[test]
     fn a_nobits_section_has_no_bytes_and_an_ordinary_one_has_its_own() {
         let obj = object_with_named_sections();
@@ -7644,7 +7885,6 @@ mod tests {
         );
     }
 
-    /// `section_by_name` answers for the name it was given, and only that one.
     #[test]
     fn a_section_is_found_by_its_own_name_and_no_other() {
         let obj = object_with_named_sections();
@@ -7660,20 +7900,6 @@ mod tests {
         );
     }
 
-    /// The names the header's three escapes point at, and the names it withholds.
-    ///
-    /// Reproduced on `/bin/ls` against a reader that ignores the escapes: with
-    /// `e_shstrndx = 0` it takes the null header as the name table, reads C strings out of
-    /// file offset 0, and publishes `"\x7fELF\x02\x01\x01"` in `sections` as a name the file
-    /// carried, while `readelf -S` prints `<no-strings>` for every one. With
-    /// `e_shstrndx = 0xffff` and the real index in `shdr[0].sh_link` it finds no table and
-    /// every fact reached by name goes empty, and with `e_shnum = 0` and the count in
-    /// `shdr[0].sh_size` it finds no sections at all, so `relro` falls from `full` to
-    /// `partial` on a file whose sections are all there. All three exit 0.
-    ///
-    /// The refusals are as important as the escapes. A name table that is not a string
-    /// table is not read, and the file says so under the `section names:` prefix, which
-    /// is what separates "this file named nothing" from "this file has nothing".
     #[test]
     fn section_names_follow_the_headers_escapes_and_refuse_a_table_that_is_not_one() {
         const SHOFF: usize = 256;
@@ -7696,7 +7922,7 @@ mod tests {
         assert_eq!(named(&base), all, "the control: every name resolves");
         assert_eq!(names_note(&base), None, "and nothing is withheld");
 
-        // SHN_UNDEF: the file declares no name table. Nothing is fabricated from offset 0.
+        // SHN_UNDEF: the file declares no name table.
         let mut undef = base.clone();
         undef[62..64].copy_from_slice(&0u16.to_le_bytes());
         assert!(
@@ -7737,12 +7963,11 @@ mod tests {
         // A candidate that is not a string table is refused, and so is one past the table.
         let mut progbits = base.clone();
         progbits[62..64].copy_from_slice(&2u16.to_le_bytes());
-        assert!(named(&progbits).is_empty());
-        let note = names_note(&progbits).expect("refused, and said");
         assert!(
-            note.contains("SHT_STRTAB"),
-            "the reason is the type: {note}"
+            named(&progbits).is_empty(),
+            "a candidate that is not a string table names nothing"
         );
+        let note = names_note(&progbits).expect("refused, and said");
         assert!(!note.contains("  "), "one space between words: {note}");
         // With no names, `.comment` could not be looked up, and its consumer is told so;
         // an empty list would read as a section read to its end.
@@ -7755,14 +7980,15 @@ mod tests {
         );
         let mut past = base.clone();
         past[62..64].copy_from_slice(&7u16.to_le_bytes());
-        assert!(named(&past).is_empty());
+        assert!(
+            named(&past).is_empty(),
+            "a candidate past the section table names nothing"
+        );
         let note = names_note(&past).expect("refused, and said");
         assert!(note.contains("past"), "the reason is the range: {note}");
         assert!(!note.contains("  "), "one space between words: {note}");
 
-        // A name is bounded by the table's declared size. With
-        // `.shstrtab` cut to 12 bytes, `.chard.report` at offset 11 has one byte left and
-        // `.bss` at 25 has none; a read bounded by EOF would still return both in full.
+        // A name is bounded by the table's declared size.
         let mut short = base.clone();
         short[SHOFF + 64 + 32..SHOFF + 64 + 40].copy_from_slice(&12u64.to_le_bytes());
         assert_eq!(
@@ -7772,8 +7998,6 @@ mod tests {
         );
     }
 
-    /// `e_phnum = PN_XNUM` means the count is in `shdr[0].sh_info`, and only when there
-    /// is a section-header table to hold it.
     #[test]
     fn a_program_header_count_of_pn_xnum_is_read_from_the_null_section_header() {
         const SHOFF: usize = 256;
@@ -7794,30 +8018,13 @@ mod tests {
         );
 
         // Without a section table there is nowhere to escape to: the declared 65535 is
-        // walked and runs off the file, which is an error. The ELF header is never read
-        // as `shdr[0]`.
+        // walked and runs off the file, which is an error.
         assert!(
             Elf::parse(&elf64_header(PN_XNUM, 56, 0, 64)).is_err(),
             "PN_XNUM with e_shoff = 0 is malformed and must not parse"
         );
     }
 
-    /// A count escape whose `shdr[0]` the file does not hold reads as no section-header
-    /// table, with the reason recorded, and the facts reached through segments survive.
-    ///
-    /// `e_shnum = 0` with a nonzero `e_shoff` says the count is in `shdr[0]`. A file cut
-    /// before its section-header table, or one whose header was edited, leaves that offset
-    /// past the end. GNU readelf probes `shdr[0]` for the escapes and applies none of them
-    /// when the probe fails, so it reports no sections and reads on; this reader refused
-    /// the file, and the differential in `tests/elf_readelf.rs` would have reported it
-    /// unreadable by one side. Pinned on a synthetic file, since the checked-in fixtures
-    /// are also compared against `llvm-readelf`, which refuses such a file outright
-    /// (`section header table goes past the end of the file`, LLVM 23.1.0).
-    ///
-    /// The tolerance is for the count escape alone. The same stale offset under a declared
-    /// count is a table the file does not hold, and under `PN_XNUM` it leaves a
-    /// program-header count of 65535 the file does not hold either; both stay errors, as
-    /// they are in readelf.
     #[test]
     fn a_count_escape_whose_shdr0_the_file_does_not_hold_reads_as_no_section_table() {
         const STALE: u64 = 0x10000; // the synthetic file is 4096 bytes
@@ -7874,8 +8081,7 @@ mod tests {
         assert_eq!(facts.gnu_stack_present, Some(true));
         assert!(facts.has_interp);
 
-        // The control: a readable shdr[0] is followed, and records no note. The same
-        // escape on the object with a real name table, its count in `shdr[0].sh_size`.
+        // The control: a readable shdr[0] is followed, and records no note.
         let mut followed = object_with_named_sections();
         followed[60..62].copy_from_slice(&0u16.to_le_bytes());
         followed[256 + 32..256 + 40].copy_from_slice(&4u64.to_le_bytes());
@@ -7902,16 +8108,6 @@ mod tests {
         );
     }
 
-    /// Every machine the reader names renders as its name, and any other as unrecognised.
-    ///
-    /// The values are the ones glibc's `elf.h` defines. The same ten headers were run
-    /// through `llvm-readelf` (Homebrew LLVM 23.1.0), which named them `Intel 80386`,
-    /// `MIPS R3000`, `PowerPC`, `PowerPC64`, `IBM S/390`,
-    /// `ARM`, `Advanced Micro Devices X86-64`, `AArch64`, `RISC-V` and `LoongArch`;
-    /// `tests/elf_readelf.rs`
-    /// repeats that comparison on every object of those machines the differential meets.
-    /// The numbers are written out here on purpose, so a constant that drifts from the
-    /// table is a red test and the fixture record is a second witness for `EM_PPC`.
     #[test]
     fn a_machine_is_named_or_said_to_be_unrecognised() {
         let machine_of = |e_machine: u16| {
@@ -7948,16 +8144,31 @@ mod tests {
         }
     }
 
-    /// `cstr_at` never reads past `off + table_len` bytes from `base`, even when no NUL
-    /// appears within that window and one does appear just past it.
-    ///
-    /// This is the property the earlier, unbounded `cstr_at` did not have: it scanned for
-    /// the nearest NUL regardless of what the caller's own table declared, so a crafted
-    /// table with no terminator inside its declared length pulled in whatever followed —
-    /// the next table, a descriptor, or (worst case) ran to the true end of the file. The
-    /// fixture below is built to fail exactly that way if the bound were ever dropped: the
-    /// declared window holds no NUL at all, and the first NUL in the underlying buffer sits
-    /// several bytes past it.
+    #[test]
+    fn a_read_past_the_address_space_is_refused_by_its_own_variant() {
+        let data = [0u8; 16];
+        let cur = Cursor {
+            data: &data,
+            little: true,
+        };
+        let past = u64::from(u32::MAX) + 1;
+        if usize::BITS < 64 {
+            assert_eq!(cur.slice(past, 1), Err(ReadError::OffsetTooLarge(past)));
+            assert_eq!(cur.slice(0, past), Err(ReadError::LengthTooLarge(past)));
+            assert_eq!(cur.u32_at(past), Err(ReadError::OffsetTooLarge(past)));
+            assert_eq!(
+                cur.addr_at(past, false),
+                Err(ReadError::OffsetTooLarge(past))
+            );
+        } else {
+            let start = usize::try_from(past).expect("a 64-bit usize");
+            assert_eq!(
+                cur.slice(past, 1),
+                Err(ReadError::OutOfBounds { start, count: 1 })
+            );
+        }
+    }
+
     #[test]
     fn a_cstring_read_never_crosses_its_own_tables_declared_end() {
         // "AAAA" + more non-NUL bytes, then a NUL well past any window under test.
@@ -7969,51 +8180,80 @@ mod tests {
             little: true,
         };
 
-        // Declared window of 4 bytes, no NUL inside it: must read as the 4 bytes on hand,
-        // not scan forward to the NUL at offset 16.
+        // A 4-byte window with no NUL reads its 4 bytes, not on to the NUL at offset 16.
         let bounded = cur.cstr_at(0, 0, 4);
         assert_eq!(
-            bounded, "AAAA",
+            bounded,
+            Ok(&b"AAAA"[..]),
             "a table with no terminator inside its declared length must stop at that \
              length, not scan into whatever follows"
         );
 
-        // `off` is an index into the table, and the bound is relative to the table's
-        // start, not to `off` — so a nonzero `off` shrinks the remaining window rather
-        // than resetting it.
+        // The bound is relative to the table's start, not to `off`: a nonzero `off` shrinks
+        // the window rather than resetting it.
         let from_middle = cur.cstr_at(0, 2, 4);
         assert_eq!(
-            from_middle, "AA",
+            from_middle,
+            Ok(&b"AA"[..]),
             "off=2 into a 4-byte table leaves 2 bytes, not the full table_len again"
         );
 
         // `off` at or past the declared end reads as absent, not as reaching past it.
         assert_eq!(
             cur.cstr_at(0, 4, 4),
-            "",
+            Ok(&b""[..]),
             "an offset at the table's own declared end must not read past it"
         );
         assert_eq!(
             cur.cstr_at(0, 9, 4),
-            "",
+            Ok(&b""[..]),
             "an offset past the table's own declared end must not read at all"
         );
 
-        // The control: the same buffer with a window wide enough to reach the real NUL
-        // reads the intended string, so the bound above is doing the cutting, not an
-        // unrelated off-by-one.
+        // The control: a window that reaches the real NUL reads the string, so the bound
+        // above does the cutting.
         assert_eq!(
             cur.cstr_at(0, 0, 100),
-            "A".repeat(16),
+            Ok("A".repeat(16).as_bytes()),
             "a window that reaches the real terminator must read up to it"
         );
     }
 
-    /// A read error says how much was read and where, because that is the whole of its use.
-    ///
-    /// These messages reach a report as evidence for a refusal. One that renders to nothing
-    /// turns "this object could not be read at 0x900" into a blank, and the reader is left
-    /// with a failure and no location.
+    #[test]
+    fn a_name_past_the_bound_on_one_name_is_refused_not_cut() {
+        let at_bound = [vec![b'n'; MAX_NAME_BYTES], vec![0]].concat();
+        let past_bound = [vec![b'n'; MAX_NAME_BYTES + 1], vec![0]].concat();
+        let no_nul = vec![b'n'; MAX_NAME_BYTES * 2];
+        let len = |d: &[u8]| u64::try_from(d.len()).expect("a length fits u64");
+        let read = |d: &[u8]| {
+            Cursor {
+                data: d,
+                little: true,
+            }
+            .cstr_at(0, 0, len(d))
+            .map(<[u8]>::len)
+        };
+        assert_eq!(read(&at_bound), Ok(MAX_NAME_BYTES));
+        assert_eq!(read(&past_bound), Err(Overlong));
+        assert_eq!(read(&no_nul), Err(Overlong));
+        // A table that ends at the bound with no NUL is the table-length rule, not a refusal.
+        assert_eq!(read(&no_nul[..MAX_NAME_BYTES]), Ok(MAX_NAME_BYTES));
+        // A name read is charged its bytes and its NUL, and one past the budget is refused.
+        let cur = Cursor {
+            data: &at_bound,
+            little: true,
+        };
+        let budget = Budget::new(u64::try_from(MAX_NAME_BYTES).expect("fits") + 1);
+        assert!(name_in(&cur, &budget, (0, 0, len(&at_bound))).is_ok());
+        assert_eq!(budget.left.get(), 0);
+        assert_eq!(budget.exhausted(), None);
+        assert!(matches!(
+            name_in(&cur, &budget, (0, 0, len(&at_bound))),
+            Err(NameFault::Spent(_))
+        ));
+        assert!(budget.exhausted().is_some());
+    }
+
     #[test]
     fn a_read_error_names_the_size_and_the_place() {
         for (err, wanted) in [
@@ -8044,14 +8284,6 @@ mod tests {
         }
     }
 
-    /// A forged `.dynstr` section cannot outvote the `DT_STRTAB` the loader resolves.
-    ///
-    /// The sibling of `dynamic()`'s order, in `dyn_strings`. A crafted file points `.dynstr`
-    /// at zeroed bytes while the real `DT_STRTAB` names `libm.so.6`. Read by the section,
-    /// `needed` would read `[""]`, and `as-needed`, whose detector asks whether any entry
-    /// starts with `libm.`, would conclude the linker had dropped the unused library and
-    /// report `on`. `readelf -d` takes the section's reading, because it reads sections too;
-    /// the loader does not.
     #[test]
     fn a_forged_dynstr_section_cannot_outvote_dt_strtab() {
         const REAL_STR: u64 = 0x800; // file offset and vaddr of the honest string table
@@ -8067,9 +8299,7 @@ mod tests {
         d[72..80].copy_from_slice(&0u64.to_le_bytes()); // p_offset
         d[80..88].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
         d[96..104].copy_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
-        // p_memsz too: `offset_of_vaddr` bounds on it, not on p_filesz, and a fixture that
-        // leaves it zero makes the address resolve to None and the test fail against
-        // correct code.
+        // p_memsz too: `offset_of_vaddr` bounds on it, not on p_filesz.
         d[104..112].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
         // phdr 1: PT_DYNAMIC
         let dyn_at: u64 = 0x400;
@@ -8110,16 +8340,6 @@ mod tests {
         );
     }
 
-    /// The loader's view wins when a file offers two that disagree.
-    ///
-    /// `ld.so` reads `PT_DYNAMIC` and never reads section headers; `strip --strip-all`
-    /// removes them without changing what the file does. Preferring the section view let a
-    /// crafted `ET_DYN` whose real segment set no flags read as `pie: true`,
-    /// `df_1_pie: true`, `bind_now: true` -- a false `on` on an attacker-supplied binary,
-    /// while `readelf -d` reported `FLAGS_1: None` from the segment the loader uses.
-    ///
-    /// Both directions, because only checking that the forged `on` is gone would also pass
-    /// if the parser had stopped reading `.dynamic` altogether.
     #[test]
     fn a_dynamic_section_cannot_outvote_the_segment_the_loader_reads() {
         // One PT_DYNAMIC phdr and one SHT_DYNAMIC shdr, each aimed at its own table.
@@ -8180,9 +8400,6 @@ mod tests {
         );
     }
 
-    /// Bytes that are not an object are refused as `NotElf`, with the two messages the
-    /// envelope and `Variant::elf_error` carry verbatim, and a class or data encoding this
-    /// reader has no layout for is the same variant naming the byte.
     #[test]
     fn rejects_non_elf_input() {
         let Err(text) = Elf::parse(b"not an elf at all, just some bytes") else {
@@ -8253,8 +8470,6 @@ mod tests {
         }
     }
 
-    /// [`is_stride_record`] knows [`record_stride`]'s records and no other `ignored` one: the
-    /// two share the sentence's tail, so a reworded record cannot leave the filter behind.
     #[test]
     fn a_stride_record_is_told_apart_by_its_writer() {
         for table in [ElfTable::Symbols, ElfTable::Relocations, ElfTable::Dynamic] {
@@ -8364,8 +8579,7 @@ mod tests {
                 );
                 // Every mention is one of four things: a field read (`.sh_entsize`), a word
                 // inside a string literal, the field itself (`sh_entsize:`, its declaration and
-                // the parse that sets it), or a longer identifier. A destructuring or any other
-                // spelling of a read is none of them and fails.
+                // the parse that sets it), or a longer identifier.
                 for (pos, _) in line.match_indices(&name) {
                     let (before, rest) = line.split_at(pos);
                     let after = rest.split_at(name.len()).1;
@@ -8406,12 +8620,6 @@ mod tests {
         (before.len(), body)
     }
 
-    /// Every walk of a fixed-record table takes its stride from [`record_stride`]
-    /// (2026-10-20). In the reader's non-test source no entry size is floored at the record,
-    /// the one read of a section's `sh_entsize` is in [`Elf::section_stride`], which hands it
-    /// to the helper, and the dynamic relocation tables' entry-size tags are read in
-    /// `relocation_reach` alone, which calls it. The scanned files are the reader's modules,
-    /// and each assertion names the frame it was made over.
     #[test]
     fn every_stride_is_decided_by_record_stride() {
         let listed: Vec<&str> = READER_SOURCES
@@ -8468,8 +8676,6 @@ mod tests {
         }
     }
 
-    /// A header cut short is a bounded read that fell outside the object, typed as such,
-    /// so a future re-typing cannot pass as a bare `is_err()`.
     #[test]
     fn truncated_elf_header_is_an_error_not_a_panic() {
         let mut data = b"\x7fELF\x02\x01\x01".to_vec();
@@ -8489,13 +8695,6 @@ mod tests {
         );
     }
 
-    /// A directory, a device or a socket is refused from its metadata, before it is
-    /// opened, and the refusal names what it was.
-    ///
-    /// The directory is the case a unit test can build without a shell-out. A FIFO is
-    /// read, and `tests/error_classes.rs` holds that through the built binary with an
-    /// object fed down a pipe; the cap on that read is pinned by
-    /// `a_stream_is_read_to_its_end_and_stopped_at_the_cap`.
     #[test]
     fn what_is_not_a_regular_file_is_refused_before_it_is_opened() {
         let dir = std::env::temp_dir().join(format!("chard-notfile-{}", std::process::id()));
@@ -8516,12 +8715,6 @@ mod tests {
         crate::error::best_effort(std::fs::remove_dir_all(&dir));
     }
 
-    /// The cap on a source whose length the metadata cannot report.
-    ///
-    /// A stream that ends within the cap is read whole, one that ends exactly at the cap
-    /// is read whole, and one that goes past it is refused after one byte over: the
-    /// endless source proves the reader stops rather than reading to an end that never
-    /// comes.
     #[test]
     fn a_stream_is_read_to_its_end_and_stopped_at_the_cap() {
         let bytes = [7u8; 16];
@@ -8542,12 +8735,6 @@ mod tests {
         );
     }
 
-    /// Every variant renders its path in front of its reason, and `facts_for` is what
-    /// attaches the path to a refusal `parse` made without one.
-    ///
-    /// The messages reach the envelope and `Variant::elf_error` as evidence, and one that
-    /// names no file leaves a reader with a refusal and nothing to open. `Display` carries
-    /// the whole message and `source()` is `None`, for the reason the type's doc gives.
     #[test]
     fn an_elf_error_names_the_path_and_the_reason() {
         use std::error::Error as _;
@@ -8628,11 +8815,8 @@ mod tests {
         assert_eq!(kept.path(), Some(Path::new("/first")));
     }
 
-    /// A deterministic pseudo-random sequence, so a failure reproduces exactly.
-    ///
-    /// A xorshift rather than a dependency, and seeded rather than drawn from the clock:
-    /// a fuzz test that cannot be re-run on the input that broke it is a bug report
-    /// nobody can act on.
+    /// A deterministic xorshift sequence, seeded rather than drawn from the clock, so a
+    /// failure reproduces exactly.
     struct Rng(u64);
 
     impl Rng {
@@ -8644,20 +8828,8 @@ mod tests {
         }
     }
 
-    /// A real ELF object to mutate, taken from the running test binary.
-    ///
-    /// Deliberately not synthesised. A hand-built header exercises the paths a reader
-    /// already agrees with itself about; a real linked object carries the section,
-    /// segment, dynamic, symbol and note tables whose *offsets into each other* are where
-    /// this parser does its arithmetic, and those are what a corrupted length actually
-    /// puts under pressure.
-    ///
-    /// `None` on a host whose binaries are not ELF, where there is no seed and no
-    /// substitute: a checked-in object would be a binary chard did not build, and a
-    /// synthesised one is what the paragraph above rejects. The callers announce and
-    /// return rather than being `#[cfg]`-ed away, which is how this was written first --
-    /// that silently moved the lib binary from 248 tests to 246 on a Mac, and a count that
-    /// changes with the host without saying so is the reduced coverage nobody notices.
+    /// A real ELF object to mutate, the running test binary; `None`, announced as a
+    /// capability gap, on a host whose binaries are not ELF.
     fn a_real_object(verifies: &str) -> Option<Vec<u8>> {
         let path = std::env::current_exe().expect("the test binary's own path");
         let bytes = std::fs::read(&path).expect("reading the test binary");
@@ -8674,17 +8846,11 @@ mod tests {
         Some(bytes)
     }
 
-    /// The parser must return, never panic, on any corruption of a real object.
+    /// The parser returns, never panics, on any corruption of a real object: a header that
+    /// parses, leading the reader into tables whose offsets and counts are corrupted.
     ///
-    /// `src/elf.rs` reads binaries chard did not build — `chard elf` takes any path a
-    /// caller hands it — so its input is the one thing in this project that is not
-    /// chard's to trust. `unsafe_code = "deny"` rules out memory unsafety, which leaves
-    /// panics: an out-of-range slice, an overflowing offset, a length taken from the file
-    /// and used as a bound. A panic costs the caller every object not yet reached.
-    ///
-    /// Two existing tests covered one truncation and one non-ELF buffer. This covers the
-    /// shape those miss: a header that parses, leading the reader into tables whose
-    /// offsets and counts have been corrupted underneath it.
+    /// `chard elf` reads any path a caller hands it, and `unsafe_code = "deny"` leaves a
+    /// panic as the failure, which costs the caller every object not yet reached.
     #[test]
     fn no_corruption_of_a_real_object_makes_the_parser_panic() {
         let Some(original) = a_real_object("that no corruption of a real object panics the parser")
@@ -8696,8 +8862,8 @@ mod tests {
         // Concentrated on the first 4 KiB, where every table offset and count lives. A
         // byte flipped in the middle of .text changes nothing this parser reads.
         let header_span = original.len().min(4096);
-        // The corruptions, drawn first and in order from the one seed, so the set is the
-        // same however it is shared out below. A flip is a byte offset and the bit it flips.
+        // Drawn first, in order from the one seed, so the set is the same however it is
+        // shared out below. A flip is a byte offset and the bit it flips.
         let plans: Vec<Vec<(usize, u8)>> = (0..1200)
             .map(|_| {
                 let flips = 1 + (rng.next() % 4) as usize;
@@ -8709,14 +8875,9 @@ mod tests {
                     .collect()
             })
             .collect();
-        // Each corruption parsed and walked, on every thread the host offers: one parse
-        // of a debug test binary of some megabytes takes a fifth of a second, and the
-        // twelve hundred of them one after another were the merge gate's longest wait.
-        // Each thread mutates its own copy in place and restores it, rather than
-        // cloning per corruption: cloning the seed four thousand times spent the test's
-        // whole runtime in the allocator rather than in the parser.
-        // At most eight: each worker holds its own copy of the seed, a debug test binary of up
-        // to some 140 MB, and eight already make the walk a matter of seconds.
+        // Each corruption parsed and walked on up to eight threads, each mutating its own
+        // copy of the seed in place and restoring it: a copy per corruption spends the run
+        // in the allocator, and each worker's copy is a whole debug test binary.
         let threads = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .min(8);
@@ -8737,10 +8898,9 @@ mod tests {
                             }
                             match Elf::parse(&data) {
                                 Ok(elf) => {
-                                    // Force the whole extraction, not just the header:
-                                    // `facts()` is what walks the tables the corrupted
-                                    // offsets point into.
-                                    let _ = elf.facts();
+                                    // `facts()` walks the tables the corrupted offsets
+                                    // point into.
+                                    let _: ElfFacts = elf.facts();
                                     parsed = parsed.saturating_add(1);
                                 }
                                 Err(_) => rejected = rejected.saturating_add(1),
@@ -8760,8 +8920,7 @@ mod tests {
                 })
                 .collect();
             workers.into_iter().fold((0usize, 0usize), |(p, r), w| {
-                // A worker that panicked is the parser panicking on a corruption (or the
-                // restore failing): the test fails with that panic, as it did on one thread.
+                // A worker's panic is the parser's (or the restore's): the test fails with it.
                 let (wp, wr) = w.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
                 (p.saturating_add(wp), r.saturating_add(wr))
             })
@@ -8772,13 +8931,13 @@ mod tests {
         let mut truncations_parsed = 0usize;
         for len in 0..header_span.min(1024) {
             if let Ok(elf) = Elf::parse(original.get(..len).unwrap_or(&original)) {
-                let _ = elf.facts();
+                let _: ElfFacts = elf.facts();
                 truncations_parsed = truncations_parsed.saturating_add(1);
             }
         }
 
-        // The frame. Reaching here having only ever failed at the magic bytes would mean
-        // the parser was never entered, and the test would pass having exercised nothing.
+        // The frame: a run that only ever failed at the magic bytes never entered the
+        // parser, and would pass having exercised nothing.
         eprintln!(
             "fuzzed {} corrupted objects ({parsed_ok} parsed, {errored} rejected, on {} \
              threads) and {} truncations ({truncations_parsed} parsed)",

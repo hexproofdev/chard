@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Build output, libFuzzer's crash artifacts, the growing corpus, and the lockfile of a
-# crate nothing ships. A crash worth keeping is minimised and committed under crashes/
-# with a note, by hand.
+# Build output, libFuzzer's crash artifacts and the growing corpus. A crash worth keeping is
+# minimised and committed under crashes/ with a note, by hand. Cargo.lock is tracked: `make
+# clippy-fuzz` lints this workspace `--locked`, so its verdict is a function of the commit.
 target
 artifacts
 corpus
 coverage
-Cargo.lock
 # Written into the working directory when a target binary is run directly rather than
 # through `cargo fuzz run`.
 crash-*

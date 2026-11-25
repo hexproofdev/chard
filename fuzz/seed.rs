@@ -1,51 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! Seeds for the input shapes the fuzzers do not find from a report alone, written into
 //! the ignored corpus by `make fuzz-seed`.
-//!
-//! `chard detect --evidence` sniffs five shapes and a report is only one of them; left to
-//! byte mutation, the fuzzer stayed on reports (1355 of the 1379 inputs of its corpus that
-//! parsed, 2026-09-29) and never reached the record, store-entry or `chard elf` paths. And
-//! `table` and `matrix` join several reports, which a single seed never does. So:
-//!
-//! - one fixture record per (check, arm, expected) of `tests/fixtures/detectors.json`,
-//!   into `detect_evidence`, and of each whose run prints a `report::VOLATILE_READINGS`
-//!   value, a copy with the value masked as `--normalize` masks it, and one masked copy
-//!   with a ratio of 0: a normalized report is a shape `chard detect --evidence` replays
-//!   and the fixtures, which are not normalized, do not hold (the 2026-10-06 campaign's
-//!   coverage left `detect_stack_clash`'s normalized-distance branch unexecuted);
-//! - every ELF fixture (`tests/fixtures/elf/*.elf`) into `elf_parse`, counted against the
-//!   `*.expected.json` files beside them, so a corpus run without the fixture directory as
-//!   a seed directory still starts from them: that campaign ran from its corpora and its
-//!   coverage left the `EM_RISCV` arm of the relocation-name table unexecuted, though
-//!   `elf64-le-riscv-rel-no-plt-got.elf` reaches it;
-//! - the first store entry of each kind in each report, and a `chard elf`-shaped object
-//!   built from the first `elf` entry, into `detect_evidence`;
-//! - every report, the reports as one array, and the same array with one report moved to
-//!   another corpus and revision, into `report_render`; the arrays hold [`slim`] copies;
-//! - every `macro-dump` entry of each report, its filtered defines written back as the
-//!   `#define NAME VALUE` lines a dump prints, into `parse_macros`, named by the digest it
-//!   is stored under, so a dump several reports share is one seed (reports measured at this
-//!   revision store only `elf` and `elf-delta` entries, so this writes none, and says so in
-//!   its count);
-//! - every stderr of `tests/fixtures/detectors.json` that carries a `runs` key into
-//!   `structured_diag`, each held to decode through `structured::decode` to at least one
-//!   finding with a level SARIF names: each is a document a real gcc or clang printed, and a
-//!   reading of one that is undecodable or empty is a finding, so the seeding exits 1;
-//! - a fixed set of attestations into `attestation`, one per digest kind with and without an
-//!   installed disk, one predating `origin` and `manifest_fetched`, one with no manifest and
-//!   one mismatched, under `example.invalid` URLs; and every attestation found in a report
-//!   given, as `--image-attestation` takes it and as the report publishes it.
-//!
-//! `seed --attestations <corpus-dir> <file>...` writes every attestation found anywhere in
-//! the JSON files named (session files, reports, a fetcher's own `attestation.json`) into
-//! `attestation`, each once by content, with `status` and `established_by` taken off a
-//! published block, and is how a fleet's attestations reach the corpus: they name the
-//! publishers' URLs and, for a container lane, a local path, so they are not tracked. It
-//! exits 1 when no file is named, any file named is not readable JSON, or no attestation is
-//! found in them, so a mistyped glob does not pass as a seeding.
-//!
-//! Usage: `seed <corpus-dir> <detectors.json> <elf-fixture-dir> <report.json>...` or
-//! `seed --attestations <corpus-dir> <file>...`
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -70,9 +25,15 @@ fn sarif_stderrs<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
 
 /// Write each SARIF stderr of the fixtures into `dir`, once by content, and hold each to
 /// decode to findings with SARIF's levels. `None` where one does not, naming it.
+#[expect(
+    clippy::expect_used,
+    reason = "the seed writer is a dev tool make fuzz-seed runs: an I/O failure stops it naming what it was doing, and make fails as on exit 1"
+)]
 fn seed_sarif(rows: &[Value], dir: &Path) -> Option<usize> {
     let mut found = Vec::new();
-    rows.iter().for_each(|row| sarif_stderrs(row, &mut found));
+    for row in rows {
+        sarif_stderrs(row, &mut found);
+    }
     std::fs::create_dir_all(dir).expect("creating a corpus directory");
     let mut written = BTreeSet::new();
     for stderr in &found {
@@ -85,10 +46,9 @@ fn seed_sarif(rows: &[Value], dir: &Path) -> Option<usize> {
             eprintln!("seed: a fixture's SARIF stderr reads as {findings:?}: {stderr}");
             return None;
         }
-        let name = format!(
-            "fixture-{}",
-            &chard::digest::sha256_hex(stderr.as_bytes())[..16]
-        );
+        let mut digest = chard::digest::sha256_hex(stderr.as_bytes());
+        digest.truncate(16);
+        let name = format!("fixture-{digest}");
         if written.insert(name.clone()) {
             std::fs::write(dir.join(name), stderr).expect("writing a seed");
         }
@@ -96,6 +56,10 @@ fn seed_sarif(rows: &[Value], dir: &Path) -> Option<usize> {
     (!written.is_empty()).then_some(written.len())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the seed writer is a dev tool make fuzz-seed runs: an I/O failure stops it naming what it was doing, and make fails as on exit 1"
+)]
 fn write(dir: &Path, name: &str, value: &Value) {
     std::fs::create_dir_all(dir).expect("creating a corpus directory");
     let bytes = serde_json::to_vec(value).expect("a seed serializes");
@@ -120,7 +84,7 @@ fn slim(report: &Value) -> Value {
             map.remove(key);
         }
     }
-    if let Some(observations) = slim["observations"].as_array_mut() {
+    if let Some(observations) = slim.get_mut("observations").and_then(Value::as_array_mut) {
         for o in observations {
             if let Some(map) = o.as_object_mut() {
                 for key in ["controls", "build", "run"] {
@@ -213,29 +177,34 @@ fn masked_with_zero_ratio(masked: &Value) -> Option<Value> {
     zero(&mut copy).then_some(copy)
 }
 
-/// Copies every `*.elf` in `fixtures` into `dir`, and whether it copied one for each
-/// `*.expected.json` beside them and at least one.
-fn seed_elf_fixtures(fixtures: &Path, dir: &Path) -> (usize, usize, bool) {
+/// Copies every `*.elf` in `fixtures` into `dir`, and how many it copied.
+#[expect(
+    clippy::expect_used,
+    reason = "the seed writer is a dev tool make fuzz-seed runs: an I/O failure stops it naming what it was doing, and make fails as on exit 1"
+)]
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "the fixtures are told by the bytes of their names, so a file named .elf alone is copied and counted"
+)]
+fn seed_elf_fixtures(fixtures: &Path, dir: &Path) -> usize {
     let Ok(listing) = std::fs::read_dir(fixtures) else {
         eprintln!("seed: {} is not a readable directory", fixtures.display());
-        return (0, 0, false);
+        return 0;
     };
     std::fs::create_dir_all(dir).expect("creating a corpus directory");
-    let (mut copied, mut expected) = (0usize, 0usize);
+    let mut copied = 0usize;
     for entry in listing {
         let path = entry.expect("listing the ELF fixtures").path();
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        if name.ends_with(".expected.json") {
-            expected += 1;
-        } else if name.ends_with(".elf") {
+        if name.ends_with(".elf") {
             std::fs::copy(&path, dir.join(format!("fixture-{name}"))).expect("copying a fixture");
             copied += 1;
         }
     }
-    (copied, expected, copied > 0 && copied == expected)
+    copied
 }
 
 /// Every object under `value` that carries a `digest_kind`, as `--image-attestation` takes
@@ -257,9 +226,15 @@ fn attestations_in(value: &Value, found: &mut Vec<Value>) {
 }
 
 /// Writes `value` into `dir` named by its digest, so the same attestation is one seed.
+#[expect(
+    clippy::expect_used,
+    reason = "the seed writer is a dev tool make fuzz-seed runs: an I/O failure stops it naming what it was doing, and make fails as on exit 1"
+)]
 fn write_by_content(dir: &Path, value: &Value) -> bool {
     let bytes = serde_json::to_vec(value).expect("a seed serializes");
-    let name = format!("att-{}.json", &chard::digest::sha256_hex(&bytes)[..16]);
+    let mut digest = chard::digest::sha256_hex(&bytes);
+    digest.truncate(16);
+    let name = format!("att-{digest}.json");
     let path = dir.join(name);
     if path.exists() {
         return false;
@@ -271,6 +246,11 @@ fn write_by_content(dir: &Path, value: &Value) -> bool {
 
 /// The fixed attestation seeds: each digest kind, an installed disk, the older shape, no
 /// manifest, a mismatch.
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "each seed is a copy of the object json! builds above, and setting a key of an object adds it"
+)]
 fn attestation_seeds(dir: &Path) -> usize {
     let mut written = 0;
     for (kind, length) in [
@@ -353,6 +333,14 @@ fn seed_attestations(corpus: &str, files: &[String]) -> bool {
     !files.is_empty() && read == files.len() && found > 0
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the seed writer is a dev tool make fuzz-seed runs: an I/O failure stops it naming what it was doing, and make fails as on exit 1"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the seeding's steps in sequence, each one's counts read by the summary line at its end"
+)]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [flag, corpus, files @ ..] = args.as_slice()
@@ -365,18 +353,18 @@ fn main() {
         return;
     }
     let [corpus, fixtures, elf_fixtures, reports @ ..] = args.as_slice() else {
-        eprintln!("usage: seed <corpus-dir> <detectors.json> <elf-fixture-dir> <report.json>...");
+        eprintln!("usage: seed <corpus-dir> <rows.json> <elf-fixture-dir> <report.json>...");
         std::process::exit(2);
     };
     let corpus = Path::new(corpus);
     let elf_dir = corpus.join("elf_parse");
-    let (elves, expected_elves, all_elves) = seed_elf_fixtures(Path::new(elf_fixtures), &elf_dir);
+    let elves = seed_elf_fixtures(Path::new(elf_fixtures), &elf_dir);
     eprintln!(
-        "seed: {elves} ELF fixture(s) of the {expected_elves} {elf_fixtures} describes into {}",
+        "seed: {elves} ELF fixture(s) of {elf_fixtures} into {}",
         elf_dir.display()
     );
-    if !all_elves {
-        eprintln!("seed: expected one ELF fixture for each .expected.json, and at least one");
+    if elves == 0 {
+        eprintln!("seed: expected at least one ELF fixture");
         std::process::exit(1);
     }
     let detect = corpus.join("detect_evidence");
@@ -445,20 +433,32 @@ fn main() {
             eprintln!("seed: {path} is not JSON, skipped");
             continue;
         };
-        if let Some(store) = report["facts"].as_object() {
+        // A report is an object.
+        if !report.is_object() {
+            eprintln!("seed: {path} is JSON but not an object, so it is no report");
+            std::process::exit(1);
+        }
+        if let Some(store) = report.get("facts").and_then(Value::as_object) {
             let mut kinds = BTreeSet::new();
             for (key, entry) in store {
                 if let Some(defines) = entry["macros"].as_object()
                     && entry["kind"] == "macro-dump"
                 {
-                    let text: String = defines
+                    let text = defines
                         .iter()
-                        .map(|(name, value)| {
-                            format!("#define {name} {}\n", value.as_str().unwrap_or_default())
-                        })
-                        .collect();
+                        .fold(String::new(), |mut text, (name, value)| {
+                            text.push_str("#define ");
+                            text.push_str(name);
+                            text.push(' ');
+                            text.push_str(value.as_str().unwrap_or_default());
+                            text.push('\n');
+                            text
+                        });
                     std::fs::create_dir_all(&macros).expect("creating a corpus directory");
-                    let name = format!("dump-{}.txt", &key[..key.len().min(16)]);
+                    // The first 16 characters, not bytes: the key is the report's, and a
+                    // byte offset inside a character would panic.
+                    let prefix: String = key.chars().take(16).collect();
+                    let name = format!("dump-{prefix}.txt");
                     std::fs::write(macros.join(name), text).expect("writing a seed");
                     dumps += 1;
                 }
@@ -478,12 +478,15 @@ fn main() {
             }
         }
         let mut found = Vec::new();
-        attestations_in(&report["environment"], &mut found);
+        if let Some(environment) = report.get("environment") {
+            attestations_in(environment, &mut found);
+        }
         for attestation in &found {
             attestations += usize::from(write_by_content(&attestation_dir, attestation));
         }
-        if let Some(block) = report["environment"]["execution"]["image_attestation"]
-            .as_object()
+        if let Some(block) = report
+            .pointer("/environment/execution/image_attestation")
+            .and_then(Value::as_object)
             .filter(|b| b.contains_key("digest_kind"))
         {
             attestations += usize::from(write_by_content(
@@ -505,6 +508,10 @@ fn main() {
         // dataset identity refuses to join without `--allow-mixed`, and the only way its
         // conflict and decoder-movement paths are reached from a single sweep.
         let mut mixed = loaded.clone();
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "loaded holds more than one report here, each an object, since the load refuses any other JSON; setting a key of an object adds it"
+        )]
         let other = &mut mixed[1]["run"];
         other["probe_corpus_sha256"] = json!("0".repeat(64));
         other["decoders_sha256"] = json!("1".repeat(64));

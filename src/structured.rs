@@ -1,35 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A second decoder for the `compiler-diag` channel, reading SARIF beside the prose.
-//!
-//! Every compiler-diag verdict is decided by [`crate::probe`]'s prose decoder: a needle list
-//! per check, matched against lines of `LC_ALL=C` stderr, with the severity read off the
-//! line that carries the needle. That decoder stays authoritative. This module asks the same
-//! question of the compiler's own structured output, so that the two can be compared and a
-//! disagreement diagnosed rather than assumed away. It runs only under
-//! `chard measure --structured-diagnostics`, and nothing it finds moves a verdict.
-//!
-//! # What the compilers offer
-//!
-//! Measured on Fedora 44 on 2026-09-28, gcc 16.1.1 (x86_64) and 16.2.1 (aarch64), clang
-//! 22.1.8 (both):
-//!
-//! - gcc accepts `-fdiagnostics-format=` `text`, `sarif-stderr` and `sarif-file` only. `json`,
-//!   `json-stderr` and `json-file` are rejected ("unrecognized argument"), so gcc's JSON
-//!   format is gone and SARIF is the one structured form. `-fdiagnostics-add-output=sarif`
-//!   also exists and keeps the text on stderr.
-//! - clang accepts `-fdiagnostics-format=sarif` only, prints `diagnostic formatting in SARIF
-//!   mode is currently unstable [-Wsarif-format-unstable]` as text ahead of the document, and
-//!   prints its trailing `N error(s) generated.` as text after it. It has no
-//!   `-fdiagnostics-add-output`.
-//! - On both, a diagnostic from the driver rather than the compiler proper (an unknown
-//!   option) stays text. SARIF covers what the compiler proper says, which is where every
-//!   needle the prose decoder matches comes from.
-//!
-//! So the structured reading is taken from a separate build: the arm's own argv with the
-//! SARIF-to-stderr flag appended, to its own output path. Adding the flag to the measured
-//! build instead would change the stream the authoritative decoder reads, and on clang there
-//! is no option that writes both.
 
 use std::collections::BTreeMap;
 
@@ -67,15 +38,6 @@ pub struct Capture {
 impl Capture {
     /// Decode a side build's record. A build that could not be run at all is `Err` with the
     /// reason, the same as a stream with no document in it.
-    ///
-    /// An undecodable stream's reason carries how the build ended
-    /// ([`BuildRecord::ended`]: `exited N`, or `was killed by a signal`) and one stderr line,
-    /// because the ordinary cause is the driver refusing a flag before the compiler proper
-    /// ran, and a driver's refusal is text on both compilers. The line is the first carrying
-    /// `error:`, else the first: clang 22.1.8 opens every SARIF-mode stderr with its
-    /// unstable-format warning, and where an assertions build of it aborted in cc1 (Gentoo's
-    /// binary package, 2026-09-30) the first line named that banner while the cause,
-    /// `clang: error: unable to execute command: Aborted (core dumped)`, came later.
     #[must_use]
     pub fn of(flag: &'static str, record: Result<&BuildRecord, String>) -> Self {
         Self {
@@ -95,9 +57,6 @@ impl Capture {
 }
 
 /// Read the first SARIF document out of a stderr that may carry text around it.
-///
-/// The document is the first line that opens with `{`; everything after the value closes is
-/// ignored, which is where clang's `N error(s) generated.` and any linker text land.
 ///
 /// # Errors
 ///
@@ -124,9 +83,7 @@ pub fn decode(stderr: &str) -> Result<Vec<Finding>, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "SARIF document has no runs array".to_owned())?;
     // A run without `results`, or a result without message text, is undecodable rather
-    // than silent. Both compilers write `"results": []` for a build with nothing to say
-    // (gcc 16.1.1, clang 22.1.8 and Apple clang 21, 2026-09-28), so an absent array is a
-    // document this decoder does not understand, not an empty one.
+    // than silent.
     let mut findings = Vec::new();
     for run in runs {
         let results = run
@@ -154,10 +111,6 @@ pub fn decode(stderr: &str) -> Result<Vec<Finding>, String> {
 
 /// The level of the first finding whose message carries a needle, in the vocabulary the prose
 /// decoder answers in, or `None` when no finding does.
-///
-/// `note` is kept as `note` rather than folded into `warning`. The prose decoder reads a
-/// matched line with neither `error:` nor `warning:` as a warning, and a disagreement there is
-/// one the comparison should show rather than absorb.
 #[must_use]
 pub fn severity_of(findings: &[Finding], needles: &[&str]) -> Option<&'static str> {
     let needles: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
@@ -247,9 +200,6 @@ pub fn compare(prose: Option<&'static str>, capture: &Capture, needles: &[&str])
 }
 
 /// The run-level account of the gate: what was compared, and how it came out.
-///
-/// Counted against what was eligible, for the reason `coverage` is: a gate that compared
-/// nothing and reported no disagreement would read as agreement.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Summary {
     /// The flag used, or absent where this toolchain has no structured form chard knows.
@@ -312,9 +262,6 @@ impl Summary {
     }
 
     /// The ways this summary does not add up, one sentence each; empty when it does.
-    ///
-    /// A summary recomputed from the same observations passes these by construction. They
-    /// hold the published document, which the consistency rule reads, to its own sums.
     #[must_use]
     pub fn imbalances(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -360,8 +307,7 @@ impl Summary {
             for (arm, c) in &comparison.arms {
                 let sentence = match c.outcome {
                     "disagree" => format!(
-                        "the structured and prose decoders disagree on the {arm} arm: prose \
-                         read `{}`, {} read `{}`. The verdict is the prose decoder's",
+                        "the structured and prose decoders disagree on the {arm} arm: prose read `{}`, {} read `{}`",
                         c.prose, comparison.format, c.structured
                     ),
                     "undecodable" => format!(
@@ -404,10 +350,6 @@ mod tests {
         }
     }
 
-    /// An undecodable side build names its error line, not a banner ahead of it.
-    ///
-    /// The stderr is the shape Gentoo's assertions build of clang 22.1.8 wrote on
-    /// 2026-09-30: the unstable-format warning, the assertion, then the driver's error.
     #[test]
     fn an_undecodable_reason_quotes_the_error_over_a_banner() {
         let aborted = record(
@@ -436,9 +378,6 @@ mod tests {
         );
     }
 
-    /// An undecodable reason says how the build ended in `BuildRecord::ended`'s words: the
-    /// `-1` sentinel names a signal, never "exit -1", and a real `exit(-1)`, which reads 255
-    /// on Unix, keeps its number.
     #[test]
     fn an_undecodable_reason_says_how_the_build_ended() {
         for (exit_status, ended) in [
@@ -461,7 +400,6 @@ mod tests {
         }
     }
 
-    /// The missing-arm diagnostic is one sentence, spaced as written.
     #[test]
     fn the_missing_arm_sentence_is_spaced_as_written() {
         assert_eq!(
@@ -501,8 +439,6 @@ mod tests {
         assert_eq!(severity_of(&clang, &["no such wording"]), None);
     }
 
-    /// A stream with no document is undecodable, never an empty list: an empty list reads as
-    /// a compiler that said nothing, which is the silence this project refuses to publish.
     #[test]
     fn a_stream_without_a_document_is_undecodable_not_silent() {
         assert!(decode("gcc: error: unrecognized command-line option '-fno-such'\n").is_err());
@@ -549,8 +485,6 @@ mod tests {
         assert!(u.reason.is_some());
     }
 
-    /// The prose decoder reads a matched line with no severity word as a warning; the
-    /// structured one keeps `note`, so that difference surfaces as a disagreement.
     #[test]
     fn a_note_is_not_folded_into_a_warning() {
         let findings = vec![Finding {

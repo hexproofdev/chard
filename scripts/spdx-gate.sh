@@ -5,25 +5,22 @@
 # of a kind named below that cannot carry one, each kind with its reason and its count.
 #
 # The identifier is a line of its own: a comment leader or none, the identifier, one of the
-# licences in LICENCES, and a comment closer or none. A mention of the phrase in prose, an
-# empty value, or a licence this repository does not use is not a header. LICENCES is
-# BSD-3-Clause, the crate's licence (`Cargo.toml`, `LICENSE`), and CC-BY-SA-4.0, which
-# CODE_OF_CONDUCT.md alone carries, adapted from a text under it; a file under another licence
-# is a decision for a person, made here.
+# licences in LICENCES, and a comment closer or none. A mention in prose, an empty value, or
+# a licence this repository does not use is not a header. LICENCES is BSD-3-Clause, the
+# crate's licence, and CC-BY-SA-4.0, which CODE_OF_CONDUCT.md alone carries, adapted from a
+# text under it; a file under another licence is a decision for a person, made here.
 #
-# Tracked means the index, the set a commit holds, and text is git's own reading of each
-# file there (`git ls-files --eol`): the gate reads what a clone receives, not what lies in
-# this checkout. Each kind and the total are printed with their counts, and a tracked set
-# that came back empty fails, for the reason the leak gate gives (a check that scans nothing
-# exits 0).
+# Tracked means the index, and text is git's own reading of each file there (`git ls-files
+# --eol`): the gate reads what a clone receives, not this checkout. A tracked set that came
+# back empty fails, since a gate that scanned nothing would otherwise exit 0. Exit 0 on a
+# pass or a skip (below); a failure exits nonzero.
 
 set -euo pipefail
 
-# Outside a clone there is no tracked set to read: a tarball from `git archive` or a crate
-# archive holds the files and not the index. The gate says so and exits 0, a skip and not a
-# pass, so `make check` runs to its end from one; the same inside another repository's work
-# tree, whose index is not this tree's. A tree holding a `.git` that git cannot read fails.
-# The leak gate opens the same way (`scripts/leak-gate.sh`).
+# Outside a clone (a `git archive` tarball, a crate archive) there is no index to read. The
+# gate says so and exits 0, a skip and not a pass; other phases of `make check` refuse there.
+# It skips the same way inside another repository's work tree, whose index is not this tree's.
+# A tree holding a `.git` that git cannot read fails.
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if ! top=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null); then
   if [ -e "$here/.git" ] || [ -L "$here/.git" ]; then
@@ -53,10 +50,12 @@ exempt_kind() { # path -> kind, or nothing
     # beside it is prose and carries an identifier like any other file.
     fuzz/crashes/*.note) ;;
     fuzz/crashes/*) echo fuzz-crash ;;
-    # cargo writes the lockfile whole on every resolve, and keeps no comment of ours.
-    Cargo.lock) echo lockfile ;;
+    # cargo writes a lockfile whole on every resolve, and keeps no comment of ours: the root
+    # workspace's, and the fuzz workspace's beside its own manifest.
+    Cargo.lock | fuzz/Cargo.lock) echo lockfile ;;
     # The licence text itself, which the identifiers elsewhere point to.
     LICENSE) echo licence-text ;;
+    *) ;;
   esac
 }
 
@@ -68,7 +67,7 @@ header_line="^[[:space:]]*(#|//|/\\*|<!--)?[[:space:]]*SPDX-License-Identifier: 
 # entries are counted against a second, independent listing of the index.
 listing=$(mktemp)
 trap 'rm -f "$listing"' EXIT
-git ls-files --eol -z > "$listing"
+git ls-files --eol -z >"$listing"
 expected=$(git ls-files -z | tr -cd '\0' | wc -c)
 
 declare -A kinds=()
@@ -78,11 +77,17 @@ while IFS= read -r -d '' entry; do
   index_eol=${entry%% *}
   tracked=$((tracked + 1))
   # `i/-text` is git's binary; `i/none` is text with no line ending, which still needs one.
-  if [ "$index_eol" = i/-text ]; then binary=$((binary + 1)); continue; fi
-  if [ "$(git cat-file -s ":$path")" -eq 0 ]; then empty=$((empty + 1)); continue; fi
-  # Read through a process substitution and not a pipe, for the reason the leak gate's
-  # `scan_content` gives: under `pipefail`, `head` closing the pipe early makes git's
-  # SIGPIPE the pipeline's status, and a file carrying the identifier read as one lacking it.
+  if [ "$index_eol" = i/-text ]; then
+    binary=$((binary + 1))
+    continue
+  fi
+  if [ "$(git cat-file -s ":$path")" -eq 0 ]; then
+    empty=$((empty + 1))
+    continue
+  fi
+  # Read through a process substitution and not a pipe: under `pipefail`, `head` closing the
+  # pipe early makes git's SIGPIPE the pipeline's status, and a file carrying the identifier
+  # read as one lacking it.
   first=$(head -n 5 < <(git cat-file blob ":$path"))
   if grep -Eq "$header_line" <<<"$first"; then
     carry=$((carry + 1))
@@ -90,12 +95,12 @@ while IFS= read -r -d '' entry; do
   fi
   kind=$(exempt_kind "$path")
   if [ -n "$kind" ]; then
-    kinds[$kind]=$(( ${kinds[$kind]:-0} + 1 ))
+    kinds[$kind]=$((${kinds[$kind]:-0} + 1))
     exempt=$((exempt + 1))
   else
     lacking+=("$path")
   fi
-done < "$listing"
+done <"$listing"
 
 printf '\nspdx gate: licence identifiers over the tracked set\n\n'
 if [ "$tracked" -eq 0 ]; then

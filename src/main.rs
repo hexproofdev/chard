@@ -1,46 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! chard CLI.
-//!
-//! `chard measure` builds every probe three times per check — bare, positive
-//! control, negative control — and emits one schema-conforming report. What every
-//! command writes where, and what each exit status means, is [`CONTRACT`], the one
-//! statement of it, which `DESIGN.md` carries word for word.
-//!
-//! The driver's contract with itself: it counts the checks it was handed and
-//! compares that against what it emitted, because a check that was never run
-//! cannot report its own absence. That count lands in `coverage`, and
-//! `--fail-on-missing` turns an incomplete sweep into a distinct exit code so a
-//! caller never mistakes a partial column for a full one.
 
-// The same lint wall as `lib.rs`. It was missing here, which left the driver —
-// where the control triple is actually wired together, and where a panic would
-// abort a sweep mid-flight — as the one module outside the no-panic guarantee the
-// project claims.
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unreachable,
-        clippy::todo,
-        clippy::arithmetic_side_effects,
-        clippy::indexing_slicing,
-        clippy::string_slice,
-        clippy::as_conversions,
-        clippy::cast_lossless,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::unused_result_ok,
-        clippy::let_underscore_must_use,
-        clippy::map_err_ignore,
-        clippy::allow_attributes_without_reason,
-    )
-)]
-// Not under `cfg_attr(not(test))`: a `println!` in the binary is a panic on a closed pipe
-// in any build. Output goes through `write_stdout`; `lib.rs` denies the same for the modules.
-#![deny(clippy::print_stdout)]
+// The driver is held to the same lint wall as the library (`lib.rs`): `Cargo.toml`'s
+// generated lint block covers every target of the package, this one included.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -68,58 +31,79 @@ use chard::toolchain;
 
 /// The contract every command keeps with its caller: what makes a command, what goes to
 /// stdout and stderr, each exit status, the error envelope and the schema policy. It is
-/// stated here once, printed by `chard --help`, and `DESIGN.md` ("The command-line
-/// contract") carries the same words, which `the_contract_is_stated_once` holds; the
-/// module docs of `error.rs` and `detect.rs` and the README point here rather than
-/// restating it.
-const CONTRACT: &str = "A command is one operation that reads reports, binaries or nothing \
-     and writes one document: `measure` builds the probes with a compiler and writes a report; \
-     `table` and `matrix` read reports, and `digest` reads one and writes the block that \
-     report leads with; `detect` reads a report or another of chard's \
-     documents (`--evidence`) or one binary (`--artifact`); `elf` reads binaries; `probes` \
-     reads nothing and lists what `measure` builds. Setup and tooling, building chard and \
-     running its gates among them, are flags or Makefile targets, not commands. A command \
-     writes its document to stdout, or to the file `-o` names (`-o -` is stdout); `measure` \
-     writes its report to `chard-<cc>-<profile>.json` in the current directory unless `-o` \
-     names another file or `-`. The document is JSON except `table`'s rendering and `probes \
-     --format text`, which are text for people (as are `--help` and `--version`); progress \
-     and notes go to stderr, prefixed `chard: `, and a usage error's own text goes there \
-     unprefixed. `measure` ends every run that exits 0, 1, 2 or 3, a refused one too, with one \
-     line there naming its exit status, the file it wrote or kept, the report's counts and \
-     what to run next; a panic (exit 101) ends on a line saying so, and a killed run on none. \
-     Exit 0: the document is \
-     written, and from `detect` every reading it replayed agrees. Exit 1: a gate tripped and \
-     the document is written: from `measure --fail-on-missing`, a check did not settle; from \
-     `detect`, a reading disagrees with its replay. Exit 2: chard refused the invocation or \
-     failed, a usage error among them, and a `--execution` that what chard observed \
-     contradicts, whose report is kept as for exit 3 and not published. stdout then carries an error envelope in place of the \
-     document, `{\"chard_schema\", \"error\": {\"code\", \"operation\", \"message\", \
-     \"hint\"}}`, whose `code` names whose action comes next: `USER_INPUT` the caller, \
-     `PERMISSION` whoever owns the filesystem, `TRANSIENT` a retry, `CONFIGURATION` the \
-     invocation's settings, `INTERNAL` a bug report against chard. Exit 3: chard contradicted \
-     itself, and only `measure` exits 3: the report it built disagrees with itself and is not \
-     published (it is written only to `<file>.contradicted`, beside the file it would have \
-     gone to, and under `-o -` nowhere), and stdout carries an `INTERNAL` envelope whose hint \
-     names that file or says how to keep one. Every JSON \
-     document but `elf`'s carries `chard_schema`, the major version of its own shape; the \
-     shapes of a report, a matrix, `detect`'s output and the envelope are in `schema/`, and \
-     `digest`'s is the report's `digest`. \
-     `elf`'s output is a map from the paths it was given to their facts, with no place for a \
-     key beside them. A key chard adds is not a change: a consumer ignores keys it does not \
-     know, and the shipped schemas admit them. Removing or renaming a key, changing a \
-     value's type or meaning, or adding a value to an enumeration raises `chard_schema`. The \
-     rule holds from chard's first publication, where every document is at `1`. `table`, \
-     `matrix`, `digest` and `detect` read a report at the `chard_schema` this chard writes \
-     and refuse any other with exit 2, and `table`, `matrix` and `digest` refuse a report \
-     without its `digest` the same way.";
+/// stated here once and printed by `chard --help`.
+const CONTRACT: &str = "A command is one operation: it reads reports, binaries or nothing, and \
+     writes one document. `measure` builds the probes with a compiler and writes a report. \
+     `table` and `matrix` read reports. `digest` reads one report and writes the block that \
+     report leads with. `detect` reads a report or another of chard's documents \
+     (`--evidence`), or one binary (`--artifact`). `elf` reads binaries. `probes` reads \
+     nothing and lists what `measure` builds. Setup and tooling, building chard and running \
+     its gates among them, are flags or Makefile targets, not commands.\n\n\
+     A command writes its document to stdout, or to the file `-o` names (`-o -` is stdout). \
+     `measure` writes its report to `chard-<cc>-<profile>.json` in the current directory \
+     unless `-o` names another file or `-`. The document is JSON, except `table`'s rendering \
+     and `probes --format text`, which are text for people, as are `--help` and `--version`. \
+     Progress and notes go to stderr, prefixed `chard: `. A usage error's own text goes to \
+     stderr unprefixed. `measure` ends every run that exits 0, 1, 2, 3 or 4, a refused one \
+     too, with one line on stderr. That line names the exit status, the file written or kept, \
+     the report's counts and what to run next. After a panic (exit 101) the last line says so, \
+     and a killed run has none.\n\n\
+     - Exit 0: the document is written. From `detect`, every reading it replayed agrees. From \
+     `measure --fail-on-missing`, every check settled or `--allow` excused it, and each \
+     excused check is named on stderr and in `coverage.gate.excused`.\n\
+     - Exit 1: a gate tripped, and the document is written. From `measure \
+     --fail-on-missing`, a check was not attempted or did not settle, `--allow` did not \
+     excuse it, and exit 4 does not apply. From `detect`, a reading disagrees with its \
+     replay.\n\
+     - Exit 4: from `measure --fail-on-missing`, a gate tripped as for exit 1, and every \
+     shortfall is a machine limit or a target limit, at least one a machine limit. A caller \
+     asking whether the gate passed tests for 0. A machine limit is a check held by one of \
+     the gating rules `cpu-lacks-shadow-stack`, `machine-lacks-bti`, `machine-lacks-pac` or \
+     `cpu-shows-no-fpac`. The kernel and CPU the run had cannot answer it, and no change of \
+     toolchain or profile helps. A target limit is a check held by `no-check-on-target` or \
+     `arch-outside-table`: chard does not read it on this target architecture. A rerun on a \
+     machine whose kernel and CPU give every feature the machine limits name still exits 1 \
+     while a target limit that `--allow` does not excuse stands. Target limits alone exit 1, \
+     or 0 where `--allow no-check-on-target` excuses every one. `arch-outside-table` and the \
+     machine limits have no allowance, so no allowance moves exit 4. The document is written \
+     as for exit 1.\n\
+     - Exit 2: chard refused the invocation or failed. A usage error exits 2. So does a \
+     `--execution` that what chard observed contradicts, and its report is kept as for exit \
+     3, not published. stdout carries an error envelope in place of the document, \
+     `{\"chard_schema\", \"error\": {\"code\", \"operation\", \"message\", \"hint\"}}`. Its \
+     `code` names whose action comes next: `USER_INPUT` the caller, `PERMISSION` whoever owns \
+     the filesystem, `TRANSIENT` a retry, `CONFIGURATION` the invocation's settings, \
+     `INTERNAL` a bug report against chard.\n\
+     - Exit 3: chard contradicted itself, and only `measure` exits 3. The report it built \
+     disagrees with itself and is not published. It is written only to `<file>.contradicted`, \
+     beside the file it would have gone to, and under `-o -` nowhere. stdout carries an \
+     `INTERNAL` envelope whose hint names that file or says how to keep one.\n\n\
+     Every JSON document but `elf`'s carries `chard_schema`, the major version of its own \
+     shape. The shapes of a report, a matrix, `detect`'s output and the envelope are in \
+     `schema/`, and `digest`'s is the report's `digest`. `elf`'s output is a map from the \
+     paths it was given to their facts, with no place for a key beside them. A key chard adds \
+     is not a change: a consumer ignores keys it does not know, and the shipped schemas admit \
+     them. An enumeration is closed or open. A closed one holds values a consumer decides on, \
+     such as a verdict, an error code or a defect status, and adding a value to it raises \
+     `chard_schema`. An open one names things chard has, such as gating rules or linker \
+     kinds. The schemas spell an open one `anyOf` of the values known and any string. A value \
+     may be added to it within a version, and a consumer reads a value it does not know as \
+     one it cannot interpret. Removing or renaming a key or a value, in either kind, or \
+     changing a value's type or meaning, raises `chard_schema`. The rule holds from chard's \
+     first publication, 0.1.0, where every document was at `1`. A report and a matrix are at \
+     `2`, and `detect`'s output, the probe listing and the error envelope at `1`. `table`, \
+     `matrix`, `digest` and `detect` read a report at the `chard_schema` this chard writes and \
+     refuse any other with exit 2. The refusal of a report at `1` whose `run.decoders_sha256` \
+     is 0.1.0's names chard 0.1.0. `table`, `matrix` and `digest` refuse a report without its \
+     `digest` the same way.";
 
 /// `chard --help`'s description: what chard is, then [`CONTRACT`].
 fn long_about() -> String {
     format!(
         "Measure which C/C++ hardening flags a toolchain actually applies.\n\n\
-         `measure` builds small probe programs with the compiler you name, reads the \
-         artifacts it just built and the probes' own reports, and publishes a verdict per \
-         check only where its control triple (the flag forced on, forced off, and as \
+         `measure` builds small probe programs with the compiler you name. It reads the \
+         artifacts it just built and the probes' own reports. It publishes a verdict for a \
+         check only where the check's control triple (the flag forced on, forced off, and as \
          configured) shows the probe can tell the states apart. It reads no distribution's \
          packaging.\n\n{CONTRACT}"
     )
@@ -143,13 +127,8 @@ struct Cli {
 #[derive(Args)]
 struct FormatArg<F: FormatChoice> {
     /// Form.
-    ///
-    /// How the document is printed; the forms and the default are listed below.
     // A one-word summary keeps `-h`'s line, which clap ends with the default and the forms,
-    // within 80 columns. `default_value`, not `default_value_t`: the derive keeps a `_t`
-    // default's rendering in
-    // a static, which every instantiation of this struct shares, so `table` was given
-    // `probes`'s `json`.
+    // within 80 columns.
     #[arg(long, value_name = "FORM", value_enum, default_value = F::DEFAULT)]
     format: F,
 }
@@ -202,13 +181,6 @@ impl TableFormat {
 #[derive(Args)]
 struct AllowMixedArg {
     /// Allow reports that are not one dataset.
-    ///
-    /// Refused by default where the reports differ in their probe set, the chard revision
-    /// that read their evidence (with the source that named it and the rustflags chard was
-    /// built under), or where they ran (host, container or vm): a table or a
-    /// matrix claims its reports are comparable, so a check missing from an older report
-    /// would read as a protection the toolchain lacks, and a change in chard as a property
-    /// of a toolchain.
     #[arg(long)]
     allow_mixed: bool,
 }
@@ -254,11 +226,11 @@ struct ReportArg {
           long_help = output_help(
               "Write the report to this file (`-`: stdout).\n\nBy default \
                `chard-<cc>-<profile>.json` in the current directory, `<cc>` the last component \
-               of `--cc`. The name holds nothing else, so a run under the same compiler name \
-               and profile replaces an earlier report there whatever else it changed (its \
-               flags, `--probe`, `--env`, `--execution`, or another compiler of that name), \
-               as a rerun does; give each run its own `-o` to keep both. The closing line \
-               says when an earlier report was replaced."
+               of `--cc`. The name holds nothing else. A run under the same compiler name and \
+               profile replaces an earlier report there, whatever else changed: its flags, \
+               `--probe`, `--env`, `--execution`, or another compiler of that name. Give each \
+               run its own `-o` to keep both. The closing line says when an earlier report was \
+               replaced."
           ))]
     path: Option<PathBuf>,
 }
@@ -268,36 +240,24 @@ struct ReportArg {
 fn output_help(what: &str) -> String {
     format!(
         "{what}\n\nAn invocation refused before the earlier file at the path is set aside \
-         leaves that file as it was: a usage error; an input that cannot be read or that the \
-         command refuses (a file that is not JSON, a check id `detect` does not know); an \
-         option `measure` refuses before it builds (`--probe`, `--env`, a profile's flags, \
-         `--workdir`); a path no run could write; and a path that is one of the inputs, or \
-         beside which chard writes a name that is one. From the set-aside on, a run that \
-         fails leaves no earlier document there to be read as this one (it is kept as \
-         `<file>.previous`), and one that writes its document removes what was set aside."
+         leaves that file as it was. These are refused that early:\n\n\
+         - a usage error;\n\
+         - an input that cannot be read or that the command refuses (a file that is not \
+         JSON, a check id `detect` does not know);\n\
+         - an option `measure` refuses before it builds (`--probe`, `--env`, a profile's \
+         flags, `--workdir`);\n\
+         - a path no run could write;\n\
+         - a path that is one of the inputs, or beside which chard writes a name that is \
+         one.\n\n\
+         Once the earlier file is set aside, it is kept as `<file>.previous`. A run that \
+         fails then leaves no earlier document at the path to be read as this one. A run \
+         that writes its document removes what was set aside."
     )
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Build probes with a compiler, read the result; write a JSON report.
-    ///
-    /// Each check gets a verdict (`on`, `off`, `partial`), or a reading that says why it
-    /// has none (`unsupported`, `not-applicable`, `indeterminate`, `probe-invalid`,
-    /// `build-failed`, `run-failed`). The report goes to `chard-<cc>-<profile>.json` in the
-    /// current directory, or to `-o` (`-o -`: stdout). The run's last line on stderr names
-    /// its exit status, the file it wrote or kept, the report's counts and what to run next.
-    ///
-    /// Exits 0 when the report is published; 1 under `--fail-on-missing` when a check is not
-    /// settled, which without `--execution` includes the checks that depend on kernel policy; 2
-    /// when the run cannot be done or the declared `--execution` is contradicted by what chard
-    /// observed (the envelope says why); 3 when the report contradicts
-    /// itself, a defect in chard: it is not published (it is written to `<file>.contradicted`,
-    /// beside the file it would have gone to, and under `-o -` nowhere), and the `INTERNAL`
-    /// envelope on stdout names where it is or how to keep it. Each profile flag the toolchain rejects
-    /// is named once per tool that refused it, first in `diagnostics` and above `chard table`'s
-    /// grid, with the checks it left `build-failed` counted, and the run still exits 0, or 1
-    /// under `--fail-on-missing`.
     #[command(after_long_help = "Examples:\n  \
         chard measure --cc gcc && chard table chard-gcc-bare.json\n  \
         chard measure --cc clang --profile explicit \\\n      \
@@ -305,9 +265,6 @@ enum Command {
         --ldflags \"-Wl,-z,relro,-z,now\" -o clang-flags.json")]
     Measure(Box<MeasureArgs>),
     /// Read nothing; write the probes and their checks, as JSON or text.
-    ///
-    /// A probe is one program; a check is one question a probe answers, so one probe can
-    /// hold several checks. `measure --probe` takes probe ids; `detect` takes a check id.
     #[command(after_long_help = "Example:\n  chard probes --format text")]
     Probes {
         #[command(flatten)]
@@ -331,32 +288,15 @@ enum Command {
         #[command(flatten)]
         allow_mixed: AllowMixedArg,
         /// Keep a repeated configuration's later report, whole.
-        ///
-        /// Refused by default where two reports agree on every axis a column keys on: a
-        /// table column holds one report. With this flag the later report on the command
-        /// line replaces the earlier's column, nothing of the earlier kept, and the table's
-        /// notes name both reports, every flag whose verdict or polarity differs between
-        /// them, a differing `kernel.ownership`, and every flag that left the column with the
-        /// earlier or joined it with the later; with `--by-defect`, every defect class drawn
-        /// differently, and every class that left or joined.
         #[arg(long)]
         replace_repeated: bool,
         /// Wrap a text table's notes (default 80; 0: no wrap).
-        ///
-        /// The legend, levels, flags, withheld reasons and notes are wrapped; the grid is as
-        /// wide as its columns, and `markdown` is not wrapped. chard does not read the
-        /// terminal's width: pass `--width "${COLUMNS:-80}"` to fit it.
         #[arg(long, value_name = "COLS", default_value_t = table::DEFAULT_WIDTH, hide_default_value = true)]
         width: usize,
         #[command(flatten)]
         output: OutputArg,
     },
     /// Read reports; write them cross-tabulated by configuration, as JSON.
-    ///
-    /// A distribution is only one of the things a result depends on: the compiler version,
-    /// the C library and the flag profile can each explain it. The matrix keys every report
-    /// on all of them and, for each check, names which axes account for its results, or
-    /// says that none does alone.
     #[command(after_long_help = "Example:\n  chard matrix reports/*.json")]
     Matrix {
         /// Report files to tabulate.
@@ -365,30 +305,12 @@ enum Command {
         #[command(flatten)]
         allow_mixed: AllowMixedArg,
         /// Keep a repeated configuration's later report, whole.
-        ///
-        /// Refused by default where two reports agree on every axis the matrix keys on: a
-        /// matrix cell holds one report. With this flag the later report on the command line
-        /// replaces the earlier's cell, nothing of the earlier kept, and the matrix's warnings
-        /// name both reports, every flag whose verdict or polarity differs between them, a
-        /// differing `kernel.ownership`, and every flag that left the cell with the earlier or
-        /// joined it with the later.
         #[arg(long)]
         replace_repeated: bool,
         #[command(flatten)]
         output: OutputArg,
     },
     /// Read one report; write its digest alone, as JSON.
-    ///
-    /// The digest is the report's first key: the consistency status, coverage with its earned
-    /// limitations apart from its instrument withholdings, one row per check (verdict, level,
-    /// polarity, channel, gating rule), every reason a check is not a measurement, and the
-    /// toolchain, profile, execution mode and revision measured, without the controls, facts
-    /// and decoders that make up most of the report. It is derived from the report's own
-    /// fields. Its `consistency` is the report's `consistency.status`, the word `measure` wrote
-    /// after applying every consistency rule; reading the report, chard re-runs only the rules
-    /// that need nothing outside the file. Exit 2 refuses what `table` refuses: a report whose
-    /// `chard_schema` is not the one this chard reads, one with no digest, one that
-    /// contradicts itself, and one whose digest is not the one its fields give.
     #[command(after_long_help = "Example:\n  chard digest chard-gcc-bare.json")]
     Digest {
         /// Report file to read.
@@ -397,9 +319,6 @@ enum Command {
         output: OutputArg,
     },
     /// Read binaries; write the ELF facts chard decides from, as JSON.
-    ///
-    /// These are the facts the artifact checks decide from (program headers, dynamic
-    /// tags, property notes, symbols); no verdict is formed.
     #[command(after_long_help = "Example:\n  chard elf /usr/bin/ls")]
     Elf {
         /// Binaries to inspect.
@@ -409,20 +328,6 @@ enum Command {
         output: OutputArg,
     },
     /// Read a chard document or a binary; write a replay or detection.
-    ///
-    /// With a report (`--evidence report.json`), each reading of the check that can be
-    /// decided again from the report's own facts is, and compared with what the report
-    /// states, each verdict with its control triple. The counts are printed: `expected`
-    /// equals `replayed` plus `not_replayable`. A report with no reading of the check is
-    /// refused. Exit 0 when all agree, 1 on a disagreement (a tripped gate: the replay is
-    /// written, and each disagreement in it is an entry with `agrees: false`, a
-    /// `decoder.digest_agrees: false` or a `reading-absent` entry), 2 on input that cannot be
-    /// used.
-    ///
-    /// With one `facts` entry, a `chard elf` output or `--artifact`, the decoder runs once
-    /// and prints a detection. That is not a verdict: no control triple ran.
-    ///
-    /// The argument is a check id, as `chard probes --format text` lists it, not a probe id.
     #[command(after_long_help = "Examples:\n  \
         chard detect relro --evidence report.json\n  \
         chard detect cet-marked --artifact ./a.out")]
@@ -436,8 +341,6 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         artifact: Option<PathBuf>,
         /// With a report, re-check one reading only.
-        ///
-        /// `measured`, `positive`, `negative` or `regime`.
         #[arg(long)]
         arm: Option<String>,
         #[command(flatten)]
@@ -452,13 +355,6 @@ struct MeasureArgs {
     cc: String,
 
     /// Profile: bare (default), or see --help.
-    ///
-    /// `bare` measures the compiler's own defaults. `bare-optimized` adds only -O2, which
-    /// `_FORTIFY_SOURCE` needs to exist. `openssf-tldr` builds with the flags the OpenSSF
-    /// compiler options guide recommends: a near positive control, on which most checks
-    /// read `on` and some read `off` by the guide's own choices. `explicit` builds with the
-    /// lists you give in `--flags`, `--cxxflags` and `--ldflags`: a distribution's own build
-    /// flags are measured this way.
     // chard does not query rpm, dpkg-buildflags, abuild, makepkg or portageq: a runtime
     // query describes only the image it runs in, and each distribution's spelling of its
     // flag list belongs to whatever assembles the list.
@@ -466,69 +362,26 @@ struct MeasureArgs {
     profile: String,
 
     /// C flags for --profile explicit.
-    ///
-    /// Split on whitespace. Refused beside any other profile, as are `--cxxflags` and
-    /// `--ldflags`. Also refused, in any of the three lists:
-    ///
-    /// - a response file (`@file`, or `@` inside `-Wl,`, `-Wp,` or `-Wa,`), which chard
-    ///   cannot read into;
-    ///
-    /// - a relative path given to `-B`, `-L`, `-I`, `--sysroot` and their kin, read as the
-    ///   driver or the tool a word is handed to reads it (write it absolute), and a path
-    ///   option handed to a tool with no path in the same word or the pair after it;
-    ///
-    /// - a flag that removes the startup objects, the default libraries or the default
-    ///   headers (`-nostartfiles`, `-nostdlib`, `-nostdinc` and their kin);
-    ///
-    /// - a pair the two drivers read differently, an option one of gcc and clang takes a
-    ///   value for and the other reads as a flag of its own (clang's `-isystem-after` and
-    ///   `-dependency-file`, gcc's `-Tbss` and their kin), followed by a word that selects
-    ///   something or takes a word of its own;
-    ///
-    /// - a flag that can select x32, 16-bit or aarch64 ILP32 code, targets chard does not
-    ///   measure (`-mx32`, `-m16`, `-mabi=ilp32`, a triple with an x32, `code16` or
-    ///   `gnu_ilp32` environment or an `arm64_32` architecture, `-arch arm64_32`, or GNU as's
-    ///   `--x32` handed to the assembler), wherever it stands, even where a later flag overrides it: remove it.
     // `allow_hyphen_values`: every realistic value starts with `-`, which clap would
     // otherwise reject as an unknown option.
     #[arg(long, allow_hyphen_values = true)]
     flags: Option<String>,
 
     /// C++ flags for --profile explicit.
-    ///
-    /// Without them the C++ probes are built with `--flags`. Distributions set the C++
-    /// hardening macros (`_GLIBCXX_ASSERTIONS`, `_LIBCPP_HARDENING_MODE`) in CXXFLAGS, so
-    /// pass that list here, or the C++ checks measure a build without them.
     // Building the C++ probes with CFLAGS asks a question whose answer is `off` wherever the
     // two differ, which is where the C++ hardening lives (`report::Profile::cxxflags`).
     #[arg(long, allow_hyphen_values = true)]
     cxxflags: Option<String>,
 
     /// Link flags for --profile explicit.
-    ///
-    /// Added to every probe's link, and kept apart so the report records `-Wl,-z,relro` and
-    /// its kin as the build's LDFLAGS, not folded into its CFLAGS.
     #[arg(long, allow_hyphen_values = true)]
     ldflags: Option<String>,
 
     /// A variable for the toolchain (repeatable).
-    ///
-    /// The compiler runs with only `PATH`, `LC_ALL=C` and `TERM=dumb` set, under any
-    /// profile, so a toolchain configured through its environment (a Nix cc-wrapper's
-    /// `NIX_HARDENING_ENABLE` and its `NIX_CC_WRAPPER_TARGET_HOST_<triple>=1`) is measured
-    /// as configured only when each variable it reads is given here. Each pair reaches every
-    /// compiler run, never a probe's own run, and is published in the report
-    /// (`profile.compiler_environment`), so none should be a secret. `PATH`, `LC_ALL` and
-    /// `TERM` are refused, as are a name given twice, a name that is not a portable variable
-    /// name, and a value holding a relative path, read as in `--flags` (write it absolute).
     #[arg(long = "env", value_name = "NAME=VALUE", allow_hyphen_values = true)]
     env: Vec<String>,
 
     /// Work directory, kept as evidence.
-    ///
-    /// Sources, artifacts and captured output are kept here and not cleaned up (default
-    /// `chard-work`). One run at a time: a second run in a directory a live run holds is
-    /// refused.
     #[arg(
         long,
         value_name = "DIR",
@@ -542,14 +395,6 @@ struct MeasureArgs {
     emit_macros: bool,
 
     /// Where chard runs: `host`, `container`, `vm`.
-    ///
-    /// Detected as far as chard can: a container runtime's marker file, a cgroup path naming docker, libpod,
-    /// containerd or lxc, systemd's `/run/systemd/container`, a `container=` word on PID 1 (read as root or
-    /// PID 1's user) or a user namespace reads `container`; no
-    /// instrument reads `host` or `vm`, so without the flag the mode is `host` by default and whose kernel it is
-    /// stays unsettled. The checks that depend on kernel policy are reported `indeterminate` under `container` and
-    /// under that default; where chard observed no container, `--execution host` or `vm` publishes them, and inside
-    /// a container it recognises an asserted `host` or `vm` is refused as a contradicted assertion.
     #[arg(long, value_name = "WHERE", hide_possible_values = true, value_parser = ["host", "container", "vm"])]
     execution: Option<String>,
 
@@ -558,75 +403,34 @@ struct MeasureArgs {
     image: Option<String>,
 
     /// A JSON file saying where the image came from.
-    ///
-    /// Written by whatever fetched and verified the image. Without it, a container or vm
-    /// run records `image_attestation: unattested`, and a host run, which has no image,
-    /// records `not-applicable` and refuses one. chard cannot verify the attestation from
-    /// inside the image: it records it and says so. One whose digest was compared with a
-    /// fetched manifest and did not match is refused; one whose manifest could not be
-    /// fetched is recorded as unattested. An `installed_disk` record in it is published too.
     // The harness writes this object as `provenance` in its session file; an
     // `installed_disk` record is `env::InstalledDisk`, hashed into `run.inputs_sha256`.
     #[arg(long, value_name = "FILE")]
     image_attestation: Option<PathBuf>,
 
     /// Run only these probes, by probe id.
-    ///
-    /// Repeatable. Probe ids are listed by `chard probes --format text`. A probe id names a
-    /// program, which may hold several checks; `detect` takes a check id instead. The
-    /// report's `coverage` then counts only the selected checks (`checks_expected` below
-    /// `corpus_checks_total`), so it is never mistaken for a full run.
     #[arg(long = "probe", value_name = "PROBE")]
     probes: Vec<String>,
 
     /// Seconds a probe may run.
-    ///
-    /// At least 1; a probe still running then is stopped.
     // `0` is refused: it kills a probe still running at the first look (`run::execute`), so
     // a run under it measures how fast each probe exits rather than what it reports.
     #[arg(long, value_name = "SECS", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 
-    /// Exit 1 unless every check settled.
-    ///
-    /// A check settles on a verdict (`on`, `off`, `partial`), or on `unsupported` or
-    /// `not-applicable` where the run established that the toolchain or the host has no
-    /// such mechanism. Any other reading, and an `unsupported` that rests on a limit of
-    /// chard's own, fails it, and each check that fails it is named on stderr with the
-    /// reason the report records, the lines ending on the exit status and the remedy where
-    /// chard knows one. Without
-    /// `--execution`, the checks that depend on kernel policy (`noexecstack-enforced`,
-    /// `shadow-stack-enforced`) are withheld, since nothing chard reads tells a system that
-    /// owns its kernel from a container chard has no instrument for, and so fail it.
-    /// `--execution host` or `vm` lets them be measured on a target that has them; a kernel
-    /// with no shadow-stack interface settles `shadow-stack-enforced` as `unsupported`,
-    /// while a platform or a CPU chard's run was handed that cannot answer them leaves them
-    /// unsettled even then. The gate
-    /// counts the whole corpus, so a run narrowed by `--probe` always fails it. This says
-    /// whether the run was complete, not whether the build is hardened. A list of the
-    /// `off` verdicts is not a hardening gate either: for a `weaken` check `off` is the
-    /// protected state, and a `partial` or withheld verdict is neither `on` nor `off`.
-    /// Which checks a build must have is the reader's decision.
+    /// Exit 1 or 4 on a check unsettled and unexcused.
     #[arg(long)]
     fail_on_missing: bool,
 
+    /// Excuse one gating rule's checks from the gate.
+    #[arg(long, value_name = "RULE", requires = "fail_on_missing")]
+    allow: Vec<report::Allowance>,
+
     /// Also compare SARIF with the text reading.
-    ///
-    /// Each compiler-diagnostic build's SARIF output is read and compared with the text
-    /// reading, arm by arm, at the cost of one extra build per arm. The verdicts are the
-    /// text reading's either way; disagreements are published as diagnostics and counted in
-    /// `structured_diagnostics`.
     #[arg(long)]
     structured_diagnostics: bool,
 
     /// Blank what varies between runs.
-    ///
-    /// The start time and every duration are zeroed; the values of `--workdir`, `-o` and
-    /// `--image-attestation` in the recorded invocation become `<normalized>`; and the
-    /// readings inside a probe's output that move from run to run (stack-clash-guard-page's
-    /// `SCPRT dist=`) become `<volatile>`. Two normalized reports of the same measurement
-    /// then compare byte for byte. The schema marks each such field `x-volatile` and lists
-    /// each reading under `x-volatile-readings`.
     // The lists are `report::VOLATILE_FIELDS`, `report::VOLATILE_READINGS` and
     // `report::INVOCATION_PATH_OPTIONS`.
     #[arg(long)]
@@ -664,7 +468,7 @@ fn default_report_name(cc: &str, profile: &str) -> Result<PathBuf> {
     let Some(base) = Path::new(cc).file_name() else {
         return Err(UserError::with_hint(
             format!("--cc {cc} has no file name to name the report from"),
-            "give --cc the compiler's name or path, or name the report with -o",
+            "give --cc the compiler's name or path",
         )
         .into());
     };
@@ -696,10 +500,9 @@ fn main() -> ExitCode {
 
 /// A command line clap refuses, through the envelope as every other refusal is: clap's own
 /// text (the error, a tip, the usage line) goes to stderr, and stdout carries a
-/// `USER_INPUT` envelope naming the command, exit 2. Left to `Cli::parse`, it would exit
-/// 2 with stdout empty, the one refusal in which a caller reading stdout would find nothing.
-/// `--help` and `--version` reach here as clap's "errors" too, and print to stdout with
-/// exit 0.
+/// `USER_INPUT` envelope naming the command, exit 2, where `Cli::parse` would leave stdout
+/// empty. `--help` and `--version` reach here as clap's "errors" too, and print to stdout
+/// with exit 0.
 fn refuse_usage(refusal: &clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
     // clap's text quotes the command line, and clap built without `color` passes a quoted
@@ -712,7 +515,7 @@ fn refuse_usage(refusal: &clap::Error) -> ExitCode {
             .and_then(|()| stream.flush())
     };
     // Where it goes is clap's choice by kind: stdout for help and version, stderr for the
-    // rest. A closed or full stream has nowhere left to report to.
+    // rest.
     if refusal.use_stderr() {
         error::best_effort(write(&mut std::io::stderr()));
     } else {
@@ -783,12 +586,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             width,
             output,
         } => {
-            // The inputs are read and parsed first: a path that is missing, unreadable or
-            // named as unpublished is the invocation's error and leaves an earlier table at
-            // `-o` untouched. Then, as `measure` does and for the same reason, the earlier
-            // table is set aside before the set is judged, so a refused set (reports of two
-            // datasets, a report that contradicts itself) leaves no earlier table at `-o`
-            // to be read as this one.
+            // The inputs are read and parsed first, so a bad path leaves an earlier table at
+            // `-o` untouched; then, as `measure` does, the earlier table is set aside before
+            // the set is judged, so a refused set leaves no earlier table at `-o` to be read
+            // as this one.
             let inputs = dataset::read_reports(&reports)?;
             let destination = set_aside_output(output.file(), &paths_of(&reports))?;
             let rendered = table::render_reports(
@@ -893,8 +694,7 @@ fn detect_command(
         (Some(_), Some(_)) | (None, None) => {
             return Err(UserError::with_hint(
                 "detect takes exactly one of --evidence and --artifact",
-                "pass a report, store entry, record or `chard elf` output with --evidence, \
-                 or an ELF object with --artifact",
+                "pass a report, store entry, record or `chard elf` output with --evidence, or an ELF object with --artifact",
             )
             .into());
         }
@@ -903,6 +703,22 @@ fn detect_command(
     let inputs: Vec<&Path> = evidence.into_iter().chain(artifact).collect();
     let destination = set_aside_output(output, &inputs)?;
     deliver(destination.as_ref(), &json_document(&decoded)?, "detection")?;
+    // A gate replay the report could not take is said where a pipeline's log shows it, and
+    // not only inside the document: the exit status reads such a gate as agreeing.
+    if let detect::Output::Replay(replay) = &decoded {
+        let unpublished = replay
+            .gates
+            .iter()
+            .filter(|g| g.outcome == detect::GateOutcome::ListingsUnpublished)
+            .count();
+        if unpublished > 0 {
+            error::note(&format!(
+                "{unpublished} of {} gate(s) of {} were not replayed",
+                replay.gates.len(),
+                replay.check
+            ));
+        }
+    }
     Ok(ExitCode::from(if decoded.agrees() {
         error::EXIT_OK
     } else {
@@ -930,17 +746,15 @@ fn set_aside_output(
 
 /// An `-o` that is one of the command's own `inputs`, or a name chard writes beside `-o`
 /// that is one, is refused: the input has been read, and the set-aside, the cleanup of
-/// temporary names and the publication would replace or remove it, so `chard elf ./a.out
-/// -o ./a.out` removed the binary, `chard table r.json -o r.json` the report, and `chard elf
-/// a.out.previous -o a.out` the binary the set-aside renamed `a.out` over. `-o` itself is
-/// compared by device and inode, so a second spelling of the input, a hard link to it or a
-/// symbolic link to it is refused as the input is (regular files only: a stream such as
+/// temporary names and the publication would replace or remove it. `-o` itself is compared
+/// by device and inode, so a second spelling of the input, a hard link to it or a symbolic
+/// link to it is refused as the input is (regular files only: a stream such as
 /// `/dev/stdout` can share a terminal's inode and is no file to lose). The names beside it
-/// are compared as directory entries, since a rename or a removal acts on the entry. An
-/// input is one of them when its own entry, or the entry at the end of a link it is, is in
-/// the directory of the file a publication writes ([`report::published_path`], the end of
-/// a link at `-o`) and is that file's name followed by [`report::SET_ASIDE_SUFFIX`] or
-/// [`report::QUARANTINE_SUFFIX`], or by [`report::PARTIAL_SUFFIX`] and anything after it.
+/// (the file a publication writes, [`report::published_path`], followed by
+/// [`report::SET_ASIDE_SUFFIX`] or [`report::QUARANTINE_SUFFIX`], or by
+/// [`report::PARTIAL_SUFFIX`] and anything after it) are compared as directory entries, the
+/// input's own and the one at the end of a link it is, since a rename or a removal acts on
+/// the entry.
 ///
 /// # Errors
 ///
@@ -955,7 +769,7 @@ fn refuse_output_naming_an_input(output: &Path, inputs: &[&Path]) -> Result<()> 
         })
     };
     // A path's directory, resolved, and its own name: the entry a rename or a removal
-    // acts on. `None` where either cannot be had, which names no entry an input could be.
+    // acts on.
     let entry = |path: &Path| {
         let directory = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -975,7 +789,7 @@ fn refuse_output_naming_an_input(output: &Path, inputs: &[&Path]) -> Result<()> 
         if same_file(output, input) {
             return Err(UserError::with_hint(
                 format!(
-                    "the output {} is the input {}, which writing it would replace",
+                    "the output {} is the input {}",
                     output.display(),
                     input.display()
                 ),
@@ -1024,14 +838,6 @@ fn refuse_output_naming_an_input(output: &Path, inputs: &[&Path]) -> Result<()> 
 
 /// [`report::refuse_unpublishable`] on `-o`, as the refusal that names what to change.
 ///
-/// Each shape has its own hint, because the one the io table gives a missing path names
-/// scripts and interpreters, which an output has neither of.
-/// An output neither route can write is `PERMISSION`, as an unwritable `--workdir` is, with
-/// a hint for the kind that refused it: a permission, or a read-only filesystem. A path
-/// whose shape is wrong (a directory in it missing or a regular file, a name ending in a
-/// slash) is `USER_INPUT` with a hint about the path; any other io error, a full
-/// filesystem or a name too long even in place, is classified by its kind as before.
-///
 /// # Errors
 ///
 /// The refusal, when the output is unusable.
@@ -1051,20 +857,18 @@ fn refuse_unpublishable_output(path: &Path) -> Result<()> {
             ),
         )
         .into(),
-        report::Unpublishable::Directory => UserError::with_hint(
-            message,
-            "-o names the file to write; give a file name inside the directory",
-        )
-        .into(),
+        report::Unpublishable::Directory => {
+            UserError::with_hint(message, "-o names the file to write").into()
+        }
         report::Unpublishable::BrokenLink(_) => UserError::with_hint(
             message,
-            "point the link at a file in a directory that exists, or give -o another path",
+            "point the link at a file in a directory that exists",
         )
         .into(),
         report::Unpublishable::Unwritable { in_place, .. } => error::PermissionError {
             message,
             hint: if in_place.kind() == Kind::ReadOnlyFilesystem {
-                "the filesystem holding it is read-only; give -o a path on a writable one"
+                "the filesystem holding it is read-only"
             } else {
                 "give -o a path in a directory this user can create files in"
             }
@@ -1072,12 +876,7 @@ fn refuse_unpublishable_output(path: &Path) -> Result<()> {
         }
         .into(),
         report::Unpublishable::SiblingName { .. } | report::Unpublishable::SiblingLength { .. } => {
-            UserError::with_hint(
-                message,
-                "give -o a shorter file name: chard writes names beside the output that are \
-             longer than it",
-            )
-            .into()
+            UserError::with_hint(message, "give -o a shorter file name").into()
         }
         report::Unpublishable::Io(source)
             if matches!(
@@ -1087,8 +886,7 @@ fn refuse_unpublishable_output(path: &Path) -> Result<()> {
         {
             UserError::with_hint(
                 message,
-                "-o names a file: check that each directory in its path exists and is a \
-                 directory, and that it does not end in a slash",
+                "-o names a file: check that each directory in its path exists and is a directory",
             )
             .into()
         }
@@ -1131,16 +929,7 @@ fn deliver(destination: Option<&report::Destination>, document: &str, what: &str
 }
 
 /// Write `text` to stdout and flush it: the one way a subcommand's output reaches stdout,
-/// held by the `print_stdout` lint above.
-///
-/// A reader that closed the pipe (`chard probes | head -1`) has left, and the command
-/// keeps the exit status its own work earned. Rust ignores `SIGPIPE`, so where a C
-/// program would be killed the write returns `EPIPE`, and `println!` turned that into a
-/// panic and exit 101. Every subcommand writes its output last, so nothing is skipped
-/// by returning here. Any other write error (`ENOSPC` on `> /dev/full`) is the
-/// invocation's failure, since the output did not reach a reader that asked for it.
-/// The probes chard runs are untouched: `std::process::Command` restores the default
-/// `SIGPIPE` disposition in every child it spawns.
+/// held by the `print_stdout` lint, which `Cargo.toml`'s lint block denies.
 fn write_stdout(text: &str) -> Result<()> {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
@@ -1151,17 +940,13 @@ fn write_stdout(text: &str) -> Result<()> {
 }
 
 /// Split a caller-supplied flag string on whitespace.
-///
-/// Whitespace only: chard does not implement shell quoting, so a flag containing a
-/// literal space cannot be passed here. Splitting is what `--flags` has always done and
-/// the two new arguments match it rather than inventing a second convention.
 fn split_flags(text: &str) -> Vec<String> {
     text.split_whitespace().map(ToOwned::to_owned).collect()
 }
 
 /// A check's level vocabulary as `chard probes` publishes it: the words
 /// `observations[].level` may carry for this check, whether they are graded, and on a
-/// graded check the scale's kind and the ask. `probe::Levels` carries the mechanism.
+/// graded check the scale's kind and the ask.
 fn levels_listing(levels: probe::Levels) -> serde_json::Value {
     let mut listing = serde_json::Map::new();
     listing.insert("kind".to_owned(), serde_json::json!(levels.kind()));
@@ -1250,7 +1035,7 @@ fn corpus_listing() -> serde_json::Value {
                     .run_environment
                     .iter()
                     .map(|(name, value)| (*name, *value))
-                    .collect::<std::collections::BTreeMap<_, _>>(),
+                    .collect::<BTreeMap<_, _>>(),
                 "checks": p.checks.iter().map(|c| serde_json::json!({
                     "id": c.id,
                     "flag": c.flag,
@@ -1269,7 +1054,14 @@ fn corpus_listing() -> serde_json::Value {
                         .iter()
                         .filter(|row| row.check == c.id)
                         .map(|row| (row.arch, row.positive))
-                        .collect::<std::collections::BTreeMap<_, _>>(),
+                        .collect::<BTreeMap<_, _>>(),
+                    // `probe::PositiveInput`: the files the positive arm links after the probe's
+                    // source, which no other build is handed.
+                    "positive_inputs": c
+                        .positive_inputs()
+                        .iter()
+                        .map(|input| input.source_name)
+                        .collect::<Vec<_>>(),
                     "negative_control": c.negative,
                     "needs_vm": c.gate.needs_vm,
                     "arch": c.gate.arch,
@@ -1299,16 +1091,95 @@ fn link_lines(profile: &Profile) -> (Vec<String>, Vec<String>) {
     )
 }
 
+/// The run's warnings about the compiler lines the rule could not hold: the relocatable
+/// objects the run's checks read that show no compiler, and the linked artifacts that name
+/// another compiler and not the report's.
+fn compiler_line_warnings(
+    toolchain: &toolchain::Toolchain,
+    observations: &[Observation],
+    facts: &report::FactStore,
+) -> Vec<Diagnostic> {
+    let (kind, version) = (toolchain.detected.kind, toolchain.detected.version.as_str());
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let (mut unshown, mut linked): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut read = 0usize;
+    for o in observations {
+        let Some(sha) = o.build.as_ref().and_then(|b| b.artifact_sha256.as_deref()) else {
+            continue;
+        };
+        let Some(elf) = facts.measured_elf_of(o) else {
+            continue;
+        };
+        if !seen.insert(sha) {
+            continue;
+        }
+        let short: String = sha.chars().take(16).collect();
+        if elf.elf_type == measure::RELOCATABLE {
+            read = read.saturating_add(1);
+            if let toolchain::ObjectCompiler::NotShown(why) =
+                toolchain::object_compiler(&elf.comment, elf.comment_truncation(), kind, version)
+            {
+                unshown.push(format!("{} sha256:{short} {why}", o.probe));
+            }
+            continue;
+        }
+        let assembly = probe::find(&o.probe).is_some_and(|p| {
+            Path::new(p.source_name)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("s"))
+        });
+        if assembly || elf.comment_truncation().is_some() {
+            continue;
+        }
+        if let Some(lines) = toolchain::linked_without_own_line(&elf.comment, kind, version) {
+            linked.push(format!(
+                "{} sha256:{short} (`{}`)",
+                o.probe,
+                lines.join("`, `")
+            ));
+        }
+    }
+    let named = match kind {
+        toolchain::Kind::Other => "any compiler, since toolchain.kind is other".to_owned(),
+        _ => format!("{} {version}", kind.as_str()),
+    };
+    let mut warnings = Vec::new();
+    if !unshown.is_empty() {
+        warnings.push(Diagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "{} of the {read} relocatable object(s) the run's measured builds left were not \
+                 held to {named}, and their readings are published as measured. \
+                 artifact-compiled-by-another-compiler withholds an object only where its \
+                 `.comment` names another compiler. Each object, with the reason: {}",
+                unshown.len(),
+                unshown.join("; ")
+            ),
+            context: Some("toolchain".to_owned()),
+            rejection: None,
+        });
+    }
+    if !linked.is_empty() {
+        warnings.push(Diagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "{} linked artifact(s) of the run's measured builds name a compiler in \
+                 `.comment`, and none names {named}. Their readings are published as measured, \
+                 since a linked artifact is not held to a compiler line: its startup objects \
+                 add lines of their own. A compile forwarded to another compiler leaves this \
+                 shape, and so does a unit compiled under -fno-ident or -Qn. Each artifact, \
+                 with its lines: {}",
+                linked.len(),
+                linked.join("; ")
+            ),
+            context: Some("toolchain".to_owned()),
+            rejection: None,
+        });
+    }
+    warnings
+}
+
 /// Hold `toolchain.linker` to the `.comment` of every linked artifact the run built.
-///
-/// `measure::artifact_comments` says which artifacts are fed, under which label, and
-/// which are named and left out, given the selection each side's link line made. When
-/// the profile's C++ link selected its own linker, the C++ probes' artifacts are held to
-/// `linker.cxx` and every other artifact to `linker`; otherwise all of them are held to
-/// the one linker. A `disagrees` is published beside the banner with an error diagnostic
-/// and an `artifact-only` with a warning; `DESIGN.md`, "The binary testifies about
-/// itself", says why the first is a finding about the environment and the second a gap in
-/// chard's own reading.
 fn cross_check_linker(
     toolchain: &mut toolchain::Toolchain,
     observations: &[Observation],
@@ -1385,14 +1256,6 @@ fn cross_check_linker(
 /// flagless, under the profile's C flags, and through the C++ driver under its C++ flags
 /// where those differ, and withhold the verdicts that premise decided where any witness
 /// contradicts it.
-///
-/// `toolchain::target_agreement` derives the agreements and
-/// `report::withhold_on_contradicted_target` the withholding; `DESIGN.md`, "The
-/// binary testifies about itself", says why a contradicted premise withholds rather than
-/// re-gates. `report::target_witness_diagnostics` says what is published: an error naming
-/// every witness that spoke against the premise, a warning for an `unmapped` witness that
-/// flipped a gate, and a warning of its own for a dump the artifacts overruled, which
-/// contradicts nothing.
 fn cross_check_target(
     toolchain: &mut toolchain::Toolchain,
     observations: &mut [Observation],
@@ -1420,12 +1283,6 @@ fn cross_check_target(
 /// was resolved under `default_arch`, the driver's default target, before the dump under its
 /// flags could say which target they select.
 ///
-/// `openssf-tldr` picks its flags by architecture and selects no target; `explicit` selects
-/// whatever its flags say and does not depend on architecture. So no profile chard ships can
-/// resolve to different flags under the two, and one that did would have been dumped and
-/// linked under flags the published profile does not carry: that is refused as an unusable
-/// invocation rather than measured.
-///
 /// # Errors
 ///
 /// [`resolve_profile`]'s, and the refusal above.
@@ -1442,10 +1299,7 @@ fn settle_profile(
     let settled = resolve_profile(args, target_arch, config_files)?;
     if link_lines(&settled) != link_lines(&posed) {
         return Err(ConfigError(format!(
-            "the profile {} resolves to different flags under {target_arch}, the target its \
-             flags select, than under {default_arch}, the driver's default, under which its \
-             target was read; a profile whose target selection depends on the architecture it \
-             selects has no single target to measure",
+            "the profile {} resolves to different flags under {target_arch}, the target its flags select, than under {default_arch}, the driver's default",
             posed.id
         ))
         .into());
@@ -1480,19 +1334,6 @@ fn witnessed_archs(detected: &toolchain::Detected) -> Vec<&'static str> {
 /// Refuse a profile whose flags depend on an architecture the driver's own macro dumps
 /// contradict.
 ///
-/// `openssf-tldr` is resolved under the architecture the arch gate reads, which is
-/// `-dumpmachine`'s unless the profile's flags select a target. A driver can build for
-/// another without saying so there: gcc under `-m32` prints its own x86_64 triple while its
-/// dump defines `__i386__`, so the profile carried the guide's x86_64 row onto i386 builds and
-/// the CET checks read that row's request under the guide's name. The dumps are taken before
-/// any probe is built (after the driver's `-###` query) and name the machine the driver
-/// compiles for. Where one names an architecture
-/// the profile resolves to other flags under, the invocation has no single architecture for
-/// the profile to be chosen by, and it is refused as [`settle_profile`] refuses a
-/// target-dependent one, rather than measured under either list. A profile that does not
-/// depend on architecture (`bare`, `bare-optimized`, `explicit`) is never refused here; the
-/// contradiction it meets is published and withheld on by `cross_check_target`.
-///
 /// # Errors
 ///
 /// [`resolve_profile`]'s, and the refusal above.
@@ -1507,13 +1348,7 @@ fn refuse_on_witnessed_arch(
         let other = resolve_profile(args, arch, config_files)?;
         if link_lines(&other) != link_lines(&profile) {
             return Err(ConfigError(format!(
-                "the profile {} resolves to different flags under {arch}, the architecture the \
-                 driver's intrinsic macro dump names, than under {target_arch}, the one the arch \
-                 gate read; a profile chosen by architecture has no single architecture to be \
-                 chosen by here, so it is measured under neither. A driver that builds for \
-                 another target than its -dumpmachine names (gcc under -m32 prints its own \
-                 triple) can be measured under --profile explicit with the flags for the target \
-                 it builds",
+                "the profile {} resolves to different flags under {arch}, the architecture the driver's intrinsic macro dump names, than under {target_arch}, the one the arch gate read",
                 profile.id
             ))
             .into());
@@ -1529,12 +1364,6 @@ const EXPLICIT_NEEDS_FLAGS: &str = "--profile explicit requires --flags";
 /// The refusal of `--flags`, `--cxxflags` or `--ldflags` beside a built-in profile, checked
 /// in [`measure`] before the earlier output is set aside and again where the profile is
 /// resolved.
-///
-/// A built-in profile reads none of the three, so a list beside one would be applied to no
-/// build and named nowhere in the report: `chard measure --profile bare --flags -O2` would
-/// publish a measurement of the compiler's defaults, which reads as a measurement of `-O2`
-/// to whoever asked for one. An empty list is refused too, since it is still written beside
-/// a profile that does not read it.
 fn refuse_flags_beside_a_builtin_profile(args: &MeasureArgs) -> Result<()> {
     if args.profile == "explicit" {
         return Ok(());
@@ -1565,16 +1394,14 @@ fn refuse_flags_beside_a_builtin_profile(args: &MeasureArgs) -> Result<()> {
 /// `profile` with a note where the driver's `-v` was refused (`toolchain::answered`): chard
 /// then read no configuration file, which does not say the driver loads none, so a `bare`
 /// column's `flags_source: none` and every other profile's results may carry what such a
-/// file supplies. The note sits where `config_files`' own note would, beside `flags_source`.
+/// file supplies.
 fn with_unread_config(mut profile: Profile, failures: &[toolchain::QueryFailure]) -> Profile {
     if failures
         .iter()
         .any(|f| f.context == toolchain::CONFIG_FILES_FIELD)
     {
         let unread = format!(
-            "chard read nothing from the driver's `{}` (the toolchain.config_files diagnostic \
-             says how it ended), so it read no configuration file from it, which does not say \
-             the driver loads none: these results may include whatever such a file supplies",
+            "chard read nothing from the driver's `{}`",
             toolchain::VERBOSE_QUERY
         );
         profile.toolchain_note = Some(match profile.toolchain_note.take() {
@@ -1586,21 +1413,11 @@ fn with_unread_config(mut profile: Profile, failures: &[toolchain::QueryFailure]
 }
 
 /// Resolve `--profile` into flags, recording how they were obtained.
-///
-/// `config_files` is what the driver said it loaded, from `toolchain.config_files`. It
-/// decides what a `bare` column is a measurement of: with no file, the compiler's
-/// compiled-in defaults, and `flags_source: none` says so; with one, those defaults plus
-/// whatever the file supplies, which chard does not read, and `driver-config-file` says
-/// that instead. `bare-optimized` keeps `chard-enabling-condition`, since that value
-/// attributes the one flag chard passed, and its note names the file; the diagnostic
-/// `measure` raises names it for every profile.
 fn resolve_profile(args: &MeasureArgs, arch: &str, config_files: &[String]) -> Result<Profile> {
     let config_note = || {
         (!config_files.is_empty()).then(|| {
             format!(
-                "the driver loaded a configuration file it applies to every invocation \
-                 ({}), so these defaults are the compiler's compiled-in ones plus whatever \
-                 that file supplies; chard does not read the file",
+                "the driver loaded a configuration file it applies to every invocation ({})",
                 config_files.join(", ")
             )
         })
@@ -1622,30 +1439,6 @@ fn resolve_profile(args: &MeasureArgs, arch: &str, config_files: &[String]) -> R
         }),
         // The compiler's own defaults, measured under the one condition several of
         // them require in order to exist at all.
-        //
-        // `bare` answers a real question — what does `cc file.c` give you — and it
-        // is the right question for a CI script that compiles exactly that way. But
-        // it cannot answer whether the *compiler* ships a hardening default,
-        // because fortify does not instantiate without optimization: glibc's
-        // <features.h> gates `__USE_FORTIFY_LEVEL` on `__OPTIMIZE__`, and a vendor
-        // patch that injects `-D_FORTIFY_SOURCE` may condition it the same way. A
-        // `--` in the bare column is therefore ambiguous between "the compiler sets
-        // nothing" and "the compiler sets it only when optimizing", which are
-        // different facts about the distribution — `compiler-default` versus
-        // `compiler-default-gated` in the attribution taxonomy.
-        //
-        // Measured on Ubuntu 24.04, bare gcc-13 reported no fortify while its
-        // packages reported level 3. That is consistent with both readings, so
-        // LP#2012440's claim that the level lives in gcc-13 rather than in dpkg
-        // could not be settled from the two profiles that existed.
-        //
-        // `-O2` is deliberately the only flag. It is not a hardening flag and it
-        // grants nothing on its own, so anything observed here beyond what `-O2`
-        // enables is the compiler's own choice. `-O2` rather than `-O1` because it
-        // is what packaging uses and what the fortify levels are tuned against.
-        // The `optimization-enabled` check necessarily reads `on` in this profile:
-        // that cell is the profile's own flag rather than a finding, and
-        // `flags_source` says so.
         "bare-optimized" => Ok(Profile {
             id: "bare-optimized".to_owned(),
             flags_source: report::flags_source::ENABLING_CONDITION.to_owned(),
@@ -1658,9 +1451,7 @@ fn resolve_profile(args: &MeasureArgs, arch: &str, config_files: &[String]) -> R
                      else; -O2 is the precondition for fortify to instantiate, not a \
                      hardening flag. {config}"
                 ),
-                None => "the compiler's own defaults with optimization enabled and nothing \
-                         else; -O2 is the precondition for fortify to instantiate, not a \
-                         hardening flag"
+                None => "the compiler's own defaults with optimization enabled and nothing else"
                     .to_owned(),
             }),
             compiler_environment: compile::CompilerEnvironment::of_this_run(),
@@ -1677,9 +1468,7 @@ fn resolve_profile(args: &MeasureArgs, arch: &str, config_files: &[String]) -> R
         "explicit" => {
             let (cflags, cxxflags, ldflags) = explicit_lists(args)?;
             // The id carries a digest of the three lists, because `profile.id` is a
-            // column join key and two explicit lists are two columns. Every `--flags`
-            // run was `explicit:cli` before, so a hardened list and a bare one joined as
-            // one column measured twice. See `report::explicit_profile_id`.
+            // column join key and two explicit lists are two columns.
             Ok(Profile {
                 id: report::explicit_profile_id(&cflags, &cxxflags, &ldflags),
                 flags_source: report::flags_source::USER.to_owned(),
@@ -1696,15 +1485,6 @@ fn resolve_profile(args: &MeasureArgs, arch: &str, config_files: &[String]) -> R
 
 /// The three lists of an explicit profile, read from `--flags`, `--cxxflags` and
 /// `--ldflags` and refused where chard cannot read them ([`refuse_unreadable_flags`]).
-///
-/// One reader for both of its callers: `measure` calls it before the set-aside and the
-/// toolchain interrogation, so a list it refuses touches nothing, and [`resolve_profile`]
-/// builds the
-/// profile from what it returns. None of the refusals depends on the toolchain.
-///
-/// An absent `--cxxflags` stays empty rather than being filled from `--flags`:
-/// `measure::variant_flags` reads empty as "same as cflags", and the report should say the
-/// caller supplied one set, not claim they supplied two that happen to match.
 ///
 /// # Errors
 ///
@@ -1730,53 +1510,119 @@ fn explicit_lists(args: &MeasureArgs) -> Result<(Vec<String>, Vec<String>, Vec<S
     Ok((cflags, cxxflags, ldflags))
 }
 
-/// Each relative path argument of `lists`, by list, as [`refuse_unreadable_flags`] names it:
-/// as written and in its list, with gcc's reading of clang's own option or the pair a handed
-/// path option lacks where the argument was read so ([`compile::relative_path_readings`]).
+/// Each relative path argument and input file of `lists`, as [`refusals`] names it, with the
+/// reading's note where it has one, such as gcc's reading of clang's own option, the pair a
+/// handed path option lacks, or what an input file is opened against
+/// ([`compile::relative_path_readings`]).
 fn relative_path_refusals(lists: &[(&str, &Vec<String>)]) -> Vec<String> {
-    lists
+    refusals(lists, |words| {
+        compile::relative_path_readings(words)
+            .into_iter()
+            .map(|found| (found.argument, found.reading.note()))
+            .collect()
+    })
+}
+
+/// The lines the driver is handed that join two of `lists`, each with the name a refusal gives
+/// it and the two lists it joins: `--flags` then `--ldflags`, which every C build is handed, and
+/// `--cxxflags` then `--ldflags`, which a C++ build is handed where `--cxxflags` is given. Each
+/// line is [`measure::profile_flags_for`]'s, the function the builds take theirs from. A line of
+/// one list, where the other is empty, is that list's own, and not returned.
+fn joined_lines<'a>(lists: &[(&str, &'a Vec<String>)]) -> Vec<JoinedLine<'a>> {
+    let list = |name: &str| {
+        lists
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(&[][..], |(_, l)| l.as_slice())
+    };
+    let (cflags, cxxflags, ldflags) = (list("--flags"), list("--cxxflags"), list("--ldflags"));
+    [
+        (probe::Lang::C, cflags, "--flags"),
+        (probe::Lang::Cxx, cxxflags, "--cxxflags"),
+    ]
+    .into_iter()
+    .filter(|(_, base, _)| !base.is_empty() && !ldflags.is_empty())
+    .map(|(lang, base, name)| JoinedLine {
+        name: format!("{name} followed by --ldflags, the one line the driver is handed"),
+        parts: [base, ldflags],
+        line: measure::profile_flags_for((cflags, cxxflags, ldflags), lang),
+    })
+    .collect()
+}
+
+/// One line [`joined_lines`] returns.
+struct JoinedLine<'a> {
+    /// The name a refusal gives the line.
+    name: String,
+    /// The two lists it joins, in their order on it.
+    parts: [&'a [String]; 2],
+    /// The line, as the builds take it.
+    line: Vec<String>,
+}
+
+/// What `read` finds in `lists`, as [`refuse_unreadable_flags`] names it: as written and in its
+/// list, with its note where it has one. Each list is read on its own, and then each line the
+/// driver is handed joined from two of them ([`joined_lines`]); a reading the joined line gives
+/// that neither list gives on its own is named in the joined line. The driver reads the joined
+/// line, so a word at the end of one list takes the first word of the next as its value: under
+/// `--flags "-O2 -Xassembler" --ldflags "--x32"`, read a list at a time, neither list selects
+/// x32, while the driver is handed `-Xassembler --x32` (clang 22.1.8 on Fedora 44 x86_64,
+/// measured 2026-11-15 UTC; the two words in one list are refused). A reading one list gives
+/// is named in that list rather than again in the joined line.
+fn refusals(
+    lists: &[(&str, &Vec<String>)],
+    read: impl Fn(&[String]) -> Vec<(String, Option<String>)>,
+) -> Vec<String> {
+    let entry = |(arg, note): &(String, Option<String>), name: &str| match note {
+        Some(note) => format!("{arg:?} in {name}, {note}"),
+        None => format!("{arg:?} in {name}"),
+    };
+    let mut found: Vec<String> = lists
         .iter()
         .flat_map(|(name, list)| {
-            compile::relative_path_readings(list)
-                .into_iter()
-                .map(move |found| {
-                    let arg = found.argument;
-                    match found.reading.note() {
-                        Some(note) => format!("{arg:?} in {name}, {note}"),
-                        None => format!("{arg:?} in {name}"),
-                    }
-                })
+            read(list)
+                .iter()
+                .map(|reading| entry(reading, name))
+                .collect::<Vec<_>>()
         })
-        .collect()
+        .collect();
+    for JoinedLine { name, parts, line } in joined_lines(lists) {
+        let mut apart: Vec<(String, Option<String>)> =
+            parts.iter().flat_map(|part| read(part)).collect();
+        for reading in read(&line) {
+            if let Some(at) = apart.iter().position(|seen| *seen == reading) {
+                apart.swap_remove(at);
+                continue;
+            }
+            let named = entry(&reading, &name);
+            if !found.contains(&named) {
+                found.push(named);
+            }
+        }
+    }
+    found
 }
 
 /// Refuse an explicit profile's flag lists where chard cannot read what they hand the
 /// driver: a response file first, since a relative `@file` is first of all a file chard
-/// cannot read into ([`compile::response_file_arguments`] says why), then a flag that
-/// selects x32, 16-bit or aarch64 ILP32 code, which chard does not measure
-/// ([`toolchain::unsupported_target_flags`] says which), then a flag that
+/// cannot read into ([`compile::response_file_arguments`]), then a flag that selects x32,
+/// 16-bit or aarch64 ILP32 code ([`toolchain::unsupported_target_flags`]), a flag that
 /// removes part of the runtime and leaves its replacement unnamed
-/// ([`toolchain::runtime_removing_flags`] says why), then a flag holding U+001F, which
-/// `report::flags_sha256` joins a list's flags with, then a pair the two drivers read
-/// differently, clang's `-isystem-after` or `-include-pch` alone before a word a selection
-/// reader takes ([`toolchain::driver_divided_pairs`] says why the arms can match one
-/// reading and not the other), then a relative path ([`compile::relative_path_readings`]
-/// says why one names two directories in a run). Called before any of the lists reaches a
-/// driver.
+/// ([`toolchain::runtime_removing_flags`]), a flag holding U+001F, which
+/// `report::flags_sha256` joins a list's flags with, a pair the two drivers read differently
+/// ([`toolchain::driver_divided_pairs`]), and a relative path or an input file named by one
+/// ([`compile::relative_path_readings`]). Each reader reads every list on its own and then
+/// the lines the driver is handed joined from them ([`refusals`] says why both). Called
+/// before any of the lists reaches a driver.
 ///
 /// # Errors
 ///
 /// A [`ConfigError`] naming each refused argument and the list it came from.
 fn refuse_unreadable_flags(lists: &[(&str, &Vec<String>)]) -> Result<()> {
     let named = |read: fn(&[String]) -> Vec<String>| -> Vec<String> {
-        lists
-            .iter()
-            .flat_map(|(name, list)| {
-                read(list)
-                    .into_iter()
-                    .map(move |arg| format!("{arg:?} in {name}"))
-            })
-            .collect()
+        refusals(lists, |words| {
+            read(words).into_iter().map(|arg| (arg, None)).collect()
+        })
     };
     let response_files = named(compile::response_file_arguments);
     if !response_files.is_empty() {
@@ -1849,11 +1695,12 @@ fn refuse_unreadable_flags(lists: &[(&str, &Vec<String>)]) -> Result<()> {
     let relative = relative_path_refusals(lists);
     if !relative.is_empty() {
         return Err(ConfigError(format!(
-            "a relative path in an explicit profile names one directory to the probe builds, \
-             which run in the work directory, and another to the toolchain interrogation, which \
-             runs where chard was started, and chard reads each word as the tool it is handed to \
-             reads it, refusing what it cannot read so; give each path as an absolute path, or \
-             do as its note says: {}",
+            "a relative path in an explicit profile names what the toolchain opens in the \
+             directory it runs in: the probe builds run in the work directory, which holds what \
+             chard and any earlier run wrote there, and the toolchain interrogation runs where \
+             chard was started. chard reads each word as the tool it is handed to reads it, \
+             refusing what it cannot read so; give each path as an absolute path, or do as its \
+             note says: {}",
             relative.join(", ")
         ))
         .into());
@@ -1863,19 +1710,6 @@ fn refuse_unreadable_flags(lists: &[(&str, &Vec<String>)]) -> Result<()> {
 
 /// Resolve `--probe` ids into the probes to run, and the truncation a narrowed run
 /// records.
-///
-/// A repeated id is refused rather than deduplicated. The selection is the coverage
-/// denominator, and an invocation naming one probe twice is asking for a denominator
-/// that counts one thing twice: honouring it counted the probe's checks twice against
-/// two identical observations and published `all_checks_attempted` over the doubled
-/// pair, with `defect_coverage.from_checks` listing one check id twice as though a
-/// second measurement had corroborated the first. Deduplicating silently would change
-/// what the caller typed into what they meant, and the two readings of a repeated id
-/// (once, or twice) both differ from the invocation. A duplicated `--probe` is a
-/// scripted loop that appended one id twice, and the loop is what needs fixing.
-///
-/// Unknown ids are refused for the same reason they always were: a selection that
-/// names nothing measures nothing and must not look like a run.
 ///
 /// # Errors
 ///
@@ -1895,8 +1729,7 @@ fn select_probes(requested: &[String]) -> Result<(Vec<&'static Probe>, Vec<Strin
         if chosen.iter().any(|p| p.id == found.id) {
             return Err(UserError::with_hint(
                 format!("probe id given more than once: {id}"),
-                "pass each --probe once; the selection is a set, and a repeated id would \
-                 count one probe's checks twice in the coverage denominator",
+                "pass each --probe once; the selection is a set",
             )
             .into());
         }
@@ -1914,12 +1747,6 @@ fn select_probes(requested: &[String]) -> Result<(Vec<&'static Probe>, Vec<Strin
 
 /// Read an image attestation from `path`, if one was supplied.
 ///
-/// Malformed input is an error rather than a silent `unattested`. The two are different
-/// claims — "nothing was offered" against "something was offered and could not be read" —
-/// and collapsing them would let a typo in a harness invocation downgrade a verified image
-/// to an unverified one without saying so. That is the failure mode this whole feature
-/// exists to close, so it must not be reintroduced by the reader.
-///
 /// # Errors
 ///
 /// When the file cannot be read, or does not deserialise into the fetcher's own
@@ -1929,15 +1756,12 @@ fn read_image_attestation(path: Option<&Path>) -> Result<Option<environment::Att
         return Ok(None);
     };
     // The io error keeps its kind, so `error::classify` reads it as it does for every other
-    // reader of an operator-named file (an unreadable one is `PERMISSION` there, as it is
-    // for `table`); only bytes that are not UTF-8 are this function's to refuse.
-    // Refused from the metadata first, as `detect --evidence` and `table` refuse it: a
-    // character device such as `/dev/zero` would be read without bound, and the allocation
-    // failure that ends that read is chard's own (`INTERNAL`), not the caller's.
+    // reader of an operator-named file; only bytes that are not UTF-8 are this function's to
+    // refuse.
     let reading = || format!("reading the image attestation {}", path.display());
     let kind = std::fs::metadata(path).with_context(reading)?.file_type();
     if !(kind.is_file() || std::os::unix::fs::FileTypeExt::is_fifo(&kind)) {
-        return Err(error::UserError::new(format!(
+        return Err(UserError::new(format!(
             "{} is not an image attestation chard can read: it is {}",
             path.display(),
             error::file_type_name(kind)
@@ -1946,7 +1770,7 @@ fn read_image_attestation(path: Option<&Path>) -> Result<Option<environment::Att
     }
     let bytes = std::fs::read(path).with_context(reading)?;
     let text = String::from_utf8(bytes).map_err(|e| {
-        error::UserError::new(format!(
+        UserError::new(format!(
             "reading the image attestation {}: {e}",
             path.display()
         ))
@@ -1954,26 +1778,15 @@ fn read_image_attestation(path: Option<&Path>) -> Result<Option<environment::Att
     // Parsed by the library rather than here, so the refinement has a test: `from_json`
     // refuses a digest that is not hex of the length its own `digest_kind` implies.
     let attestation = environment::Attestation::from_json(&text).map_err(|e| {
-        error::UserError::with_hint(
+        UserError::with_hint(
             format!("parsing the image attestation {}: {e}", path.display()),
-            "the file must be the fetcher's provenance object: verdict, url, served_by, \
-                 manifest_url, digest_kind, digest, digest_matched, signature, and \
-                 optionally installed_disk {sha256, installed_at, installed_from_digest}. \
-                 The harness writes exactly this as `provenance` in its session file.",
+            "the file must be the fetcher's provenance object: verdict, url, served_by, manifest_url, digest_kind, digest, digest_matched, signature, and optionally installed_disk {sha256, installed_at, installed_from_digest}.",
         )
     })?;
     Ok(Some(attestation))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one invocation, read top to bottom: the work directory, the selection, the \
-              toolchain and then its environment, the profile, the sweep over the \
-              library's loop, the derived layer, and publication. Each step is read \
-              through the one before it, and that order is the provenance a report rests \
-              on; one function keeps it auditable in one place. The control triple itself \
-              lives in `measure::run_check`."
-)]
+#[expect(clippy::too_many_lines, reason = "one invocation, read top to bottom.")]
 fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
     let started_at = SystemTime::now();
     let started_utc = report::iso8601_utc(started_at);
@@ -1981,22 +1794,16 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
 
     // The invocation's own arguments first, before anything on disk is touched: a run
     // refused here measured nothing and is not a run, so it leaves the earlier report at
-    // `-o` and the work directory as they were. With the set-aside first, a mistyped
-    // `--probe` would move a good report to `<output>.previous` while measuring nothing.
-    // The selection is settled before the compiler is
-    // touched, so an invocation that names a probe twice or names one that does not exist
-    // is refused at the door rather than after a toolchain interrogation it was never
-    // going to use.
+    // `-o` and the work directory as they were.
     let (selected, truncations) = select_probes(&args.probes)?;
     let attestation = read_image_attestation(args.image_attestation.as_deref())?;
     if args.profile == "explicit" {
         explicit_lists(args)?;
     }
     refuse_flags_beside_a_builtin_profile(args)?;
-    // The compiler environment's `--env` pairs, refused or fixed before any toolchain runs.
-    // The first toolchain invocation reads them, and `compile::RunEnvironment` makes a set
-    // after that read an error, so no run is measured under one environment in its early
-    // invocations and another in its later ones.
+    // The compiler environment's `--env` pairs, refused or fixed before any toolchain runs:
+    // `compile::RunEnvironment` makes a set after the first read an error, so no run is
+    // measured under one environment early and another later.
     compile::add_to_compiler_environment(compile::compiler_environment_additions(&args.env)?)?;
     // A work directory that exists and is not a directory is the invocation's error too,
     // and `create_dir_all` would refuse it after the set-aside.
@@ -2016,9 +1823,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
     // not deleted.
     let report_file = args.report_file()?;
     // Whether this run sets an earlier report aside, read before it does: the closing line
-    // says it replaced one, or where it is kept, only where there was one. A metadata error
-    // reads as none: `set_aside_output` reads the same metadata next and refuses the run on
-    // it, so the run closes as refused before the set-aside and this is never read.
+    // says it replaced one, or where it is kept, only where there was one.
     let earlier = report_file
         .as_deref()
         .and_then(|path| report::published_path(path).ok().flatten())
@@ -2037,10 +1842,8 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
     std::fs::create_dir_all(&args.workdir)
         .with_context(|| format!("creating work directory {}", args.workdir.display()))?;
     ending.workdir = Some(args.workdir.clone());
-    // Absolutize once, here, so nothing downstream has to care whether the
-    // operator passed a relative path. Probe binaries are executed with their cwd
-    // set to the work directory, and a relative artifact path would then resolve
-    // against the wrong base.
+    // Absolutized once: probe binaries run with their cwd set to the work directory, where a
+    // relative artifact path would resolve against the wrong base.
     let workdir = std::path::absolute(&args.workdir)
         .with_context(|| format!("resolving {}", args.workdir.display()))?;
     // One run to a work directory, held until this function returns: two runs sharing one
@@ -2067,7 +1870,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         attestation,
     )
     .map_err(|refusal| match refusal {
-        environment::AttestationRefusal::DigestMismatch(a) => error::ConfigError(format!(
+        environment::AttestationRefusal::DigestMismatch(a) => ConfigError(format!(
             "refusing to measure: the image was fetched but did not match the publisher's \
              manifest.\n  \
              image     {}\n  \
@@ -2082,22 +1885,14 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
             a.digest(),
         )),
         // The invocation contradicts itself rather than the specimen being wrong: an
-        // attestation describes an image, and this run booted none. Recording it as
-        // `attested` is what happened before, which published a report claiming its image
-        // had been established while naming no image at all.
-        environment::AttestationRefusal::NoImageToAttest => error::ConfigError(
-            "refusing to measure: --image-attestation was given for a run that booted no \
-             image. Pass --execution vm or --execution container for the environment the \
-             attestation describes, or drop the attestation to measure this system."
+        // attestation describes an image, and this run booted none.
+        environment::AttestationRefusal::NoImageToAttest => ConfigError(
+            "refusing to measure: --image-attestation was given for a run that booted no image. Pass --execution vm or --execution container, or drop the attestation."
                 .to_owned(),
         ),
     })?;
-    // The toolchain's own target, not the arch chard's own binary was compiled for —
-    // they coincide for a native build, and only for one, so the two must not be read
-    // as interchangeable. See `Detected::target_arch`'s doc comment for what reading the
-    // wrong one costs. That is the driver's default target, which the profile is
-    // first resolved under; where the profile's flags select another, the gate reads the
-    // one they select (`toolchain::gate_target`), and the profile is resolved again under it.
+    // The toolchain's own target, not the arch chard's own binary was compiled for: they
+    // coincide only for a native build.
     let default_arch = detected
         .target_arch()
         .unwrap_or_else(|| env.kernel.arch.clone());
@@ -2107,8 +1902,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
     let (c_link, cxx_link) = link_lines(&posed);
     detected.link_with(&c_link, &cxx_link, &workdir);
     // The target the profile's own flags select, which `-dumpmachine` and the flagless
-    // dump cannot see; `toolchain::ProfileMacroWitness` says why. The C++ list is dumped
-    // only where it differs, and `Detected::dump_with` says why.
+    // dump cannot see; `toolchain::ProfileMacroWitness` says why.
     detected.dump_with(&c_link, &cxx_link, &workdir)?;
     let (target_arch, arch_source) = toolchain::gate_target(
         detected.target_triple.as_deref(),
@@ -2130,11 +1924,9 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         &detected.config_files,
     )?;
     let profile = with_unread_config(profile, &detected.query_failures);
-    // The join key is composed here, once, from halves the environment owns. The
-    // environment could only be read through the toolchain's own macro dump, which is
-    // why the published struct is made after it rather than by `toolchain::detect`;
-    // `Detected::qualified` is its only constructor, so no report carries an unqualified
-    // key. The tags are `env::Libc::tag` and `env::Distro::tag`.
+    // The join key is composed here, once, from halves the environment owns, which could only
+    // be read through the toolchain's own macro dump; `Detected::qualified` is its only
+    // constructor, so no report carries an unqualified key.
     let mut toolchain = detected.qualified(&env.libc.tag(), &env.distro.tag());
     error::note(&format!(
         "{} / {} {} / kernel {}",
@@ -2144,18 +1936,13 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         env.kernel.release
     ));
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    // Every profile is measured through the file, so every report says so. The `bare`
-    // profile additionally names the mechanism in `flags_source`, since that is the field
-    // a reader of a bare column consults; the others already name where their flags came
-    // from, and a file on top of them is what this diagnostic records.
+    // Every profile is measured through the file, so every report says so; the `bare`
+    // profile also names it in `flags_source`, the field a reader of a bare column consults.
     if !toolchain.detected.config_files.is_empty() {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             message: format!(
-                "the driver loaded {} configuration file(s) it applies to every invocation: \
-                 {}. Whatever they supply is in every build measured here, and chard does \
-                 not read them; a bare column measured through this driver is the \
-                 compiler's defaults plus that file, which profile.flags_source names",
+                "the driver loaded {} configuration file(s) it applies to every invocation: {}",
                 toolchain.detected.config_files.len(),
                 toolchain.detected.config_files.join(", ")
             ),
@@ -2173,22 +1960,38 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
             rejection: None,
         });
     }
+    // The banner held to the dump `kind` and `version` are read from: a program that
+    // answers `--version` as one compiler and the macro dump as another is named here,
+    // with both fields published as read (`toolchain::banner_disagreement`).
+    if let Some(message) = toolchain
+        .detected
+        .version_raw
+        .as_deref()
+        .and_then(|banner| {
+            toolchain::banner_disagreement(
+                banner,
+                toolchain.detected.kind,
+                &toolchain.detected.version,
+            )
+        })
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            message,
+            context: Some(toolchain::VERSION_RAW_FIELD.to_owned()),
+            rejection: None,
+        });
+    }
 
     // The denominator for coverage: the check ids the selection names, as a set,
     // computed before any work happens so a crash mid-sweep cannot quietly shrink it.
-    // A set of identities rather than a count, because `report::coverage` reconciles
-    // what came back against what was handed in by name: a count-only comparison is
-    // satisfied by any list of the right length, including one that measured a check
-    // twice and another not at all.
     let checks_expected: BTreeSet<String> = selected
         .iter()
         .flat_map(|p| p.checks)
         .map(|c| c.id.to_owned())
         .collect();
 
-    // Sources are written once; every variant compiles the same bytes. Both paths are
-    // chard's own, under the directory it just created, and tagged so: a failure here is
-    // never the caller's typo, and `error::classify` reads the tag before the io kind.
+    // Sources are written once; every variant compiles the same bytes.
     let header = workdir.join(probe::SELFREPORT_HEADER_NAME);
     std::fs::write(&header, probe::SELFREPORT_HEADER)
         .with_context(|| HarnessPath(header.clone()))
@@ -2202,6 +2005,30 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         }
     }
 
+    // The run's witness: 128 bits of this run's own, or, under `--normalize`, derived from
+    // what the run was asked, so the artifacts and their digests are byte-identical too.
+    let witness = if env.distro.is_macos() {
+        // Mach-O artifacts, which the ELF reader does not read: no header, no witness.
+        None
+    } else if args.normalize {
+        let asked = compile::WitnessQuestion {
+            cflags: &profile.cflags,
+            cxxflags: &profile.cxxflags,
+            ldflags: &profile.ldflags,
+            env: profile.compiler_environment.added().collect(),
+            driver: &toolchain.detected.driver,
+            version_raw: toolchain.detected.version_raw.as_deref(),
+            target_triple: toolchain.detected.target_triple.as_deref(),
+            probe_corpus_sha256: &probe::corpus_sha256(),
+        };
+        Some(compile::RunWitness::derived_in(asked.lines(), &workdir)?)
+    } else {
+        Some(
+            compile::RunWitness::random_in(&workdir)
+                .context("drawing the run's witness; `--normalize` needs no random device")?,
+        )
+    };
+
     let ctx = Conditions {
         env: &env,
         profile: &profile,
@@ -2210,8 +2037,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         profile_is_clean: Conditions::profile_is_clean(&profile),
     };
 
-    // The gate's flag, decided once. A toolchain with no structured form chard has measured
-    // is said so rather than compared against nothing.
+    // The gate's flag, decided once.
     let structured_format = args
         .structured_diagnostics
         .then(|| chard::structured::format_flag(toolchain.detected.kind))
@@ -2220,8 +2046,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             message: format!(
-                "--structured-diagnostics: no structured diagnostic format is known for a \
-                 `{}` toolchain, so nothing was compared",
+                "--structured-diagnostics: no structured diagnostic format is known for a `{}` toolchain",
                 toolchain.detected.kind.as_str()
             ),
             context: None,
@@ -2236,20 +2061,23 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         workdir: &workdir,
         timeout: Duration::from_secs(args.timeout),
         structured: structured_format,
+        witness: witness.as_ref(),
     };
 
     let mut observations: Vec<Observation> = Vec::new();
     let mut facts = report::FactStore::default();
+    let mut listings = BTreeMap::new();
     let mut fact_conflicts: Vec<report::Conflict> = Vec::new();
 
     for probe in &selected {
         error::note(&format!("probe {}", probe.id));
         let outcome = measure::run_probe(&driver, probe, &ctx);
         observations.extend(outcome.observations);
+        if let Some(record) = outcome.listings {
+            listings.insert(probe.id.to_owned(), record);
+        }
         diagnostics.extend(outcome.diagnostics);
-        // One store for the run. Two probes offering different facts under one digest is
-        // chard disagreeing with itself about one sequence of bytes: said so here, and a
-        // contradiction in the consistency pass, which refuses the report.
+        // One store for the run.
         for conflict in facts.merge(outcome.facts) {
             diagnostics.push(Diagnostic {
                 severity: Severity::Error,
@@ -2278,6 +2106,9 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         &ctx,
         &mut diagnostics,
     );
+    // The compiler lines the rule could not hold, named: the objects that showed no
+    // compiler, and the linked artifacts that name another compiler and not the report's.
+    diagnostics.extend(compiler_line_warnings(&toolchain, &observations, &facts));
     // The artifacts' testimony against the architecture the arch gate read before any
     // build, which can withhold verdicts, so before anything is derived from them.
     cross_check_target(
@@ -2290,16 +2121,18 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
     );
     // The built thing's testimony against the macro channel, over the settled verdicts:
     // a macro reading of a code-generation observable whose elf-static or runtime twin
-    // read the opposite presence is withheld (`report::MACRO_TWINS`; DESIGN.md, "Four
-    // observation channels"). After the target rule, so a twin it withheld decides
-    // nothing, and before anything is derived from the verdicts.
+    // read the opposite presence is withheld (`report::MACRO_TWINS`).
     let contradicted = report::withhold_contradicted_macros(&mut observations);
     diagnostics.extend(contradicted.diagnostics());
+    // Where no twin of such a reading is a measurement in this run, the input clause holds
+    // it as it holds a macro check with no twin (`measure::withhold_where_no_twin_measured`).
+    diagnostics.extend(measure::withhold_where_no_twin_measured(
+        &mut observations,
+        &profile,
+    ));
 
     // The ratchet is derived before the rollup, because a non-monotone reading means
-    // a probe is faulty and its rungs must not reach the matrix as measurements;
-    // `report::withhold_inconsistent_rungs` moves them, says why, and derives the ratchet
-    // again so the summary agrees with the observations it summarises.
+    // a probe is faulty and its rungs must not reach the matrix as measurements.
     let (ratchet, withheld) = report::withhold_inconsistent_rungs(&mut observations, &facts);
     diagnostics.extend(withheld);
     let defect_coverage = report::defect_coverage(&observations);
@@ -2334,30 +2167,31 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
     // The artifact's SafeStack reading against the flags that asked for it, or did not.
     diagnostics.extend(report::safestack_cross_check(&observations, &profile));
 
-    let coverage: Coverage = report::coverage(
+    let mut coverage: Coverage = report::coverage(
         &observations,
         &checks_expected,
         probe::total_checks(),
         &profile,
         truncations,
     );
+    // The gate's record, over the final observations, so the report says what the gate below
+    // excused before anything reads the exit status.
+    coverage.gate = args
+        .fail_on_missing
+        .then(|| report::Gate::of(&observations, args.allow.iter().copied().collect()));
 
     if !coverage.all_checks_attempted {
-        // Against the corpus total, which is what the flag tests.
-        //
-        // This printed `checks_attempted` against `checks_expected` while
-        // `all_checks_attempted` compares `attempted` to `corpus_checks_total`, so a
-        // filtered run reported "coverage incomplete: 1 of 1 checks produced an
-        // observation" — a warning whose own numbers say nothing is missing. Both
-        // denominators are real and they answer different questions: `checks_expected`
-        // is how many this invocation asked for, `corpus_checks_total` how many exist.
-        // A message must quote the one its condition used.
+        // The message quotes what the flag tests: the corpus total, and the two id lists
+        // where either names anything.
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             message: format!(
                 "coverage incomplete: {} of the corpus's {} checks produced an \
-                 observation ({} were asked for by this invocation)",
-                coverage.checks_attempted, coverage.corpus_checks_total, coverage.checks_expected
+                 observation ({} were asked for by this invocation){}",
+                coverage.checks_attempted,
+                coverage.corpus_checks_total,
+                coverage.checks_expected,
+                id_shortfall(&coverage.checks_missing, &coverage.checks_unexpected)
             ),
             context: None,
             rejection: None,
@@ -2379,12 +2213,8 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         });
     }
 
-    // Reduced over the observations above, not measured. `-fhardened` is an umbrella,
-    // so what matters is whether its constituents are in force — a toolchain can be
-    // effectively hardened without the option existing, and can pass the option while
-    // downgrading a constituent underneath it.
-    // `cfi-effective` after `fhardened-effective`, and appended rather than inserted: a
-    // consumer reading `composites[0]` keeps reading the umbrella it always read.
+    // Reduced over the observations above, not measured: what matters for an umbrella is
+    // whether its constituents are in force.
     let composites = vec![
         composite::fhardened(
             &observations,
@@ -2424,6 +2254,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
             decoders_sha256: probe::decoders_sha256(),
             invocation: report::recorded_invocation(std::env::args_os()),
             deadlines: report::Deadlines::new(Duration::from_secs(args.timeout)),
+            artifact_witness: witness.as_ref().map(report::ArtifactWitness::of),
         },
         environment: env,
         toolchain,
@@ -2431,6 +2262,7 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         decoders: report::decoders_of(&observations),
         observations,
         facts,
+        listings,
         fortify_ratchet: ratchet,
         corroboration,
         structured_diagnostics,
@@ -2443,23 +2275,16 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         fact_conflicts,
     };
 
-    // Check the derived layer against the observations it was computed from, before
-    // anything is written. The rollups — the ratchet, defect coverage, the composites —
-    // are the numbers most likely to be read and the only part of the report nothing
-    // else validates: a control triple validates one check and
-    // `corroboration` compares channels within a protection. A contradiction
-    // here means the report disagrees with itself, which is a fault in chard rather
-    // than a finding about the toolchain, so it is said loudly and recorded in the
-    // document that carries it.
+    // Check the derived layer against the observations it was computed from, before anything
+    // is written: the rollups (the ratchet, defect coverage, the composites) are the numbers
+    // most likely to be read and the only part of the report nothing else validates.
     let mut report = report;
     // Derived from the measurement rather than the clock, after the observations are
     // final: the ratchet downgrade above moves verdicts, and an id computed earlier would
-    // name a set of cells the report does not carry. The inputs first, since the id
-    // digests them.
+    // name a set of cells the report does not carry.
     report.run.inputs_sha256 = report::inputs_of(&report).sha256();
     report.run.id = report::run_id(&report.run.inputs_sha256, &report.observations);
-    // Before the consistency pass, so what is published is what was checked. Nothing
-    // derived is among the volatile fields, so the pass sees the same claims either way.
+    // Before the consistency pass, so what is published is what was checked.
     if args.normalize {
         report::normalize(&mut report);
     }
@@ -2494,46 +2319,111 @@ fn measure(args: &MeasureArgs, ending: &mut Ending) -> Result<Closed> {
         report::Publication::Written => {}
     }
 
-    // Both halves, deliberately. Gating on `all_checks_attempted` alone would pass a run
-    // where every check was handed in and nine of them earned no verdict, which is the
-    // shape of an incomplete measurement that looks complete. The gate is
-    // `all_verdicts_published` and not a count of triples that discriminated, which a
-    // withheld `indeterminate` satisfies and an earned `unsupported` does not: both the
-    // wrong way round for a completeness gate. `report::Standing` is the rule, and the
-    // field is false exactly when `coverage.withholding.instrument_withholdings` is not
-    // empty or a check went unattempted; the field's own doc records why a limitation
-    // passes it.
+    // Both halves, deliberately: gating on `all_checks_attempted` alone would pass a run where
+    // every check was handed in and some earned no verdict, an incomplete measurement that
+    // looks complete.
+    let Some(record) = report.coverage.gate.as_ref() else {
+        return Ok(Closed::Published);
+    };
     let complete = report.coverage.all_verdicts_published;
-    if args.fail_on_missing && !complete {
-        return Ok(Closed::GateFailed {
-            unsettled: name_the_shortfalls(&report),
-        });
+    if complete && record.allowed.is_empty() {
+        return Ok(Closed::Published);
     }
-    Ok(Closed::Published)
-}
-
-/// The lines a failed `--fail-on-missing` leaves on stderr, after the report: a count, then
-/// one line per check that failed it, in `report::shortfalls`'s order, then the exit status
-/// and the remedies chard knows; returns how many checks it named.
-///
-/// The exit status alone said only that the gate failed, and the reason was a reading of
-/// `coverage` and every verdict. `gate_lines` builds the lines from the report alone, so
-/// the unit tests below hold each of them.
-fn name_the_shortfalls(report: &Report) -> usize {
     let corpus = probe::CORPUS.iter().flat_map(|p| p.checks).map(|c| c.id);
     let shortfalls = report::shortfalls(&report.observations, corpus);
-    for line in gate_lines(&report.coverage, &shortfalls) {
+    let (closed, lines) = gate(&report.coverage, record, &shortfalls);
+    for line in lines {
         error::note(&line);
     }
-    shortfalls.len()
+    Ok(closed)
+}
+
+/// Whether the gate failed on machine limits: every shortfall is an unsettled check a gating
+/// rule of [`MACHINE_LIMITS`] or of [`TARGET_LIMITS`] holds, and at least one is a machine
+/// limit. Target limits are allowed beside a machine limit because every architecture the
+/// mechanism table has a column for leaves some check unread there. Target limits alone, a
+/// check not attempted, a held check with no rule, a rule of any other kind and an empty list
+/// are not machine-limited: the gate fails with no named shortfall only on a report that
+/// contradicts itself, a defect in chard.
+fn machine_limited(shortfalls: &[report::Shortfall]) -> bool {
+    // Both rule sets publish `indeterminate`, since their premise is a limit of the instrument,
+    // and the consistency pass refuses either rule beside another verdict.
+    let rule = |shortfall: &report::Shortfall| match shortfall {
+        report::Shortfall::Unsettled {
+            rule: Some(id),
+            verdict: Verdict::Indeterminate,
+            ..
+        } => Some(*id),
+        _ => None,
+    };
+    let machine = |id: &str| MACHINE_LIMITS.iter().any(|(machine, _)| *machine == id);
+    shortfalls.iter().filter_map(rule).any(machine)
+        && shortfalls.iter().all(|shortfall| {
+            rule(shortfall).is_some_and(|id| machine(id) || TARGET_LIMITS.contains(&id))
+        })
+}
+
+/// How `--fail-on-missing` ends and the lines it leaves on stderr, after the report, under the
+/// allowances `record` carries: the shortfalls an allowance excuses are set apart, and the gate
+/// passes exactly when none is left and the report agrees that nothing else is short. The
+/// status the last line names is the ending's own ([`Closed::status`]), so the unit tests hold
+/// the ending and its lines to one value.
+fn gate(
+    coverage: &Coverage,
+    record: &report::Gate,
+    shortfalls: &[report::Shortfall],
+) -> (Closed, Vec<String>) {
+    let (excused, unsettled): (Vec<&report::Shortfall>, Vec<&report::Shortfall>) = shortfalls
+        .iter()
+        .partition(|shortfall| record.excuses(shortfall).is_some());
+    let passed = unsettled.is_empty() && gate_accounts_for(coverage, excused.len());
+    let closed = if passed {
+        Closed::GatePassed {
+            excused: excused.len(),
+        }
+    } else {
+        Closed::GateFailed {
+            unsettled: unsettled.len(),
+            excused: excused.len(),
+            machine_limited: machine_limited(shortfalls),
+        }
+    };
+    let mut lines = if passed {
+        Vec::new()
+    } else {
+        gate_shortfall_lines(coverage, &unsettled)
+    };
+    lines.extend(excused_lines(record, &excused));
+    let status = closed.status();
+    let tail = if passed {
+        match excused.len() {
+            0 => "every check settled".to_owned(),
+            n => format!("every check settled but the {n} excused"),
+        }
+    } else {
+        remedies(&unsettled)
+    };
+    lines.push(format!(
+        "--fail-on-missing: exit {status}, the report written; {tail}"
+    ));
+    (closed, lines)
+}
+
+/// Whether the report's own account of what it lacks is exactly the `excused` checks: the run
+/// complete (`all_verdicts_published`), or every corpus check attempted once, no id missing or
+/// unexpected, and as many checks withheld as the allowances excused. A report incomplete
+/// with no shortfall named disagrees with itself, and is never a pass, whatever was allowed.
+fn gate_accounts_for(coverage: &Coverage, excused: usize) -> bool {
+    coverage.all_verdicts_published
+        || (excused > 0
+            && coverage.all_checks_attempted
+            && coverage.checks_missing.is_empty()
+            && coverage.checks_unexpected.is_empty()
+            && coverage.withholding.instrument_withholdings.count == excused)
 }
 
 /// The count line, the shortfalls, and where none is named the line that says so.
-///
-/// A run narrowed by `--probe` fails the gate for each corpus check it did not select,
-/// because the gate counts the whole corpus (`all_checks_attempted` says why), so the count
-/// line says how many the run selected.
-fn gate_lines(coverage: &Coverage, shortfalls: &[report::Shortfall]) -> Vec<String> {
+fn gate_shortfall_lines(coverage: &Coverage, shortfalls: &[&report::Shortfall]) -> Vec<String> {
     let selected = if coverage.checks_expected == coverage.corpus_checks_total {
         String::new()
     } else {
@@ -2564,20 +2454,47 @@ fn gate_lines(coverage: &Coverage, shortfalls: &[report::Shortfall]) -> Vec<Stri
             coverage.checks_attempted, coverage.corpus_checks_total
         ));
     }
-    lines.push(format!(
-        "--fail-on-missing: exit {}, the report written; {}",
-        error::EXIT_GATE,
-        remedies(shortfalls)
-    ));
+    lines
+}
+
+/// One line per excused check, naming the allowance with the reason the report records, then
+/// one per allowance that excused nothing, which a reader would otherwise take for one that
+/// was not given.
+fn excused_lines(record: &report::Gate, excused: &[&report::Shortfall]) -> Vec<String> {
+    let mut lines: Vec<String> = excused
+        .iter()
+        .filter_map(|shortfall| {
+            record.excuses(shortfall).map(|allowance| {
+                format!(
+                    "--fail-on-missing: excused by --allow {}: {shortfall}",
+                    allowance.as_str()
+                )
+            })
+        })
+        .collect();
+    lines.extend(
+        record
+            .allowed
+            .iter()
+            .filter(|allowance| !excused.iter().any(|s| allowance.excuses(s)))
+            .map(|allowance| {
+                format!(
+                    "--fail-on-missing: --allow {} excused no check",
+                    allowance.as_str()
+                )
+            }),
+    );
     lines
 }
 
 /// What a caller can change to settle the gate, for the shortfalls where chard knows: a
 /// kernel-policy check withheld because nothing established whose kernel the run's is
-/// (`execution-mode-assumed`) or because the run is in a container (`needs-vm`), and a
-/// check `--probe` left out. The other reasons are the toolchain's or the instrument's, and
-/// each line above says which; no option of the run is claimed to settle them.
-fn remedies(shortfalls: &[report::Shortfall]) -> String {
+/// (`execution-mode-assumed`) or because the run is in a container (`needs-vm`), a check
+/// `--probe` left out, and a check the machine the run was handed cannot answer
+/// (`MACHINE_LIMITS`). A check chard does not read on the target (`TARGET_LIMITS`) is named as
+/// one no run on that target settles. No option of the run is claimed to settle the other
+/// reasons, the toolchain's or the instrument's.
+fn remedies(shortfalls: &[&report::Shortfall]) -> String {
     use report::gating_rule::{EXECUTION_MODE_ASSUMED, NEEDS_VM};
     let count = |rule: &str| {
         shortfalls
@@ -2587,6 +2504,21 @@ fn remedies(shortfalls: &[report::Shortfall]) -> String {
             )
             .count()
     };
+    // A machine or target limit counts only beside `indeterminate`, the shape
+    // [`machine_limited`] and `report::Allowance::excuses` read, so the remedy that names
+    // another machine or `--allow` names no check either would leave held.
+    let held = |rule: &str| {
+        shortfalls
+            .iter()
+            .filter(|s| {
+                matches!(s, report::Shortfall::Unsettled {
+                    rule: Some(id),
+                    verdict: Verdict::Indeterminate,
+                    ..
+                } if *id == rule)
+            })
+            .count()
+    };
     let not_attempted = shortfalls
         .iter()
         .filter(|s| matches!(s, report::Shortfall::NotAttempted { .. }))
@@ -2594,13 +2526,13 @@ fn remedies(shortfalls: &[report::Shortfall]) -> String {
     let mut remedies = Vec::new();
     let covered = count(EXECUTION_MODE_ASSUMED.id)
         .saturating_add(count(NEEDS_VM.id))
-        .saturating_add(not_attempted);
+        .saturating_add(not_attempted)
+        .saturating_add(MACHINE_LIMITS.iter().map(|(rule, _)| held(rule)).sum())
+        .saturating_add(TARGET_LIMITS.iter().map(|rule| held(rule)).sum());
     match count(EXECUTION_MODE_ASSUMED.id) {
         0 => {}
         n => remedies.push(format!(
-            "--execution host or --execution vm, where this run owns the kernel it runs on, \
-             lifts gating.rule {} from the {n} {} it holds, which the run then attempts \
-             instead of withholding",
+            "--execution host or --execution vm, where this run owns the kernel it runs on, lifts gating.rule {} from the {n} {} it holds",
             EXECUTION_MODE_ASSUMED.id,
             plural(n, "check", "checks")
         )),
@@ -2608,8 +2540,7 @@ fn remedies(shortfalls: &[report::Shortfall]) -> String {
     match count(NEEDS_VM.id) {
         0 => {}
         n => remedies.push(format!(
-            "the {n} {} under gating.rule {} {} measured only outside a container, on the \
-             host or in a vm, with --execution saying which",
+            "the {n} {} under gating.rule {} {} measured only outside a container, with --execution saying which",
             plural(n, "check", "checks"),
             NEEDS_VM.id,
             plural(n, "is", "are")
@@ -2620,16 +2551,161 @@ fn remedies(shortfalls: &[report::Shortfall]) -> String {
             "a run without --probe attempts the {not_attempted} not attempted"
         ));
     }
+    let machine: Vec<(&str, usize)> = MACHINE_LIMITS
+        .iter()
+        .map(|(rule, _)| (*rule, held(rule)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    if !machine.is_empty() {
+        let n: usize = machine.iter().map(|(_, n)| n).sum();
+        let needs: Vec<&str> = MACHINE_LIMITS
+            .iter()
+            .filter(|(rule, _)| machine.iter().any(|(m, _)| m == rule))
+            .map(|(_, needs)| *needs)
+            .collect();
+        let rules: Vec<&str> = machine.iter().map(|(rule, _)| *rule).collect();
+        remedies.push(format!(
+            "the {n} {} under gating.rule {} {} settled only by a run where the kernel and CPU give the feature (another machine, kernel configuration or VM CPU model): {}",
+            plural(n, "check", "checks"),
+            rules.join(", "),
+            plural(n, "is", "are"),
+            needs.join("; ")
+        ));
+    }
+    let target: Vec<(&str, usize)> = TARGET_LIMITS
+        .iter()
+        .map(|rule| (*rule, held(rule)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    if !target.is_empty() {
+        remedies.push(target_limit_remedy(&target, !machine.is_empty()));
+    }
     match shortfalls.len().saturating_sub(covered) {
-        _ if remedies.is_empty() => {
-            "no option of this run is known to settle these; each line gives the report's reason"
-                .to_owned()
-        }
+        _ if remedies.is_empty() => "no option of this run is known to settle these".to_owned(),
         0 => remedies.join("; "),
         others => format!(
             "{}; no option of this run is known to settle the other {others}",
             remedies.join("; ")
         ),
+    }
+}
+
+/// The gating rules that withhold a check because the machine the run was handed cannot answer
+/// it, each with the machine that can: every `MachineWitness` rule of the instrument class,
+/// held by `the_machine_limits_are_the_machine_rules_of_the_instrument_class`. No option of a
+/// run moves one; a run where the kernel and CPU give the feature does.
+const MACHINE_LIMITS: &[(&str, &str)] = &[
+    (
+        report::gating_rule::CPU_LACKS_SHADOW_STACK.id,
+        "a CPU that enumerates CET shadow stack in CPUID leaf 7",
+    ),
+    (
+        report::gating_rule::MACHINE_LACKS_BTI.id,
+        "a machine whose /proc/cpuinfo lists `bti`",
+    ),
+    (
+        report::gating_rule::MACHINE_LACKS_PAC.id,
+        "a machine whose /proc/cpuinfo lists `paca`",
+    ),
+    (
+        report::gating_rule::CPU_SHOWS_NO_FPAC.id,
+        "a CPU with FEAT_FPAC",
+    ),
+];
+
+/// The remedy clauses for the shortfalls under [`TARGET_LIMITS`] rules, one per rule with its
+/// count: no run on the target settles them. Where a machine limit stands beside them
+/// (`beside_machine`), the rerun the machine remedy names leaves these, so its gate still
+/// fails with exit 1.
+fn target_limit_remedy(target: &[(&str, usize)], beside_machine: bool) -> String {
+    let allowance = |rule: &str| {
+        report::Allowance::ALL
+            .into_iter()
+            .find(|allowance| allowance.as_str() == rule)
+    };
+    target
+        .iter()
+        .map(|&(rule, n)| {
+            let (them, stand) = (
+                plural(n, "it", "them"),
+                plural(n, "it stands", "they stand"),
+            );
+            let rerun = if beside_machine {
+                format!(
+                    ", and the run where the kernel and CPU give every feature named still exits \
+                     1 while {stand}"
+                )
+            } else {
+                String::new()
+            };
+            let excuse = match allowance(rule) {
+                Some(allowance) => format!(
+                    "; --allow {} excuses {them}, and the report then lists {them} in \
+                     coverage.gate.excused",
+                    allowance.as_str()
+                ),
+                None => format!("; no --allow excuses {them}"),
+            };
+            format!(
+                "the {n} {} under gating.rule {rule} {} not read on this target architecture, so \
+                 no run on it settles {them}{rerun}{excuse}",
+                plural(n, "check", "checks"),
+                plural(n, "is", "are"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The gating rules that withhold a check because chard reads nothing of it on the target:
+/// every applicability rule of the instrument class with target-architecture evidence, held
+/// by `the_target_limits_are_the_target_rules_of_the_instrument_class`. No machine of the
+/// target is their remedy, so they stand beside a machine limit in [`machine_limited`]
+/// without making exit 4 alone.
+const TARGET_LIMITS: &[&str] = &[
+    report::gating_rule::NO_CHECK_ON_TARGET.id,
+    report::gating_rule::ARCH_OUTSIDE_TABLE.id,
+];
+
+/// What the closing line says of a gate that passed under `--allow` or failed, after the exit
+/// status; nothing for any other ending.
+fn gate_how(closed: &Closed) -> String {
+    match closed {
+        Closed::GatePassed { excused: 0 } => {
+            " (--fail-on-missing: passed, --allow excused no check)".to_owned()
+        }
+        Closed::GatePassed { excused } => format!(
+            " (--fail-on-missing: passed, {excused} {} excused by --allow and still withheld, \
+             named above)",
+            plural(*excused, "check", "checks"),
+        ),
+        Closed::GateFailed {
+            unsettled,
+            excused,
+            machine_limited: true,
+        } => format!(
+            " (--fail-on-missing: {unsettled} {} not settled, each a machine limit or a check \
+             unread on this target{}, named above)",
+            plural(*unsettled, "check", "checks"),
+            excused_clause(*excused),
+        ),
+        Closed::GateFailed {
+            unsettled, excused, ..
+        } => format!(
+            " (--fail-on-missing: {unsettled} {} not attempted or not settled{}, named above)",
+            plural(*unsettled, "check", "checks"),
+            excused_clause(*excused),
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The closing line's count of the checks `--allow` excused beside a failed gate, where there
+/// are any.
+fn excused_clause(excused: usize) -> String {
+    match excused {
+        0 => String::new(),
+        n => format!(", and {n} excused by --allow"),
     }
 }
 
@@ -2643,8 +2719,16 @@ fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
 enum Closed {
     /// The report was published.
     Published,
-    /// The report was published and `--fail-on-missing` named `unsettled` checks: exit 1.
-    GateFailed { unsettled: usize },
+    /// The report was published and `--fail-on-missing` passed, `excused` checks excused by
+    /// `--allow`: exit 0. A gate that passed with no allowance is [`Closed::Published`].
+    GatePassed { excused: usize },
+    /// The report was published and `--fail-on-missing` named `unsettled` checks beside
+    /// `excused` ones: exit 1, or exit 4 where `machine_limited` ([`machine_limited`] holds).
+    GateFailed {
+        unsettled: usize,
+        excused: usize,
+        machine_limited: bool,
+    },
     /// The report contradicts itself in `contradictions` places, a defect in chard: exit 3,
     /// kept at `quarantine` where the report went to a file.
     Contradicted {
@@ -2661,11 +2745,29 @@ enum Closed {
     Failed(anyhow::Error),
 }
 
+impl Closed {
+    /// The exit status this ending makes, which [`measure_command`] exits with and the
+    /// closing line and [`gate`]'s last line name. `tests/exit_statuses.rs` holds the
+    /// emitters of the three endings with an envelope to these constants.
+    const fn status(&self) -> u8 {
+        match self {
+            Self::Published | Self::GatePassed { .. } => error::EXIT_OK,
+            Self::GateFailed {
+                machine_limited: true,
+                ..
+            } => error::EXIT_MACHINE_LIMIT,
+            Self::GateFailed { .. } => error::EXIT_GATE,
+            Self::Contradicted { .. } => error::EXIT_CONTRADICTION,
+            Self::DeclarationContradicted { .. } | Self::Failed(_) => error::EXIT_FAILURE,
+        }
+    }
+}
+
 /// Where a run's report goes, once the set-aside has decided it.
 #[derive(Default)]
 enum Target {
-    /// Not yet decided: the run was refused before the set-aside, which nothing before it
-    /// can have moved an earlier report or built anything.
+    /// Not yet decided: the run was refused before the set-aside, so it moved no earlier
+    /// report and built nothing.
     #[default]
     Undecided,
     /// `-o -`.
@@ -2739,36 +2841,31 @@ impl std::fmt::Display for Counts {
 
 /// `measure`, its envelope where it has one, and its closing line on stderr, last: the exit
 /// status, the file written or kept, the counts and what to run next. Every exit `measure`
-/// takes passes through here, the refusals and the contradictions with the rest, so a caller
-/// reading only the tail of stderr learns how the run ended, rather than the last probe's name.
-/// A panic on the main thread, which
-/// nothing in chard catches, closes with a line of its own ([`close_a_panic`]); a run that
-/// is killed closes with none.
+/// takes passes through here, so a caller reading only the tail of stderr learns how the run
+/// ended. A panic on the main thread closes with a line of its own ([`close_a_panic`]); a run
+/// that is killed closes with none.
 fn measure_command(args: &MeasureArgs) -> ExitCode {
     close_a_panic();
     let mut ending = Ending::default();
     let closed = measure(args, &mut ending).unwrap_or_else(Closed::Failed);
-    // The status each arm returns, and the number its line names, side by side.
-    let (code, status) = match &closed {
-        Closed::Published => (ExitCode::from(error::EXIT_OK), error::EXIT_OK),
-        Closed::GateFailed { .. } => (ExitCode::from(error::EXIT_GATE), error::EXIT_GATE),
+    // The status is the ending's own, `Closed::status`; an ending with an envelope makes its
+    // code from the emitter that writes it, which returns that same status
+    // (`tests/exit_statuses.rs` holds both).
+    let code = match &closed {
+        Closed::Published | Closed::GatePassed { .. } | Closed::GateFailed { .. } => {
+            ExitCode::from(closed.status())
+        }
         Closed::Contradicted {
             contradictions,
             quarantine,
-        } => (
-            error::emit_contradiction(*contradictions, quarantine.as_deref()),
-            error::EXIT_CONTRADICTION,
-        ),
+        } => error::emit_contradiction(*contradictions, quarantine.as_deref()),
         Closed::DeclarationContradicted {
             execution,
             quarantine,
-        } => (
-            error::emit_declaration_contradicted(execution, quarantine.as_deref()),
-            error::EXIT_FAILURE,
-        ),
-        Closed::Failed(err) => (error::emit("measure", err), error::EXIT_FAILURE),
+        } => error::emit_declaration_contradicted(execution, quarantine.as_deref()),
+        Closed::Failed(err) => error::emit("measure", err),
     };
-    error::note(&closing_line(&closed, status, &ending));
+    error::note(&closing_line(&closed, closed.status(), &ending));
     code
 }
 
@@ -2776,18 +2873,15 @@ fn measure_command(args: &MeasureArgs) -> ExitCode {
 const PANIC_STATUS: u8 = 101;
 
 /// Install a panic hook that writes `measure`'s closing line after the panic's own message,
-/// for a panic on the main thread. chard catches no panic, so one there ends the process
-/// with exit 101; a panic on another thread (the pipe readers of `compile::run`) is joined
-/// and reported as that run's failure, and closes no run.
+/// for a panic on the main thread, which ends the process with exit 101; a panic on another
+/// thread (the pipe readers of `compile::run`) is joined and reported as that run's failure.
 fn close_a_panic() {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         report(info);
         if std::thread::current().name() == Some("main") {
             error::note(&format!(
-                "measure exits {PANIC_STATUS}: chard panicked, a defect in chard, and the run \
-                 stopped where the message above says; what it left on disk is unchecked; \
-                 next: report this with that message"
+                "measure exits {PANIC_STATUS}: chard panicked, a defect in chard"
             ));
         }
     }));
@@ -2816,13 +2910,11 @@ fn closing_line(closed: &Closed, status: u8, ending: &Ending) -> String {
                 )
             }
             Target::File(destination) => format!(
-                "measure exits {status}{how}: sent the report to {destination}{counts}\
-                 {workdir}; next: chard table on a file holding what it received"
+                "measure exits {status}{how}: sent the report to {destination}{counts}{workdir}"
             ),
-            Target::Stdout => format!(
-                "measure exits {status}{how}: sent the report to stdout{counts}{workdir}; \
-                 next: chard table on a file holding what stdout received"
-            ),
+            Target::Stdout => {
+                format!("measure exits {status}{how}: sent the report to stdout{counts}{workdir}")
+            }
             // `measure` sets the target before it can publish; were it not set, the line
             // still says only what is known.
             Target::Undecided => {
@@ -2837,10 +2929,7 @@ fn closing_line(closed: &Closed, status: u8, ending: &Ending) -> String {
         .unwrap_or_default();
     match closed {
         Closed::Published => published(""),
-        Closed::GateFailed { unsettled } => published(&format!(
-            " (--fail-on-missing: {unsettled} {} not attempted or not settled, named above)",
-            plural(*unsettled, "check", "checks")
-        )),
+        Closed::GatePassed { .. } | Closed::GateFailed { .. } => published(&gate_how(closed)),
         Closed::Contradicted {
             contradictions,
             quarantine,
@@ -2848,8 +2937,7 @@ fn closing_line(closed: &Closed, status: u8, ending: &Ending) -> String {
             let kept = quarantine.as_ref().map_or_else(
                 || {
                     format!(
-                        "kept it nowhere{workdir}; next: re-run with -o FILE to keep it as \
-                         FILE{}, and attach that to a bug report",
+                        "kept it nowhere{workdir}; next: re-run with -o FILE to keep it as FILE{}",
                         report::QUARANTINE_SUFFIX
                     )
                 },
@@ -2881,9 +2969,7 @@ fn closing_line(closed: &Closed, status: u8, ending: &Ending) -> String {
                 },
             );
             format!(
-                "measure exits {status}: the declared --execution is contradicted by what chard \
-                 observed, so the report was not published; {kept}{workdir}; next: declare the \
-                 mode the run is in, or omit --execution"
+                "measure exits {status}: the declared --execution is contradicted by what chard observed, so the report was not published; {kept}{workdir}"
             )
         }
         Closed::Failed(_) => failed_line(status, ending),
@@ -2916,19 +3002,13 @@ fn earlier_kept(ending: &Ending) -> String {
 fn failed_line(status: u8, ending: &Ending) -> String {
     let workdir = workdir_kept(ending);
     let left = match &ending.target {
-        Target::Undecided => {
-            "refused before the run started, so an earlier report is where it was and nothing \
-             was built"
-                .to_owned()
-        }
+        Target::Undecided => "refused before the run started".to_owned(),
         Target::Stdout => format!("no whole report is known to have reached stdout{workdir}"),
         Target::File(destination @ report::Destination::Stream(_)) => {
             format!("no whole report is known to have reached {destination}{workdir}")
         }
         // A file there now, not empty, is what this run wrote before it failed: the set-aside
-        // moved or emptied an earlier one. Whether it is the whole report (the failure in the
-        // cleanup after it) or part of one (a write in place that stopped) is the envelope's
-        // to say; the line claims neither.
+        // moved or emptied an earlier one.
         Target::File(destination)
             if std::fs::metadata(destination.path()).is_ok_and(|m| m.is_file() && m.len() > 0) =>
         {
@@ -2943,15 +3023,11 @@ fn failed_line(status: u8, ending: &Ending) -> String {
             earlier_kept(ending)
         ),
     };
-    format!(
-        "measure exits {status}: refused or failed, the envelope on stdout says why; {left}; \
-         next: the envelope's hint"
-    )
+    format!("measure exits {status}: refused or failed, the envelope on stdout says why; {left}")
 }
 
 /// `path` as one word of a command the closing line suggests: a relative path that starts
-/// with `-` gets `./`, so the command does not read it as an option, and the rest is
-/// [`toolchain::shell_word`]'s.
+/// with `-` gets `./`, so the command does not read it as an option.
 fn command_word(path: &Path) -> String {
     let text = path.to_string_lossy();
     if text.starts_with('-') {
@@ -2961,13 +3037,39 @@ fn command_word(path: &Path) -> String {
     }
 }
 
+/// The ids the coverage warning names beside its counts: the selection's ids no observation
+/// carries and the observations' ids the selection never named, which keep
+/// `all_checks_attempted` false where the counts alone would agree.
+fn id_shortfall(missing: &[String], unexpected: &[String]) -> String {
+    let mut out = String::new();
+    if !missing.is_empty() {
+        out.push_str("; missing: ");
+        out.push_str(&missing.join(", "));
+    }
+    if !unexpected.is_empty() {
+        out.push_str("; never asked for: ");
+        out.push_str(&unexpected.join(", "));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
 
-    /// The probe listing names a graded check's ungraded words where it has any, and no
-    /// ungraded key where it has none.
+    #[test]
+    fn the_coverage_warning_names_the_ids_the_counts_hide() {
+        assert_eq!(id_shortfall(&[], &[]), "");
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+        assert_eq!(
+            id_shortfall(&ids(&["b"]), &ids(&["c", "d"])),
+            "; missing: b; never asked for: c, d"
+        );
+        assert_eq!(id_shortfall(&ids(&["b"]), &[]), "; missing: b");
+        assert_eq!(id_shortfall(&[], &ids(&["c"])), "; never asked for: c");
+    }
+
     #[test]
     fn the_levels_listing_names_ungraded_words_only_where_there_are_some() {
         let listed = levels_listing(probe::SSP_LEVELS);
@@ -2982,12 +3084,6 @@ mod tests {
         );
     }
 
-    /// Every subcommand's help is written for a user: `-h` fits one screen (24 lines of 80
-    /// columns), `--help` carries an example that clap parses, and no help names a Rust path,
-    /// a clap setting or a distribution package query, which chard does not make. The
-    /// lists the help writes out in words are held to the code: every verdict word, and
-    /// every value the list options accept. Read from clap's rendering of each command, so
-    /// a new subcommand or option is held too.
     #[test]
     fn the_help_is_written_for_users() {
         let rendered = rendered_help();
@@ -3077,122 +3173,6 @@ mod tests {
         rendered
     }
 
-    /// The lists the help writes out in words are the code's: every verdict word, the two id
-    /// kinds where they are taken, and every value the list options accept.
-    #[test]
-    fn the_help_names_what_the_code_accepts_and_publishes() {
-        use clap::CommandFactory;
-        let rendered = rendered_help();
-        let long_of = |n: &str| {
-            &rendered
-                .iter()
-                .find(|(name, ..)| name == n)
-                .expect("rendered")
-                .2
-        };
-        let top_long = &rendered[0].2;
-        assert!(
-            !top_long.contains("always JSON"),
-            "chard --help says stdout is always JSON"
-        );
-        let measure = long_of("measure");
-        assert!(
-            measure.contains("probe id") && long_of("detect").contains("check id"),
-            "the two id kinds are named where they are taken"
-        );
-        // The checks `--fail-on-missing`'s paragraph and the README say a run without
-        // `--execution` fails on are the ones that declare `needs_vm`, no fewer and no more.
-        let fail_on_missing = MeasureArgs::command()
-            .get_arguments()
-            .find(|a| a.get_id() == "fail_on_missing")
-            .and_then(|a| a.get_long_help())
-            .expect("--fail-on-missing has a long help")
-            .to_string();
-        let readme = include_str!("../README.md")
-            .split("\n\n")
-            .find(|p| p.contains("Without `--execution`"))
-            .expect("the README's --fail-on-missing paragraph");
-        let mut needs_vm = 0;
-        for check in probe::CORPUS.iter().flat_map(|p| p.checks) {
-            let named = format!("`{}`", check.id);
-            assert_eq!(
-                fail_on_missing.contains(&named),
-                check.gate.needs_vm,
-                "--fail-on-missing's help and {}'s needs_vm disagree",
-                check.id
-            );
-            if check.gate.needs_vm {
-                needs_vm += 1;
-                assert!(
-                    readme.contains(&named),
-                    "README.md's --fail-on-missing paragraph does not name {}",
-                    check.id
-                );
-            }
-        }
-        assert!(
-            needs_vm > 0,
-            "no check declares needs_vm, so the help names nothing real"
-        );
-        // `stack-clash-guard-page`'s notes say why it needs no kernel-ownership gate.
-        let stack_clash = probe::CORPUS
-            .iter()
-            .flat_map(|p| p.checks)
-            .find(|c| c.id == "stack-clash-guard-page")
-            .expect("stack-clash-guard-page");
-        assert!(
-            !stack_clash.gate.needs_vm && stack_clash.notes.contains("kernel-ownership gate"),
-            "stack-clash-guard-page's notes and its needs_vm disagree"
-        );
-        for verdict in report::Verdict::ALL {
-            assert!(
-                measure.contains(&format!("`{}`", verdict.as_str())),
-                "measure --help does not name the verdict {}",
-                verdict.as_str()
-            );
-        }
-        for (command, option) in [
-            ("measure", "profile"),
-            ("measure", "execution"),
-            ("table", "format"),
-            ("probes", "format"),
-        ] {
-            let cmd = if command == "measure" {
-                MeasureArgs::command()
-            } else {
-                Cli::command()
-                    .find_subcommand(command)
-                    .expect("subcommand")
-                    .clone()
-            };
-            let arg = cmd
-                .get_arguments()
-                .find(|a| a.get_id() == option)
-                .expect("the option");
-            // An option whose forms clap lists itself (`--format`) is held to clap's own
-            // listing, one `- name:` line per form; one that hides them, to the prose.
-            for value in arg.get_possible_values() {
-                let named = if arg.is_hide_possible_values_set() {
-                    format!("`{}`", value.get_name())
-                } else {
-                    format!("- {}:", value.get_name())
-                };
-                assert!(
-                    long_of(command).contains(&named),
-                    "{command} --help does not name `{}` for --{option}",
-                    value.get_name()
-                );
-            }
-        }
-    }
-
-    /// A pair the two drivers read differently, clang's `-isystem-after` or `-include-pch`
-    /// alone, gcc's `-Tbss` or clang's `-dependency-file`, before a word a selection reader
-    /// takes, is refused by name and list, from any of the three lists; the joined spelling,
-    /// the pair before a word no reader takes and the dangling option of clang's two are
-    /// refused for gcc's reading instead, and the pair handed to another tool and a selection
-    /// taken as the value of an option that selects nothing (`-u -B<dir>/`) pass
-    /// (`toolchain::driver_divided_pairs` says why).
     #[test]
     fn a_pair_the_drivers_read_differently_is_refused_and_named() {
         let line = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
@@ -3234,11 +3214,8 @@ mod tests {
             fed = fed.saturating_add(1);
         }
         assert_eq!(fed, refused.len(), "every list was fed a pair");
-        // The rest is no divided pair: the joined spelling, a value no reader takes, a
-        // dangling option. Each is refused all the same, as a relative path, since gcc reads
-        // the word as `-isystem` or `-include` joined to a relative path
-        // (`compile::relative_path_readings`), and that refusal names gcc's reading, not this
-        // cause.
+        // The rest is no divided pair, and each is refused as a relative path instead: gcc
+        // reads the word as `-isystem` or `-include` joined to a relative path.
         for (other, gcc) in [
             (
                 "-O2 -isystem-after/srv/i -m32",
@@ -3299,11 +3276,6 @@ mod tests {
         assert_eq!(passed, 9, "every value shape was fed");
     }
 
-    /// gcc's long spelling of a path option is that option to every reader: the directory
-    /// named `-B/srv/px/` after `--include-directory-after` is `-idirafter`'s relative path,
-    /// refused as `-idirafter -B/srv/px/` is, and `--li` and `--pref` are `-L` and `-B`
-    /// (`toolchain::LONG_ALIASES`); a value-taking option's long spelling takes its value
-    /// unread, as the test above holds. Counted against the shapes fed.
     #[test]
     fn a_long_spelling_of_a_path_option_refuses_its_relative_value_as_the_short_one() {
         let line = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
@@ -3327,11 +3299,6 @@ mod tests {
         assert_eq!(fed, relatives.len(), "every shape was fed");
     }
 
-    /// A relative path refusal names how it read each argument: as written, as gcc reads
-    /// clang's own `-isystem-after`, and as a path option handed to a tool with no path in the
-    /// pair after it (`compile::relative_path_readings`); and three more lines, a path
-    /// handed to the preprocessor by the pair after its option, gcc's `-I-` and a linker word
-    /// that begins like a driver option, pass.
     #[test]
     fn a_relative_path_refusal_names_how_it_read_each_argument() {
         let line = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
@@ -3340,14 +3307,9 @@ mod tests {
         let err = refuse_unreadable_flags(&[("--ldflags", &words)]).expect_err("refused");
         let text = format!("{err:#}");
         for named in [
-            "\"-Xpreprocessor -I -Xpreprocessor rel\" in --ldflags, ",
-            "\"-isystem-after/srv/i\" in --ldflags, which gcc reads as -isystem with the relative \
-             path \"-after/srv/i\"; name a directory with -idirafter, which both drivers read, or \
-             leave the option out, ",
-            "\"-Xlinker -L\" in --ldflags, whose path is not handed in the same word or the pair \
-             after it, so the tool reads it from a later word or from none; hand the option and \
-             its path together",
-            "give each path as an absolute path, or do as its note says: ",
+            "\"-Xpreprocessor -I -Xpreprocessor rel\" in --ldflags",
+            "\"-isystem-after/srv/i\" in --ldflags",
+            "\"-Xlinker -L\" in --ldflags",
         ] {
             assert!(text.contains(named), "{named} is not in: {text}");
         }
@@ -3356,9 +3318,174 @@ mod tests {
         assert!(refuse_unreadable_flags(&[("--flags", &passed)]).is_ok());
     }
 
-    /// A flag holding U+001F is refused, since `report::flags_sha256` joins a list's flags with it
-    /// and the two lists `-O2<U+001F>-fPIE` and `-O2 -fPIE` would hash alike; the second list
-    /// itself passes.
+    #[test]
+    fn an_input_file_named_by_a_relative_path_is_refused() {
+        let line = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let cases = [
+            ("--flags", "foo.c"),
+            ("--cxxflags", "./foo.o"),
+            ("--ldflags", "libfoo.a"),
+        ];
+        let mut fed = 0_usize;
+        for (list, word) in cases {
+            let words = line(&format!("-O2 {word}"));
+            let err = refuse_unreadable_flags(&[(list, &words)]).expect_err("refused");
+            let text = format!("{err:#}");
+            assert!(
+                err.downcast_ref::<ConfigError>().is_some()
+                    && text.contains(&format!("{word:?} in {list}")),
+                "{list} {word}: {text}"
+            );
+            fed = fed.saturating_add(1);
+        }
+        assert_eq!(fed, cases.len(), "every list was fed an input");
+        for pair in [
+            "-Ttext 0x8000",
+            "-dumpbase foo.c",
+            "-undefined dynamic_lookup",
+        ] {
+            let err = refuse_unreadable_flags(&[("--ldflags", &line(&format!("-O2 {pair}")))])
+                .expect_err("refused");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!("{pair:?} in --ldflags")),
+                "{pair}: {text}"
+            );
+        }
+        let absolute = line("-O2 /srv/src/foo.c /srv/obj/foo.o /srv/lib/libfoo.a");
+        for list in ["--flags", "--cxxflags", "--ldflags"] {
+            assert!(
+                refuse_unreadable_flags(&[(list, &absolute)]).is_ok(),
+                "{list}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_builtin_profiles_lists_are_refused_as_an_explicit_profiles() {
+        use clap::CommandFactory as _;
+        let command = MeasureArgs::command();
+        let profiles: Vec<String> = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "profile")
+            .expect("measure takes --profile")
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_owned())
+            .filter(|name| name != "explicit")
+            .collect();
+        assert!(profiles.len() >= 3, "{profiles:?}");
+        let arches: BTreeSet<&str> = chard::guide::INVENTORY
+            .iter()
+            .filter_map(|row| match row.carried {
+                chard::guide::Carried::Arch(arches) => Some(arches),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .chain(["x86"])
+            .collect();
+        let mut fed = 0_usize;
+        for arch in &arches {
+            for name in &profiles {
+                let args = MeasureArgs::try_parse_from(["chard", "--profile", name.as_str()])
+                    .expect("the CLI parses the profile");
+                let profile = resolve_profile(&args, arch, &[]).expect("a built-in profile");
+                assert!(
+                    refuse_unreadable_flags(&[
+                        ("--flags", &profile.cflags),
+                        ("--cxxflags", &profile.cxxflags),
+                        ("--ldflags", &profile.ldflags),
+                    ])
+                    .is_ok(),
+                    "{name} on {arch}: {:?}",
+                    profile.cflags
+                );
+                fed = fed.saturating_add(1);
+            }
+        }
+        assert!(
+            arches.contains("x86_64") && arches.contains("aarch64"),
+            "{arches:?}"
+        );
+        assert_eq!(fed, arches.len() * profiles.len(), "every profile was fed");
+    }
+
+    #[test]
+    fn a_refusal_reads_the_line_the_driver_is_handed() {
+        let line = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let x32 = "chard does not measure x32";
+        let refused = [
+            ("--flags", "-O2 -Xassembler", "--x32", x32),
+            ("--cxxflags", "-O2 -Xassembler", "-x32", x32),
+            ("--flags", "-O2 -target", "x86_64-pc-linux-gnux32", x32),
+            ("--cxxflags", "-O2 --machine", "x32", x32),
+        ];
+        let mut fed = 0_usize;
+        for (list, head, tail, why) in refused {
+            let (head_words, tail_words) = (line(head), line(tail));
+            let other = line("-O2");
+            let lists: Vec<(&str, &Vec<String>)> = if list == "--flags" {
+                vec![("--flags", &head_words), ("--ldflags", &tail_words)]
+            } else {
+                vec![
+                    ("--flags", &other),
+                    ("--cxxflags", &head_words),
+                    ("--ldflags", &tail_words),
+                ]
+            };
+            let err = refuse_unreadable_flags(&lists).expect_err("refused");
+            let text = format!("{err:#}");
+            assert!(
+                err.downcast_ref::<ConfigError>().is_some()
+                    && text.contains(why)
+                    && text.contains(&format!(
+                        "{tail:?} in {list} followed by --ldflags, the one line the driver is \
+                         handed"
+                    )),
+                "{list} {head:?} --ldflags {tail:?}: {text}"
+            );
+            fed = fed.saturating_add(1);
+        }
+        assert_eq!(fed, refused.len(), "every split was fed");
+        let (head_words, tail_words) = (line("-O2 -Xassembler"), line("--x32"));
+        assert!(
+            refuse_unreadable_flags(&[("--flags", &head_words), ("--cxxflags", &tail_words)])
+                .is_ok(),
+            "--flags and --cxxflags are never handed to one driver as one line"
+        );
+        let (cflags, ldflags) = (line("-O2 -fPIE"), line("-pie -Wl,-z,now"));
+        assert!(refuse_unreadable_flags(&[("--flags", &cflags), ("--ldflags", &ldflags)]).is_ok());
+        // A reading one list gives is named in that list and not again in the joined line,
+        // which repeats it; a reading only the joined line gives is named there.
+        for (cflags, ldflags, named, joined) in [
+            ("-O2 -I inc", "-pie", "\"-I inc\" in --flags", false),
+            (
+                "-O2 -I",
+                "inc",
+                "\"-I inc\" in --flags followed by --ldflags",
+                true,
+            ),
+            (
+                "-O2 -I inc -I",
+                "inc",
+                "\"-I inc\" in --flags followed by --ldflags",
+                true,
+            ),
+        ] {
+            let (cflags, ldflags) = (line(cflags), line(ldflags));
+            let text = format!(
+                "{:#}",
+                refuse_unreadable_flags(&[("--flags", &cflags), ("--ldflags", &ldflags)])
+                    .expect_err("a relative -I is refused")
+            );
+            assert!(
+                text.contains(named) && text.contains("followed by") == joined,
+                "{cflags:?} {ldflags:?}: {text}"
+            );
+        }
+    }
+
     #[test]
     fn a_flag_holding_the_hash_separator_is_refused() {
         let joined = vec!["-O2\u{1f}-fPIE".to_owned()];
@@ -3373,136 +3500,6 @@ mod tests {
         );
     }
 
-    /// The CLI's contract is stated once: `chard --help` prints [`CONTRACT`], `DESIGN.md`
-    /// carries the same words in its own section, and the README and the module docs point
-    /// there rather than restate the exit statuses. Compared word by word, so the copy's line
-    /// breaks are its own.
-    #[test]
-    fn the_contract_is_stated_once() {
-        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let contract = words(CONTRACT);
-        let top_long = &rendered_help()[0].2;
-        assert!(
-            words(top_long).contains(&contract),
-            "chard --help does not print the contract"
-        );
-        let design = include_str!("../DESIGN.md");
-        let section = design
-            .split("\n## ")
-            .find(|s| s.starts_with("The command-line contract\n"))
-            .expect("DESIGN.md has a section \"The command-line contract\"");
-        assert!(
-            words(section).contains(&contract),
-            "DESIGN.md's contract is not CONTRACT's words"
-        );
-        for (name, text, pointer) in [
-            (
-                "README.md",
-                include_str!("../README.md"),
-                "DESIGN.md#the-command-line-contract",
-            ),
-            (
-                "src/error.rs",
-                include_str!("error.rs"),
-                "\"The command-line contract\"",
-            ),
-            (
-                "src/detect.rs",
-                include_str!("detect.rs"),
-                "\"The command-line contract\"",
-            ),
-        ] {
-            assert!(
-                text.contains(pointer),
-                "{name} does not point at the contract"
-            );
-            assert!(
-                !text.contains("clap rejects exits 2"),
-                "{name} still says a usage error has no envelope"
-            );
-        }
-    }
-
-    /// The README's quickstart lists the exit statuses in a table, one row each: it names
-    /// exactly the statuses the contract does, each row carries the words the contract gives
-    /// its status and none another status's, and the panic status the contract names beside
-    /// them is the README's too.
-    #[test]
-    fn the_readme_exit_table_is_the_contracts() {
-        let contract_statuses: std::collections::BTreeSet<String> = CONTRACT
-            .match_indices("Exit ")
-            .filter_map(|(at, _)| {
-                let digits: String = CONTRACT
-                    .get(at + "Exit ".len()..)?
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                (!digits.is_empty()).then_some(digits)
-            })
-            .collect();
-        assert!(
-            contract_statuses.len() > 1,
-            "the contract names no exit statuses: {contract_statuses:?}"
-        );
-        let readme = include_str!("../README.md");
-        let rows: BTreeMap<String, String> = readme
-            .lines()
-            .skip_while(|l| *l != "| Status | Meaning |")
-            .skip(2)
-            .take_while(|l| l.starts_with('|'))
-            .map(|line| {
-                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-                assert_eq!(
-                    cells.len(),
-                    4,
-                    "a README exit row with the wrong cells: {line}"
-                );
-                (
-                    cells[1].trim_matches('`').to_owned(),
-                    cells[2].to_lowercase(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            rows.keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
-            contract_statuses,
-            "README.md's exit status table does not name the contract's statuses"
-        );
-        let meanings = [
-            ("0", "every reading it replayed agrees"),
-            ("1", "a gate tripped"),
-            ("2", "refused the invocation or failed"),
-            ("3", ".contradicted"),
-        ];
-        for (status, words) in meanings {
-            assert!(
-                CONTRACT.to_lowercase().contains(words),
-                "CONTRACT no longer says {words:?}; update this table and README.md's"
-            );
-            let row = rows.get(status).map_or("", String::as_str);
-            assert!(
-                row.contains(words),
-                "README.md's exit {status} row does not say {words:?}"
-            );
-            for (other, theirs) in meanings {
-                assert!(
-                    other == status || !row.contains(theirs),
-                    "README.md's exit {status} row says exit {other}'s {theirs:?}"
-                );
-            }
-        }
-        assert!(
-            CONTRACT.contains(&format!("a panic (exit {PANIC_STATUS})"))
-                && readme.contains(&format!("A panic exits {PANIC_STATUS}.")),
-            "the contract and README.md do not both name the panic status {PANIC_STATUS}"
-        );
-    }
-
-    /// `--format` is one declaration over two commands' forms, each with its own default:
-    /// a default rendered through a static the derive shares across the declaration's
-    /// instantiations once gave `table` `probes`'s `json`. And every command takes `-o`.
     #[test]
     fn each_format_has_its_own_default_and_every_command_takes_dash_o() {
         use clap::CommandFactory;
@@ -3545,17 +3542,10 @@ mod tests {
     /// help prints.
     fn split_example(line: &str) -> Vec<String> {
         let mut line = line.to_owned();
-        while let Some(start) = line.find("${") {
-            let end = line[start..]
-                .find('}')
-                .map(|e| start + e)
-                .expect("a closed ${");
-            let inner = &line[start + 2..end];
-            let default = match inner.split_once(":-") {
-                Some((_, d)) => d.to_owned(),
-                None => String::new(),
-            };
-            line.replace_range(start..=end, &default);
+        while let Some((before, rest)) = line.split_once("${") {
+            let (inner, after) = rest.split_once('}').expect("a closed ${");
+            let default = inner.split_once(":-").map_or("", |(_, d)| d);
+            line = format!("{before}{default}{after}");
         }
         let mut words = Vec::new();
         let mut word = String::new();
@@ -3577,8 +3567,6 @@ mod tests {
         words
     }
 
-    /// `probes --format text` names every probe and every check once, each check under its
-    /// own probe, lines the flag column up, and closes with the counts it printed.
     #[test]
     fn the_text_listing_names_every_probe_and_check_once() {
         let text = corpus_text();
@@ -3630,10 +3618,59 @@ mod tests {
         assert_eq!(lines.len(), row + 2, "nothing after the counts");
     }
 
-    /// The option lists `report::normalized_invocation` reads are the value-taking options of
-    /// `measure` as clap defines them, aliases included, both ways. `--cxxflags -openmp` read
-    /// as an attached `-o` was the shape this holds off: an option added to the CLI without a
-    /// place in one list has its value read as an argument.
+    #[test]
+    fn the_readers_selection_is_the_one_measure_resolves() {
+        let corpus_ids = |probes: &[&'static Probe]| -> BTreeSet<&'static str> {
+            probes.iter().flat_map(|p| p.checks).map(|c| c.id).collect()
+        };
+        let many = probe::CORPUS
+            .iter()
+            .find(|p| p.checks.len() > 1)
+            .expect("a probe of several checks")
+            .id;
+        let one = probe::CORPUS
+            .iter()
+            .find(|p| p.checks.len() == 1)
+            .expect("a probe of one check")
+            .id;
+        let joined = format!("--probe={one}");
+        let cases: [&[&str]; 12] = [
+            &["chard", "measure"],
+            &["chard", "measure", "--probe", many],
+            &["chard", "measure", "--probe", many, &joined],
+            &["chard", "measure", "--flags", "--probe", "--probe", one],
+            &["chard", "measure", "--probe", one, "--"],
+            &["chard", "measure", "--probe", one, "--probe", one],
+            &["chard", "measure", "--probe", "no-such-probe"],
+            &["chard", "measure", "--probe"],
+            &["chard", "measure", "--", "--probe", one],
+            &["chard", "measure", "--probe="],
+            &["chard", "measure", "stray"],
+            &["chard", "measure", "--prob", one],
+        ];
+        let mut agreed = 0;
+        for words in cases {
+            let argv: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            let measured = match Cli::try_parse_from(&argv).map(|cli| cli.command) {
+                Ok(Command::Measure(args)) => match select_probes(&args.probes) {
+                    Ok((probes, _)) => Some(corpus_ids(&probes)),
+                    Err(_) => None,
+                },
+                Ok(_) => panic!("{words:?} parsed as another command"),
+                Err(_) => None,
+            };
+            match (report::selected_checks(&argv), measured) {
+                (Ok(read), Some(measured)) => assert_eq!(read, measured, "{words:?}"),
+                (Err(_), None) => {}
+                (read, measured) => {
+                    panic!("{words:?}: the reader read {read:?}, measure {measured:?}")
+                }
+            }
+            agreed += 1;
+        }
+        assert_eq!(agreed, cases.len(), "every argv compared");
+    }
+
     #[test]
     fn the_normalized_invocation_knows_every_option_that_takes_a_value() {
         use clap::CommandFactory;
@@ -3685,9 +3722,6 @@ mod tests {
         );
     }
 
-    /// The report's default name is the compiler's last component and the profile, with
-    /// nothing of the host; `-o -` is stdout; a `--cc` with no last component is refused
-    /// rather than named for something else.
     #[test]
     fn the_report_is_named_from_the_compiler_and_the_profile() {
         let file = |args: &[&str]| {
@@ -3723,9 +3757,6 @@ mod tests {
         assert_eq!(command_word(Path::new("-x.json")), "./-x.json");
     }
 
-    /// The closing lines of the two refusals no run reaches end to end short of a defect in
-    /// chard or a container chard recognises: each names its status, the file the refused
-    /// report is kept in and what to do next, or that it was kept nowhere.
     #[test]
     fn the_closing_line_names_where_a_refused_report_is_kept() {
         let ending = Ending {
@@ -3757,19 +3788,13 @@ mod tests {
                 &ending,
             )
         };
-        assert_eq!(
-            contradicted(Some("r.json.contradicted")),
-            format!(
-                "measure exits 3: the report contradicts itself in 2 places, a defect in \
-                 chard, and was not published; kept it as r.json.contradicted {counts}; work \
-                 directory wd kept; next: attach r.json.contradicted to a bug report"
-            )
-        );
-        assert_eq!(
-            contradicted(None),
-            "measure exits 3: the report contradicts itself in 2 places, a defect in chard, \
-             and was not published; kept it nowhere; work directory wd kept; next: re-run with \
-             -o FILE to keep it as FILE.contradicted, and attach that to a bug report"
+        let line = contradicted(Some("r.json.contradicted"));
+        assert!(
+            line.starts_with("measure exits 3")
+                && line.contains("2 places")
+                && line.contains("kept it as r.json.contradicted")
+                && line.contains(counts),
+            "{line}"
         );
         let execution = environment::Execution {
             mode: environment::ExecutionMode::Host,
@@ -3787,28 +3812,20 @@ mod tests {
                 attestation: None,
             },
         };
-        assert_eq!(
-            closing_line(
-                &Closed::DeclarationContradicted {
-                    execution: Box::new(execution),
-                    quarantine: Some(PathBuf::from("r.json.contradicted")),
-                },
-                error::EXIT_FAILURE,
-                &ending,
-            ),
-            format!(
-                "measure exits 2: the declared --execution is contradicted by what chard \
-                 observed, so the report was not published; kept it as r.json.contradicted \
-                 {counts}; work directory wd kept; next: declare the mode the run is in, or \
-                 omit --execution"
-            )
+        let line = closing_line(
+            &Closed::DeclarationContradicted {
+                execution: Box::new(execution),
+                quarantine: Some(PathBuf::from("r.json.contradicted")),
+            },
+            error::EXIT_FAILURE,
+            &ending,
+        );
+        assert!(
+            line.starts_with("measure exits 2") && line.contains("r.json.contradicted"),
+            "{line}"
         );
     }
 
-    /// The gate's lines over a whole run and over one narrowed by `--probe`: the count line
-    /// names the selection only where there is one, and agrees in number; a line with no
-    /// reason recorded says so; the line that says no check was named is written exactly
-    /// where none was; and the block ends on the exit status and the remedies chard knows.
     #[test]
     fn the_gate_lines_name_the_selection_only_where_the_run_was_narrowed() {
         let total = probe::total_checks();
@@ -3822,21 +3839,7 @@ mod tests {
             reason: None,
         }];
         coverage.checks_expected = total;
-        assert_eq!(
-            gate_lines(&coverage, &one),
-            [
-                format!(
-                    "--fail-on-missing: 1 of the corpus's {total} checks is not attempted or \
-                     not settled"
-                ),
-                "--fail-on-missing: ssp-level: indeterminate; the report records no reason \
-                 beside it"
-                    .to_owned(),
-                "--fail-on-missing: exit 1, the report written; no option of this run is \
-                 known to settle these; each line gives the report's reason"
-                    .to_owned(),
-            ]
-        );
+        assert!(!machine_limited(&one));
         coverage.checks_expected = 3;
         let two = [
             report::Shortfall::NotAttempted {
@@ -3846,7 +3849,7 @@ mod tests {
                 check: "relro".to_owned(),
             },
         ];
-        let lines = gate_lines(&coverage, &two);
+        let lines = gate(&coverage, &strict(), &two).1;
         assert_eq!(
             lines.first().map(String::as_str),
             Some(
@@ -3866,22 +3869,227 @@ mod tests {
                  attempts the 2 not attempted"
             )
         );
-        let none = gate_lines(&coverage, &[]);
+        let none = gate(&coverage, &strict(), &[]).1;
         assert_eq!(none.len(), 3, "{none:?}");
         assert!(
             none.get(1).is_some_and(|l| l.contains("no check is named")),
             "{none:?}"
         );
         assert!(
-            !gate_lines(&coverage, &two)
+            !gate(&coverage, &strict(), &two)
+                .1
                 .iter()
                 .any(|l| l.contains("no check is named")),
             "the fallback is written only where nothing is named"
         );
     }
 
-    /// The remedies for the two kernel-policy rules name the rule they lift and the count
-    /// it holds, by the rules' own ids, beside the one for a narrowed run.
+    #[test]
+    fn the_gate_exits_4_on_machine_limits_beside_target_limits_alone() {
+        use report::gating_rule::{
+            ARCH_OUTSIDE_TABLE, CPU_LACKS_SHADOW_STACK, CPU_SHOWS_NO_FPAC, MACHINE_LACKS_BTI,
+            MACHINE_LACKS_PAC, NO_CHECK_ON_TARGET,
+        };
+        let total = probe::total_checks();
+        let mut coverage =
+            report::coverage(&[], &BTreeSet::new(), total, &profile("bare"), Vec::new());
+        coverage.checks_expected = total;
+        let held = |check: &str, rule: &'static str| report::Shortfall::Unsettled {
+            check: check.to_owned(),
+            verdict: Verdict::Indeterminate,
+            withheld: None,
+            rule: Some(rule),
+            reason: None,
+        };
+        let status =
+            |shortfalls: &[report::Shortfall]| gate(&coverage, &strict(), shortfalls).0.status();
+        // An aarch64 machine whose kernel gives neither BTI nor PAC, where every other check
+        // settles: the two machine limits beside the two checks the mechanism table leaves
+        // unread on aarch64.
+        let a1 = [
+            held("bti-enforced", MACHINE_LACKS_BTI.id),
+            held("linker-default-noexecstack", NO_CHECK_ON_TARGET.id),
+            held("pac-ret-enforced", MACHINE_LACKS_PAC.id),
+            held("shadow-stack-enforced", NO_CHECK_ON_TARGET.id),
+        ];
+        assert_eq!(status(&a1), error::EXIT_MACHINE_LIMIT);
+        assert!(
+            matches!(
+                gate(&coverage, &strict(), &a1).0,
+                Closed::GateFailed {
+                    unsettled: 4,
+                    excused: 0,
+                    machine_limited: true
+                }
+            ),
+            "the ending counts every shortfall it names"
+        );
+        // Every machine rule alone, and each beside a target outside the table.
+        let machine = [
+            held("shadow-stack-enforced", CPU_LACKS_SHADOW_STACK.id),
+            held("bti-enforced", MACHINE_LACKS_BTI.id),
+            held("pac-ret-enforced", MACHINE_LACKS_PAC.id),
+            held("pac-ret-enforced", CPU_SHOWS_NO_FPAC.id),
+        ];
+        assert_eq!(status(&machine), error::EXIT_MACHINE_LIMIT);
+        for (rule, _) in MACHINE_LIMITS {
+            let pair = [held("x", rule), held("y", ARCH_OUTSIDE_TABLE.id)];
+            assert_eq!(status(&pair), error::EXIT_MACHINE_LIMIT, "{rule}");
+        }
+        // Target limits alone keep exit 1: no machine settles them, and the line says so
+        // without a rerun clause.
+        let target = [
+            held("bti-enforced", NO_CHECK_ON_TARGET.id),
+            held("pac-ret-enforced", NO_CHECK_ON_TARGET.id),
+        ];
+        assert_eq!(status(&target), error::EXIT_GATE);
+        assert_eq!(
+            gate(&coverage, &strict(), &target)
+                .1
+                .last()
+                .map(String::as_str),
+            Some(
+                "--fail-on-missing: exit 1, the report written; the 2 checks under gating.rule \
+                 no-check-on-target are not read on this target architecture, so no run on it \
+                 settles them; --allow no-check-on-target excuses them, and the report then \
+                 lists them in coverage.gate.excused"
+            )
+        );
+        assert_eq!(
+            status(&[held("x", ARCH_OUTSIDE_TABLE.id)]),
+            error::EXIT_GATE
+        );
+    }
+
+    #[test]
+    fn the_gate_keeps_1_for_any_other_shortfall() {
+        use report::gating_rule::{MACHINE_LACKS_BTI, MACHINE_LACKS_PAC, NO_CHECK_ON_TARGET};
+        let total = probe::total_checks();
+        let mut coverage =
+            report::coverage(&[], &BTreeSet::new(), total, &profile("bare"), Vec::new());
+        coverage.checks_expected = total;
+        let held = |check: &str, rule: &'static str| report::Shortfall::Unsettled {
+            check: check.to_owned(),
+            verdict: Verdict::Indeterminate,
+            withheld: None,
+            rule: Some(rule),
+            reason: None,
+        };
+        let status =
+            |shortfalls: &[report::Shortfall]| gate(&coverage, &strict(), shortfalls).0.status();
+        let a1 = [
+            held("bti-enforced", MACHINE_LACKS_BTI.id),
+            held("linker-default-noexecstack", NO_CHECK_ON_TARGET.id),
+            held("pac-ret-enforced", MACHINE_LACKS_PAC.id),
+            held("shadow-stack-enforced", NO_CHECK_ON_TARGET.id),
+        ];
+        assert_eq!(status(&a1), error::EXIT_MACHINE_LIMIT);
+        let no_rule = report::Shortfall::Unsettled {
+            check: "ssp-level".to_owned(),
+            verdict: Verdict::Indeterminate,
+            withheld: None,
+            rule: None,
+            reason: None,
+        };
+        let not_attempted = report::Shortfall::NotAttempted {
+            check: "pie".to_owned(),
+        };
+        for other in [
+            held("ssp-level", "flag-unknown-to-driver"),
+            held("ssp-level", "execution-mode-assumed"),
+            no_rule,
+            not_attempted,
+        ] {
+            let mut mixed = a1.to_vec();
+            mixed.push(other.clone());
+            assert_eq!(status(&mixed), error::EXIT_GATE, "{other}");
+            assert_eq!(
+                status(std::slice::from_ref(&other)),
+                error::EXIT_GATE,
+                "{other}"
+            );
+        }
+        // A machine rule beside a verdict other than `indeterminate`, which the consistency
+        // pass refuses, keeps 1 too.
+        let probe_invalid = report::Shortfall::Unsettled {
+            check: "bti-enforced".to_owned(),
+            verdict: Verdict::ProbeInvalid,
+            withheld: None,
+            rule: Some(MACHINE_LACKS_BTI.id),
+            reason: None,
+        };
+        assert_eq!(status(&[probe_invalid]), error::EXIT_GATE);
+        // No shortfall at all (the gate's own inconsistency fallback) is chard's defect, not
+        // a machine limit.
+        assert_eq!(status(&[]), error::EXIT_GATE);
+    }
+
+    #[test]
+    fn each_ending_has_the_status_measure_command_exits_with() {
+        let gate = |machine_limited| Closed::GateFailed {
+            unsettled: 4,
+            excused: 0,
+            machine_limited,
+        };
+        let execution = environment::Execution {
+            mode: environment::ExecutionMode::Host,
+            engine: None,
+            image: None,
+            detection: "fixture".to_owned(),
+            mode_evidence: environment::ModeEvidence {
+                basis: environment::ModeBasis::AssertedAndContradicted,
+                observed: Some(environment::ExecutionMode::Container),
+                observation: "fixture".to_owned(),
+            },
+            image_attestation: environment::ImageAttestation {
+                status: environment::AttestationStatus::NotApplicable,
+                established_by: "fixture",
+                attestation: None,
+            },
+        };
+        let endings = [
+            (Closed::Published, error::EXIT_OK),
+            (gate(false), error::EXIT_GATE),
+            (gate(true), error::EXIT_MACHINE_LIMIT),
+            (
+                Closed::Contradicted {
+                    contradictions: 1,
+                    quarantine: None,
+                },
+                error::EXIT_CONTRADICTION,
+            ),
+            (
+                Closed::DeclarationContradicted {
+                    execution: Box::new(execution),
+                    quarantine: None,
+                },
+                error::EXIT_FAILURE,
+            ),
+            (
+                Closed::Failed(std::io::Error::other("fixture").into()),
+                error::EXIT_FAILURE,
+            ),
+        ];
+        for (closed, want) in &endings {
+            assert_eq!(closed.status(), *want);
+        }
+    }
+
+    #[test]
+    fn the_target_limits_are_the_target_rules_of_the_instrument_class() {
+        use report::gating_rule::{ALL, Evidence, Premise, Stage};
+        let class: Vec<&str> = ALL
+            .iter()
+            .filter(|r| {
+                r.evidence == Evidence::TargetArch
+                    && r.premise == Premise::InstrumentLimitation
+                    && r.stage == Stage::Applicability
+            })
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(TARGET_LIMITS, class);
+    }
+
     #[test]
     fn the_remedies_name_the_rule_they_lift() {
         use report::gating_rule::{EXECUTION_MODE_ASSUMED, NEEDS_VM};
@@ -3892,27 +4100,36 @@ mod tests {
             rule: Some(rule),
             reason: None,
         };
-        let shortfalls = [
-            held("noexecstack-enforced", EXECUTION_MODE_ASSUMED.id),
-            held("shadow-stack-enforced", EXECUTION_MODE_ASSUMED.id),
-            held("a", NEEDS_VM.id),
-            report::Shortfall::NotAttempted {
-                check: "pie".to_owned(),
-            },
-        ];
-        assert_eq!(
-            remedies(&shortfalls),
-            "--execution host or --execution vm, where this run owns the kernel it runs on, \
-             lifts gating.rule execution-mode-assumed from the 2 checks it holds, which the run \
-             then attempts instead of withholding; the 1 check under gating.rule needs-vm \
-             is measured only outside a container, on the host or in a vm, with --execution \
-             saying which; a run without --probe attempts the 1 not attempted"
-        );
+        for rule in [EXECUTION_MODE_ASSUMED.id, NEEDS_VM.id] {
+            let line = remedies(&refs(&[held("x", rule)]));
+            assert!(
+                line.contains(&format!("gating.rule {rule}")),
+                "{rule}: {line}"
+            );
+        }
+        for (rule, _) in MACHINE_LIMITS {
+            let line = remedies(&refs(&[held("x", rule)]));
+            assert!(
+                line.contains(&format!("gating.rule {rule}")),
+                "{rule}: {line}"
+            );
+        }
     }
 
-    /// A run that wrote to its file and then failed says the file holds what it wrote, which
-    /// may not be a whole report, and names a `.previous` it did not set aside as an older
-    /// run's, not as the earlier report this run kept.
+    #[test]
+    fn the_machine_limits_are_the_machine_rules_of_the_instrument_class() {
+        use report::gating_rule::{ALL, Evidence, Premise};
+        let class: Vec<&str> = ALL
+            .iter()
+            .filter(|r| {
+                r.evidence == Evidence::MachineWitness && r.premise == Premise::InstrumentLimitation
+            })
+            .map(|r| r.id)
+            .collect();
+        let listed: Vec<&str> = MACHINE_LIMITS.iter().map(|(rule, _)| *rule).collect();
+        assert_eq!(listed, class);
+    }
+
     #[test]
     fn a_failure_after_the_write_names_the_report_it_wrote() {
         let dir = std::env::temp_dir().join(format!("chard-closing-{}", std::process::id()));
@@ -3929,17 +4146,6 @@ mod tests {
             workdir: None,
             counts: None,
         };
-        let line = failed_line(error::EXIT_FAILURE, &ending);
-        assert_eq!(
-            line,
-            format!(
-                "measure exits 2: refused or failed, the envelope on stdout says why; {} holds \
-                 what this run wrote before the failure, which may not be a whole report, and \
-                 an older run's {}.previous is beside it; next: the envelope's hint",
-                path.display(),
-                path.display()
-            )
-        );
         ending.earlier = true;
         assert!(
             failed_line(error::EXIT_FAILURE, &ending).contains(&format!(
@@ -3950,14 +4156,300 @@ mod tests {
         );
         std::fs::write(&path, "").expect("an emptied report");
         ending.earlier = false;
-        assert!(
-            failed_line(error::EXIT_FAILURE, &ending).contains(&format!(
-                "holds no report from this run, and an older run's {}.previous is beside it;",
-                path.display()
-            )),
-            "an empty file is no report, and an older run's .previous is named as an older run's"
-        );
         std::fs::remove_dir_all(&dir).expect("removing the scratch directory");
+    }
+
+    /// A coverage block of a whole run whose completeness field is false, as the gate's unit
+    /// tests hand it the shortfalls.
+    fn gate_coverage() -> Coverage {
+        let total = probe::total_checks();
+        let mut coverage =
+            report::coverage(&[], &BTreeSet::new(), total, &profile("bare"), Vec::new());
+        coverage.checks_expected = total;
+        coverage
+    }
+
+    /// The coverage block a report whose only shortfalls are `shortfalls` carries, as the gate
+    /// reads it: every check attempted unless one is not, one withheld per unsettled shortfall,
+    /// and complete where there are none.
+    fn over(shortfalls: &[report::Shortfall]) -> Coverage {
+        let mut coverage = gate_coverage();
+        coverage.all_checks_attempted = !shortfalls
+            .iter()
+            .any(|s| matches!(s, report::Shortfall::NotAttempted { .. }));
+        coverage.withholding.instrument_withholdings.count = shortfalls
+            .iter()
+            .filter(|s| matches!(s, report::Shortfall::Unsettled { .. }))
+            .count();
+        coverage.all_verdicts_published = shortfalls.is_empty();
+        coverage
+    }
+
+    /// A check withheld `indeterminate` under `rule`.
+    fn held(check: &str, rule: &'static str) -> report::Shortfall {
+        report::Shortfall::Unsettled {
+            check: check.to_owned(),
+            verdict: Verdict::Indeterminate,
+            withheld: None,
+            rule: Some(rule),
+            reason: None,
+        }
+    }
+
+    /// The record of a gate run without `--allow`.
+    fn strict() -> report::Gate {
+        report::Gate::of(&[], BTreeSet::new())
+    }
+
+    /// The record of a gate run under every allowance, which excused `excused`.
+    fn allowing(excused: &[report::Shortfall]) -> report::Gate {
+        let allowed: BTreeSet<report::Allowance> = report::Allowance::ALL.into_iter().collect();
+        report::Gate {
+            excused: excused
+                .iter()
+                .filter_map(|shortfall| {
+                    allowed
+                        .iter()
+                        .find(|a| a.excuses(shortfall))
+                        .map(|a| report::Excused {
+                            check: shortfall.check().to_owned(),
+                            rule: *a,
+                        })
+                })
+                .collect(),
+            allowed,
+        }
+    }
+
+    /// The shortfalls as the gate hands them to [`remedies`].
+    fn refs(shortfalls: &[report::Shortfall]) -> Vec<&report::Shortfall> {
+        shortfalls.iter().collect()
+    }
+
+    #[test]
+    fn the_allowance_excuses_no_check_on_target_and_nothing_else() {
+        use report::gating_rule::{ARCH_OUTSIDE_TABLE, NO_CHECK_ON_TARGET};
+        let option = "--allow no-check-on-target excuses";
+        // x86_64 (gcc 16.2.1, Fedora 44, openssf-tldr, --execution host) and aarch64: the
+        // checks the mechanism table leaves unread on each.
+        let x86_64 = vec![held("bti-enforced", NO_CHECK_ON_TARGET.id)];
+        let aarch64 = vec![
+            held("linker-default-noexecstack", NO_CHECK_ON_TARGET.id),
+            held("shadow-stack-enforced", NO_CHECK_ON_TARGET.id),
+        ];
+        for shape in [&x86_64, &aarch64] {
+            let (closed, lines) = gate(&over(shape), &strict(), shape);
+            assert_eq!(closed.status(), error::EXIT_GATE, "{lines:?}");
+            let last = lines.last().expect("a last line");
+            assert!(last.contains(option), "{last}");
+            let (closed, lines) = gate(&over(shape), &allowing(shape), shape);
+            assert!(
+                matches!(closed, Closed::GatePassed { excused } if excused == shape.len()),
+                "{lines:?}"
+            );
+            assert_eq!(closed.status(), error::EXIT_OK);
+            assert_eq!(lines.len(), shape.len() + 1, "{lines:?}");
+            for (line, shortfall) in lines.iter().zip(shape.iter()) {
+                assert_eq!(
+                    *line,
+                    format!(
+                        "--fail-on-missing: excused by --allow no-check-on-target: {shortfall}"
+                    )
+                );
+            }
+        }
+        // A target outside the table: no allowance, so 1 either way, and the line says so.
+        let outside = [
+            held("bti-enforced", ARCH_OUTSIDE_TABLE.id),
+            held("cet-marked", ARCH_OUTSIDE_TABLE.id),
+        ];
+        for record in [strict(), allowing(&outside)] {
+            let (closed, lines) = gate(&over(&outside), &record, &outside);
+            assert_eq!(closed.status(), error::EXIT_GATE, "{lines:?}");
+            assert!(
+                record.excused.is_empty(),
+                "a gate that closes excuses nothing: {:?}",
+                record.excused
+            );
+            assert!(
+                lines
+                    .last()
+                    .is_some_and(|l| l.contains("no --allow excuses them") && !l.contains(option)),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowance_keeps_1_for_any_other_shortfall() {
+        use report::gating_rule::{FRAME_REUSE_DID_NOT_HOLD, NO_CHECK_ON_TARGET};
+        let coverage = gate_coverage();
+        let option = "--allow no-check-on-target excuses";
+        let x86_64 = vec![held("bti-enforced", NO_CHECK_ON_TARGET.id)];
+        let probe_invalid = report::Shortfall::Unsettled {
+            check: "no-delete-null-pointer-checks".to_owned(),
+            verdict: Verdict::ProbeInvalid,
+            withheld: Some(report::WithheldBecause::NegativeAlsoShows),
+            rule: None,
+            reason: None,
+        };
+        let not_attempted = report::Shortfall::NotAttempted {
+            check: "pie".to_owned(),
+        };
+        let unearned = report::Shortfall::Unsettled {
+            check: "cet-marked".to_owned(),
+            verdict: Verdict::ProbeInvalid,
+            withheld: None,
+            rule: Some(NO_CHECK_ON_TARGET.id),
+            reason: None,
+        };
+        for other in [
+            held("zero-init-padding-bits", FRAME_REUSE_DID_NOT_HOLD.id),
+            probe_invalid,
+            not_attempted,
+            unearned,
+        ] {
+            let mut shape = x86_64.clone();
+            shape.push(other.clone());
+            let record = allowing(&shape);
+            assert_eq!(record.excused.len(), 1, "{other}");
+            let (closed, lines) = gate(&over(&shape), &record, &shape);
+            assert!(
+                matches!(
+                    closed,
+                    Closed::GateFailed {
+                        unsettled: 1,
+                        excused: 1,
+                        machine_limited: false
+                    }
+                ),
+                "{other}"
+            );
+            assert_eq!(closed.status(), error::EXIT_GATE, "{other}");
+            assert!(
+                lines
+                    .first()
+                    .is_some_and(|l| l.contains("1 of the corpus's")),
+                "{lines:?}"
+            );
+            assert!(
+                lines.contains(&format!("--fail-on-missing: {other}")),
+                "{lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.starts_with(
+                    "--fail-on-missing: excused by --allow no-check-on-target: bti-enforced"
+                )),
+                "{lines:?}"
+            );
+            assert!(
+                lines.last().is_some_and(|l| !l.contains(option)),
+                "nothing left is the allowance's: {lines:?}"
+            );
+        }
+        let mut complete = coverage.clone();
+        complete.all_verdicts_published = true;
+        let (closed, _) = gate(&complete, &allowing(&[]), &[]);
+        assert!(matches!(closed, Closed::GatePassed { excused: 0 }));
+        let other = [held("ssp-level", "flag-unknown-to-driver")];
+        let (closed, _) = gate(&over(&other), &allowing(&other), &other);
+        assert_eq!(closed.status(), error::EXIT_GATE);
+        // The report disagreeing with itself (no shortfall, completeness false) is no pass.
+        let (closed, lines) = gate(&coverage, &allowing(&[]), &[]);
+        assert_eq!(closed.status(), error::EXIT_GATE, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("no check is named")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_excused_check_never_stands_in_for_another_cause() {
+        use report::gating_rule::NO_CHECK_ON_TARGET;
+        let x86_64 = vec![held("bti-enforced", NO_CHECK_ON_TARGET.id)];
+        let excused = allowing(&x86_64);
+        let mut unexpected = over(&x86_64);
+        unexpected.checks_unexpected = vec!["no-such-check".to_owned()];
+        let mut missing = over(&x86_64);
+        missing.checks_missing = vec!["pie".to_owned()];
+        let mut unattempted = over(&x86_64);
+        unattempted.all_checks_attempted = false;
+        let mut withheld = over(&x86_64);
+        withheld.withholding.instrument_withholdings.count = 2;
+        assert!(matches!(
+            gate(&over(&x86_64), &excused, &x86_64).0,
+            Closed::GatePassed { excused: 1 }
+        ));
+        for (name, coverage) in [
+            ("unexpected", unexpected),
+            ("missing", missing),
+            ("unattempted", unattempted),
+            ("withheld", withheld),
+        ] {
+            let (closed, lines) = gate(&coverage, &excused, &x86_64);
+            assert_eq!(closed.status(), error::EXIT_GATE, "{name}: {lines:?}");
+            assert!(
+                lines.iter().any(|l| l.contains("no check is named")),
+                "{name}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_allowance_moves_exit_4() {
+        use report::gating_rule::{
+            ARCH_OUTSIDE_TABLE, FRAME_REUSE_DID_NOT_HOLD, MACHINE_LACKS_BTI, MACHINE_LACKS_PAC,
+            NO_CHECK_ON_TARGET,
+        };
+        let total = probe::total_checks();
+        let mut coverage =
+            report::coverage(&[], &BTreeSet::new(), total, &profile("bare"), Vec::new());
+        coverage.checks_expected = total;
+        let held = |check: &str, rule: &'static str| report::Shortfall::Unsettled {
+            check: check.to_owned(),
+            verdict: Verdict::Indeterminate,
+            withheld: None,
+            rule: Some(rule),
+            reason: None,
+        };
+        let pool = [
+            held("bti-enforced", MACHINE_LACKS_BTI.id),
+            held("pac-ret-enforced", MACHINE_LACKS_PAC.id),
+            held("shadow-stack-enforced", NO_CHECK_ON_TARGET.id),
+            held("linker-default-noexecstack", NO_CHECK_ON_TARGET.id),
+            held("cet-marked", ARCH_OUTSIDE_TABLE.id),
+            held("zero-init-padding-bits", FRAME_REUSE_DID_NOT_HOLD.id),
+            report::Shortfall::NotAttempted {
+                check: "pie".to_owned(),
+            },
+        ];
+        let mut fours = 0;
+        let mut zeros = 0;
+        for mask in 1u32..(1 << pool.len()) {
+            let shape: Vec<report::Shortfall> = pool
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, s)| s.clone())
+                .collect();
+            let strict_status = gate(&over(&shape), &strict(), &shape).0.status();
+            let record = allowing(&shape);
+            let allowed_status = gate(&over(&shape), &record, &shape).0.status();
+            if record.excused.len() == shape.len() {
+                assert_eq!(strict_status, error::EXIT_GATE, "{shape:?}");
+                assert_eq!(allowed_status, error::EXIT_OK, "{shape:?}");
+                zeros += 1;
+            } else {
+                assert_eq!(allowed_status, strict_status, "{shape:?}");
+            }
+            if strict_status == error::EXIT_MACHINE_LIMIT {
+                fours += 1;
+            }
+        }
+        // The pool reaches every ending: each nonempty subset of the two machine rules beside
+        // any subset of the three target limits (3 x 8), and both no-check-on-target subsets
+        // alone (3).
+        assert_eq!((fours, zeros), (24, 3));
     }
 
     fn profile(name: &str) -> Profile {
@@ -3967,8 +4459,6 @@ mod tests {
             .expect("the profile must resolve without consulting the system")
     }
 
-    /// A refused `-v` is noted on every built-in profile, after any note the profile
-    /// already carries, and a refusal of another query notes nothing.
     #[test]
     fn an_unread_configuration_is_noted_on_every_profile() {
         let refused = |context: &'static str| toolchain::QueryFailure {
@@ -3983,11 +4473,7 @@ mod tests {
                 with_unread_config(profile(name), &[refused(toolchain::CONFIG_FILES_FIELD)])
                     .toolchain_note
                     .expect("noted");
-            assert!(
-                noted.contains("so it read no configuration file from it")
-                    && noted.contains(toolchain::VERBOSE_QUERY),
-                "{name}: {noted}"
-            );
+            assert!(noted.contains(toolchain::VERBOSE_QUERY), "{name}: {noted}");
             if let Some(before) = before {
                 assert!(
                     noted.starts_with(&format!("{before}; ")),
@@ -4008,10 +4494,6 @@ mod tests {
         assert_eq!(fed, 3);
     }
 
-    /// `openssf-tldr` as the CLI resolves it: 32-bit x86 gets the block and the executables row
-    /// with neither of x86_64's architecture flags, the same list as an architecture the
-    /// guide's rows do not name, and x86_64 and aarch64 get their rows. A call site that
-    /// aliased x86 to x86_64 would pass the inventory's tests and fail here.
     #[test]
     fn the_cli_resolves_openssf_tldr_by_the_guides_rows_for_each_architecture() {
         let args = MeasureArgs::try_parse_from(["chard", "--profile", "openssf-tldr"])
@@ -4041,9 +4523,6 @@ mod tests {
         );
     }
 
-    /// A profile whose flags depend on an architecture the driver's macro dump names is
-    /// refused where the arch gate read another; one that does not depend on architecture,
-    /// or a dump that names the gate's own, passes through.
     #[test]
     fn a_profile_chosen_by_an_architecture_the_dump_contradicts_is_refused() {
         let tldr = MeasureArgs::try_parse_from(["chard", "--profile", "openssf-tldr"])
@@ -4071,13 +4550,6 @@ mod tests {
             .expect("a profile that does not depend on architecture is not refused");
     }
 
-    /// A profile whose flags depend on the architecture is refused when the target its
-    /// flags select differs from the driver's default it was resolved under.
-    ///
-    /// No shipped profile both selects a target and depends on architecture, so the
-    /// refusal in `settle_profile` is unreachable from the CLI; this drives it directly
-    /// with `openssf-tldr`, which picks its flags by architecture, posed under `x86_64`
-    /// and settled under `aarch64`. The same pair under one architecture passes through.
     #[test]
     fn a_profile_whose_flags_depend_on_the_selected_target_is_refused() {
         let args = MeasureArgs::try_parse_from(["chard", "--profile", "openssf-tldr"])
@@ -4100,13 +4572,29 @@ mod tests {
         assert_eq!(link_lines(&same), link_lines(&posed));
     }
 
-    /// `chard probes` lists the tables each check reads, as the check declares them, and
-    /// every elf-static check lists at least one.
-    ///
-    /// `reads` is the declaration the truncation gate intersects, so it is the one field
-    /// a reader auditing why a cell went `indeterminate` under `artifact-unreadable` has
-    /// to see in the corpus listing; a listing that omitted it left the declaration
-    /// visible only in the source.
+    #[test]
+    fn the_corpus_listing_carries_each_checks_positive_inputs() {
+        let listing = corpus_listing();
+        let mut with = Vec::new();
+        for probe in listing["probes"].as_array().expect("probes is a list") {
+            for check in probe["checks"].as_array().expect("checks is a list") {
+                let inputs = check["positive_inputs"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{}: positive_inputs is a list", check["id"]));
+                if !inputs.is_empty() {
+                    with.push((check["id"].clone(), inputs.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            with,
+            vec![(
+                serde_json::json!("rwx-segment-absent"),
+                vec![serde_json::json!("rwx_segment.c")]
+            )]
+        );
+    }
+
     #[test]
     fn the_corpus_listing_carries_what_each_check_reads() {
         let listing = corpus_listing();
@@ -4145,13 +4633,6 @@ mod tests {
         );
     }
 
-    /// `bare-optimized` must carry `-O2` and nothing else.
-    ///
-    /// The profile's entire evidentiary value rests on this. It exists to remove
-    /// one confound — that fortify cannot instantiate without optimization — so
-    /// that hardening observed under it is attributable to the *compiler*. A single
-    /// additional flag would make it a second `openssf-tldr`: a measurement of
-    /// chard's own opinions rather than the distribution's.
     #[test]
     fn bare_optimized_adds_only_the_enabling_condition() {
         let p = profile("bare-optimized");
@@ -4162,13 +4643,15 @@ mod tests {
         );
     }
 
-    /// It must differ from `bare` by exactly that one flag, or the two columns are
-    /// not comparable and the gated-default question cannot be read off them.
     #[test]
     fn bare_optimized_differs_from_bare_only_by_optimization() {
         let bare = profile("bare");
         let opt = profile("bare-optimized");
-        assert!(bare.cflags.is_empty());
+        assert!(
+            bare.cflags.is_empty(),
+            "the bare profile adds no flag: {:?}",
+            bare.cflags
+        );
         let added: Vec<_> = opt
             .cflags
             .iter()
@@ -4177,22 +4660,6 @@ mod tests {
         assert_eq!(added, vec![&"-O2".to_owned()]);
     }
 
-    /// The flags must be attributable to chard rather than to the distribution.
-    ///
-    /// `bare` reports `flags_source: "none"`, and if `bare-optimized` did too, a
-    /// reader — or `attribute` — would credit `-O2` to the compiler's own defaults
-    /// The explicit profile carries all three flag sets the caller can supply.
-    ///
-    /// `cxxflags` and `ldflags` existed on `Profile` and in the schema with no way to
-    /// reach them: every production construction site set them empty, which made
-    /// `measure::variant_flags`' C++ branch unreachable outside its own unit test. The
-    /// consequence was a measurement chard could not take — `_GLIBCXX_ASSERTIONS` and
-    /// `_LIBCPP_HARDENING_MODE` are set in CXXFLAGS and nowhere else by every
-    /// distribution measured that sets them, so the C++ checks were being asked about a
-    /// CFLAGS that never carried them.
-    /// A relative path in any of the three lists is refused, by name and list, before the
-    /// driver is run; an absolute one, a sysroot-relative one and a searched name are not.
-    /// `compile::relative_path_arguments` says why.
     #[test]
     fn explicit_refuses_a_relative_path_and_names_it() {
         let refused = |flags: &str, cxx: &str, ld: &str| {
@@ -4231,10 +4698,6 @@ mod tests {
         );
     }
 
-    /// A flag that removes the startup objects, the default libraries or the default
-    /// headers is refused from any of the three lists, by name and list, as
-    /// `CONFIGURATION`, before the driver is run; a selection and a linker's own
-    /// `-nostdlib` are not. `toolchain::runtime_removing_flags` says why.
     #[test]
     fn explicit_refuses_a_runtime_removal_and_names_it() {
         let refused = |flags: &str, cxx: &str, ld: &str| {
@@ -4316,12 +4779,6 @@ mod tests {
         );
     }
 
-    /// A flag selecting x32, 16-bit or aarch64 ILP32 code is refused from any of the three
-    /// lists, by name
-    /// and list, as `CONFIGURATION`, with the sentence saying chard does not measure that
-    /// target; `-m32` and an x86_64 triple are not. `toolchain::unsupported_target_flags`
-    /// says which spellings and why. The refusal comes after a response file's and before
-    /// a removal's.
     #[test]
     fn explicit_refuses_an_x32_sixteen_bit_or_ilp32_target_and_names_it() {
         let refused = |flags: &str, cxx: &str, ld: &str| {
@@ -4396,9 +4853,6 @@ mod tests {
         );
     }
 
-    /// A response file in any of the three lists is refused, by name and list, as
-    /// `CONFIGURATION`, before the driver is run, whether it is absolute or relative and
-    /// whichever tool it is handed to. `compile::response_file_arguments` says why.
     #[test]
     fn explicit_refuses_a_response_file_and_names_it() {
         let refused = |flags: &str, cxx: &str, ld: &str| {
@@ -4465,8 +4919,7 @@ mod tests {
     ///
     /// Empty is what `measure::variant_flags` reads as "build C++ with the C flags", so
     /// filling it in would produce the same builds and a report claiming the caller
-    /// supplied two flag sets that happen to match. The distinction is the difference
-    /// between "they gave us one set" and "they told us these are the same".
+    /// supplied two flag sets that happen to match.
     #[test]
     fn an_omitted_cxxflags_is_absent_rather_than_a_copy() {
         let args =
@@ -4486,25 +4939,19 @@ mod tests {
         );
     }
 
-    /// and mis-attribute anything it unlocked.
+    /// The flags must be attributable to chard rather than to the distribution: `bare`
+    /// reports `flags_source: "none"`, and if `bare-optimized` did too, a reader or
+    /// `attribute` would credit `-O2` to the compiler's own defaults and mis-attribute
+    /// anything it unlocked.
     #[test]
     fn bare_optimized_declares_who_chose_its_flags() {
         assert_eq!(profile("bare").flags_source, "none");
         let p = profile("bare-optimized");
         assert_eq!(p.flags_source, "chard-enabling-condition");
-        assert!(
-            p.toolchain_note
-                .is_some_and(|n| n.contains("not a hardening flag")),
-            "the note must say -O2 grants nothing on its own"
-        );
     }
 
     /// A repeated `--probe` is refused, an unknown one is refused, and a distinct
     /// selection names its own size.
-    ///
-    /// The doubled selection was accepted: `--probe stack-canary --probe stack-canary`
-    /// produced two observations per check, `checks_expected: 2` against one distinct
-    /// probe, and `defect_coverage.from_checks` listing `canary-emitted` twice.
     #[test]
     fn a_repeated_probe_id_is_refused_and_a_distinct_selection_is_counted_once() {
         let Err(err) = select_probes(&["stack-canary".to_owned(), "stack-canary".to_owned()])
@@ -4543,13 +4990,10 @@ mod tests {
     }
 
     /// A driver that loaded a configuration file changes what `bare` measures, and the
-    /// profile says so where a reader of a bare column looks.
-    ///
-    /// `none` is reserved for compiled-in defaults. A clang auto-loading
-    /// `<triple>.cfg` was published under it, with the file named only in
-    /// `toolchain.config_files`, so a distribution putting a hardening flag in that file
-    /// would have had it credited to the compiler. `bare-optimized` keeps the value
-    /// that attributes the `-O2` chard passed, and names the file in its note instead.
+    /// profile says so where a reader of a bare column looks: `none` is reserved for
+    /// compiled-in defaults, or a hardening flag in that file is credited to the compiler.
+    /// `bare-optimized` keeps the value that attributes the `-O2` chard passed, and names the
+    /// file in its note instead.
     #[test]
     fn a_driver_configuration_file_is_named_by_the_bare_profile_it_stands_behind() {
         let files = vec!["/some.cfg".to_owned()];

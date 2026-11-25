@@ -3,37 +3,6 @@
 //! the one input of a measurement a fetcher outside chard writes. Bytes that are not UTF-8
 //! are skipped, since `main` reads the file with `read_to_string` and refuses them before
 //! the parser sees them.
-//!
-//! What is held for every input:
-//!
-//! - it returns, without a panic, and a second parse of the same text agrees with the first,
-//!   the same value or the same refusal;
-//! - an accepted input is a JSON object naming only the keys `RawAttestation` declares, and
-//!   its `installed_disk`, when not null, an object naming only `RawInstalledDisk`'s three:
-//!   the schema publishes both with `additionalProperties: false`, and `deny_unknown_fields`
-//!   is the parser's half of that;
-//! - nothing accepted is dropped or rewritten beyond what the parser documents: every key
-//!   the input gives a non-null value comes out with that value, `digest`, `installed_disk.sha256`
-//!   and `installed_disk.installed_from_digest` lowercased; `origin` and `manifest_fetched`
-//!   absent read as `not-recorded` and `true`; a null `signer`, `caveat` or `installed_disk`
-//!   comes out absent;
-//! - the refinements hold of the value: `digest_kind` names a known algorithm and `digest`
-//!   is lowercase hex of its length; `installed_disk.sha256` is 64 lowercase hex digits,
-//!   `installed_disk.installed_from_digest` equals `digest`, and `installed_at` is a real
-//!   instant, checked here by a different method from the parser's (a day count from the
-//!   civil date and back, rather than month lengths);
-//! - the value written back as JSON parses to an equal value and writes the same text, and
-//!   so does the `image_attestation` block a report publishes for it, with the two keys
-//!   chard adds (`status`, `established_by`) taken off;
-//! - `ImageAttestation::classify`, asked in all three modes, refuses it as a mismatch, with
-//!   the same value inside, exactly when `digest_matched` is false and `manifest_fetched`
-//!   true; otherwise refuses it for a host as an image there is none of, and for a container
-//!   and a VM yields the same record, `attested`, or `unattested` when no manifest was
-//!   fetched (the mode is not read from the input: one input checked in three modes covers
-//!   what one in three would, at no more mutation);
-//! - the lines it contributes to `run.inputs_sha256` (`report::attestation_inputs`, which
-//!   `report::inputs_of` writes through) are those spelled here from the parsed value alone,
-//!   and the re-parsed value contributes the same lines.
 
 #![no_main]
 
@@ -48,14 +17,30 @@ use serde_json::{Map, Value};
 mod json_mutator;
 
 fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
-    json_mutator::mutate_with(
-        data,
-        size,
-        max_size,
-        seed,
-        json_mutator::ATTESTATION_WORDS,
-    )
+    json_mutator::mutate(data, size, max_size, seed, ATTESTATION_WORDS)
 });
+
+/// The attestation's keys and the digest kinds it knows, offered by the mutator beside its
+/// own words, which every JSON target shares.
+const ATTESTATION_WORDS: &[&str] = &[
+    "digest",
+    "digest_kind",
+    "digest_matched",
+    "manifest_fetched",
+    "origin",
+    "signer",
+    "caveat",
+    "installed_disk",
+    "installed_at",
+    "installed_from_digest",
+    "sha256",
+    "md5",
+    "sha1",
+    "sha384",
+    "sha512",
+    "blake2b",
+    "not-recorded",
+];
 
 /// `RawAttestation`'s keys.
 const KEYS: &[&str] = &[
@@ -118,20 +103,24 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// Whether `text` is `YYYY-MM-DDTHH:MM:SSZ` naming a real instant: the date survives a trip
 /// through a day count unchanged, and the time is within a day with no leap second.
 fn is_instant(text: &str) -> bool {
-    let b = text.as_bytes();
-    if b.len() != 20 || &b[4..5] != b"-" || &b[7..8] != b"-" || &b[10..11] != b"T" {
+    let Ok(bytes) = <&[u8; 20]>::try_from(text.as_bytes()) else {
+        return false;
+    };
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return false;
     }
-    if &b[13..14] != b":" || &b[16..17] != b":" || &b[19..20] != b"Z" {
+    if bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'Z' {
         return false;
     }
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
-        let s = &b[r];
-        s.iter()
-            .all(u8::is_ascii_digit)
-            .then(|| s.iter().fold(0i64, |n, d| n * 10 + i64::from(d - b'0')))
+        let digits = bytes.get(r)?;
+        digits.iter().all(u8::is_ascii_digit).then(|| {
+            digits
+                .iter()
+                .fold(0i64, |n, d| n * 10 + i64::from(d - b'0'))
+        })
     };
-    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) = (
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
         num(0..4),
         num(5..7),
         num(8..10),
@@ -141,12 +130,12 @@ fn is_instant(text: &str) -> bool {
     ) else {
         return false;
     };
-    (1..=12).contains(&mo)
-        && (1..=31).contains(&d)
-        && civil_from_days(days_from_civil(y, mo, d)) == (y, mo, d)
-        && h < 24
-        && mi < 60
-        && s < 60
+    (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && civil_from_days(days_from_civil(year, month, day)) == (year, month, day)
+        && hour < 24
+        && minute < 60
+        && second < 60
 }
 
 /// What the parser documents doing to one input key's value.
@@ -173,24 +162,27 @@ fn expected(key: &str, value: &Value) -> Value {
 /// The `image_attestation.*` lines spelled from the parsed value, as `InputIdentity`
 /// writes them; every value here is hex, digits or a status word, so none needs escaping.
 fn spelled(status: AttestationStatus, a: &Attestation) -> String {
-    let mut text = format!(
-        "image_attestation.status={}\nimage_attestation.digest={}\n",
-        status.as_str(),
-        a.digest()
-    );
-    if let Some(disk) = a.installed_disk() {
-        text.push_str(&format!(
+    let disk = a.installed_disk().map_or_else(String::new, |disk| {
+        format!(
             "image_attestation.installed_disk.sha256={}\n\
              image_attestation.installed_disk.installed_at={}\n\
              image_attestation.installed_disk.installed_from_digest={}\n",
             disk.sha256(),
             disk.installed_at(),
             disk.installed_from_digest()
-        ));
-    }
-    text
+        )
+    });
+    format!(
+        "image_attestation.status={}\nimage_attestation.digest={}\n{disk}",
+        status.as_str(),
+        a.digest()
+    )
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn record(a: &Attestation) -> Value {
     serde_json::to_value(a).expect("an attestation serializes")
 }
@@ -198,6 +190,10 @@ fn record(a: &Attestation) -> Value {
 /// `classify` for a mode that carries an image: refused exactly on a mismatch with a fetched
 /// manifest, `unattested` when no manifest was fetched, otherwise `attested`. A refusal is
 /// stood in for by an `attested` record so the publication oracles below still run over it.
+#[expect(
+    clippy::panic,
+    reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+)]
 fn imaged(
     mode: ExecutionMode,
     a: &Attestation,
@@ -237,6 +233,11 @@ fn imaged(
 }
 
 fuzz_target!(|data: &[u8]| {
+    #![expect(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "a fuzz target reports a broken law by panicking; libFuzzer keeps the input as the crash"
+    )]
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
@@ -312,8 +313,10 @@ fuzz_target!(|data: &[u8]| {
     let length = LENGTHS
         .iter()
         .find(|(name, _)| *name == kind_lower)
-        .map(|(_, n)| *n)
-        .unwrap_or_else(|| panic!("accepted digest_kind {:?}", a.digest_kind()));
+        .map_or_else(
+            || panic!("accepted digest_kind {:?}", a.digest_kind()),
+            |(_, n)| *n,
+        );
     assert_eq!(a.digest().len(), length, "a digest of the wrong length");
     assert!(lower_hex(a.digest()), "a digest that is not lowercase hex");
     if let Some(disk) = a.installed_disk() {
@@ -385,7 +388,8 @@ fuzz_target!(|data: &[u8]| {
     let block = published.as_object_mut().expect("an object");
     assert_eq!(
         block.remove("status"),
-        Some(Value::from(image.status.as_str()))
+        Some(Value::from(image.status.as_str())),
+        "the published status"
     );
     assert!(
         block.remove("established_by").is_some(),

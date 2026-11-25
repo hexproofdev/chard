@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# libFuzzer dictionary for `flag_words`: the word separator and the spellings the five flag-word
+# libFuzzer dictionary for `flag_words`: the word separator and the spellings the flag-word
 # readers take or refuse, from their unit tests' lists, and near spellings they do not.
 lf="\x0a"
 space=" "

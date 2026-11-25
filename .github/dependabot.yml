@@ -14,6 +14,7 @@
 # `cargo audit` runs weekly in `audit.yml`, so an update arriving here is checked by both
 # before it can merge. It does not cover cargo-deny or cargo-audit themselves: those are
 # built by `cargo install --locked` from their own lockfiles and appear in no manifest here.
+---
 version: 2
 updates:
   - package-ecosystem: github-actions

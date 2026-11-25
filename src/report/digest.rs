@@ -1,34 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! The digest: a report's verdicts and what they stand on, ahead of the evidence.
-//!
-//! A report is about a megabyte pretty-printed, and most of it is the replay evidence
-//! (`observations[].controls`, `facts`, `decoders`); the fields that say what was found and
-//! whether to trust the file, `coverage` and `consistency`, came last. A reader going front
-//! to back, an agent with a context budget among them, paid for the evidence before it
-//! reached the verdicts. The digest is the report's first key and what `chard digest`
-//! prints: the consistency status, coverage with its earned limitations apart from its
-//! instrument withholdings, one row per check, every reason a check is not a measurement in
-//! one list, and the identity a reader joins on (toolchain, profile with its flags hash and
-//! what the profile measures, execution mode with its basis, revision and corpus hashes).
-//! No notes, references, facts, decoders, invocation or score.
-//!
-//! It states nothing about the measurement the file does not already say: every field is
-//! derived from the report's own JSON by [`derive`], the one derivation, and the one sentence
-//! chard writes there, the profile's [`meaning`], is keyed on `profile.flags_source`.
-//! [`super::publish`] runs the derivation over the report it is about to write, and the
-//! consistency rule [`super::RULE_DIGEST`] runs it again over a report read back (`table`,
-//! `matrix`, `digest`) and compares, so a digest edited apart from the observations under it
-//! is refused rather than read. At publication the rule asks only whether the derivation goes
-//! through, since the block is then made by it.
-//! Deriving from the JSON rather than from [`super::Report`] is what lets one function
-//! serve both sides: `Report` is not `Deserialize`, and a second derivation over the typed
-//! report would be a checker that can drift from the one the reader runs.
-//!
-//! The coverage it carries is recounted from the observations, not copied from `coverage`,
-//! so the two agree only where the observations do; `coverage`'s own rules hold that block
-//! to the same observations. `checks_expected` and the two id lists are copied, since the
-//! selection they count is not in the observations.
 
 use std::collections::BTreeMap;
 
@@ -76,7 +48,7 @@ pub struct CoverageDigest {
     pub all_verdicts_published: bool,
     /// The observations' verdicts, counted.
     pub verdict_counts: BTreeMap<String, usize>,
-    /// The observations as [`Withholding::of`] counts them: measured, earned limitations,
+    /// The observations as `Withholding::of` counts them: measured, earned limitations,
     /// instrument withholdings.
     pub withholding: Withholding,
 }
@@ -109,11 +81,6 @@ pub struct Reason {
     /// `controls.withheld_because`, where the triple withheld.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
-    /// The report's sentence for it, on one line: a `build-failed`'s `build_rejection`, else
-    /// `gating.reason`, else `controls.failure_reason` beside a triple that withheld, else
-    /// `evidence.observed`. Absent where the observation carries none of them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -160,14 +127,10 @@ const USER_MEANING: &str = "the flags given to `measure` (`profile.cflags`, `cxx
      listed flag it left out): what this toolchain applied to chard's own probes built with \
      these lists, not a measurement of any package build that injects them";
 
-/// A `user` sentence another revision writes in place of [`USER_MEANING`]. It says what "a
-/// package build that injects exactly these lists gets". A report carrying it is from another
-/// revision. [`reread`] refuses it, since its digest is not the one this build derives, but
-/// as an older report rather than as a contradiction. A fleet sweep carries it in its six
+/// A `user` sentence another revision writes in place of [`USER_MEANING`]. [`reread`]
+/// refuses a report carrying it, since its digest is not the one this build derives, but
+/// as an older report rather than as a contradiction. A sweep carries it in its six
 /// OpenBSD `explicit` reports, the only ones of its 311 under `user`.
-///
-/// The constant, [`with_todays_meaning`] and their tests can go once a re-sweep replaces the
-/// reports that carry the sentence.
 const USER_MEANING_RETIRED: &str = "the flags given to `measure` (`profile.cflags`, `cxxflags`, \
      `ldflags`), passed to each measured build (a build's `dropped_flags` names any it left \
      out): what a package build that injects exactly these lists gets, and not what a build \
@@ -176,9 +139,8 @@ const USER_MEANING_RETIRED: &str = "the flags given to `measure` (`profile.cflag
 /// What a column under a profile of `flags_source` measures, against what a distribution's
 /// package build injects. `config_file` is whether the driver announced a configuration file
 /// (`toolchain.config_files`), and `env_pairs` whether the run handed every toolchain run
-/// `--env` pairs, which the published `profile.id` names with its `+env:` suffix
-/// ([`super::Profile::published_id`]); each adds its clause, since either can change what a
-/// column of no flags measures.
+/// `--env` pairs; each adds its clause, since either can change what a column of no flags
+/// measures.
 ///
 /// # Errors
 ///
@@ -316,9 +278,6 @@ struct ObservationSource {
     gating: Option<GatingSource>,
     #[serde(default)]
     controls: Option<ControlsSource>,
-    #[serde(default)]
-    build_rejection: Option<String>,
-    evidence: EvidenceSource,
 }
 
 #[derive(Deserialize)]
@@ -328,24 +287,15 @@ struct GatingSource {
     /// not read.
     #[serde(default, deserialize_with = "super::gating_rule::written_premise")]
     premise: Option<super::gating_rule::Premise>,
-    reason: String,
 }
 
-/// The cause and its sentence are taken only beside `discriminating: false`, as
-/// [`super::Controls::withheld`] gives the cause at publish.
+/// The cause is taken only beside `discriminating: false`, as
+/// [`super::Controls::withheld`] gives it at publish.
 #[derive(Deserialize)]
 struct ControlsSource {
     discriminating: bool,
     #[serde(default)]
     withheld_because: Option<String>,
-    #[serde(default)]
-    failure_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct EvidenceSource {
-    #[serde(default)]
-    observed: Option<String>,
 }
 
 impl ObservationView for ObservationSource {
@@ -383,42 +333,7 @@ impl ObservationView for ObservationSource {
     }
 }
 
-impl ObservationSource {
-    /// The sentence [`Reason::reason`] carries.
-    ///
-    /// A `build-failed` beside a `build_rejection` takes it first, as `table` does: the
-    /// profile's flag the toolchain refused is what a reader acts on, not the probe. A blank
-    /// candidate is passed over rather than ending the search, where `table`, which reads one
-    /// field per verdict, prints no reason, and `--fail-on-missing`'s line
-    /// (`report::shortfalls`) reads no `build_rejection`: the digest can name a reason those
-    /// two do not, never a different verdict.
-    fn reason(&self) -> Option<String> {
-        let rejection = self
-            .build_rejection
-            .as_deref()
-            .filter(|_| self.verdict == Verdict::BuildFailed);
-        let failure = self
-            .controls
-            .as_ref()
-            .filter(|c| !c.discriminating)
-            .and_then(|c| c.failure_reason.as_deref());
-        [
-            rejection,
-            self.gating.as_ref().map(|g| g.reason.as_str()),
-            failure,
-            self.evidence.observed.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|reason| reason.split_whitespace().collect::<Vec<_>>().join(" "))
-        .find(|reason| !reason.is_empty())
-    }
-}
-
 /// The digest of `report`, a chard report as JSON, whose `consistency.status` is `status`.
-///
-/// The status is passed rather than read because at publication the block is made before
-/// the report is serialized, from the status the consistency pass has just decided.
 ///
 /// # Errors
 ///
@@ -458,7 +373,6 @@ pub fn derive(report: &serde_json::Value, status: &str) -> Result<Digest, String
                 standing,
                 rule: obs.gating.as_ref().map(|g| g.rule.clone()),
                 cause: obs.withheld_because().map(str::to_owned),
-                reason: obs.reason(),
             })
         })
         .collect();
@@ -537,7 +451,7 @@ fn source_of(report: &super::Report) -> Result<serde_json::Value, String> {
 ///
 /// # Errors
 ///
-/// Those of [`derive`], and a field that does not serialize.
+/// Those of [`derive()`], and a field that does not serialize.
 pub fn of_report(report: &super::Report) -> Result<Digest, String> {
     derive(&source_of(report)?, report.consistency.status().as_str())
 }
@@ -568,12 +482,6 @@ pub(super) fn underivable(why: &str) -> super::Contradiction {
 /// [`super::RULE_DIGEST`] on read: `profile.flags_sha256` against its three lists where the
 /// report publishes one, and the digest `report` carries against the one its own fields
 /// give, into `out`.
-///
-/// A report without a digest never reaches this rule from a reader: `table`, `matrix` and
-/// `chard digest` refuse it when they read it (`crate::dataset::refuse_unread`), before any
-/// rule runs, as they refuse a `chard_schema` other than the binary's. Over a value handed
-/// here without that read, the rule has no digest to hold and adds nothing for it. A digest
-/// that is present is held whole, a member added or removed included.
 pub(super) fn reread(report: &serde_json::Value, out: &mut super::Reread) {
     let rule = super::RULE_DIGEST;
     let contradiction = |property: String, written: String, derived: String| super::Contradiction {
@@ -726,10 +634,9 @@ fn shown(value: Option<&serde_json::Value>) -> String {
 
 /// The digest of the one report `chard digest` read, refused as `table` refuses a report:
 /// one that is not a report, one that contradicts itself, one whose digest is not the one
-/// its own fields give ([`super::reread_contradictions`] runs this module's rule), and one
-/// with no digest. The read refuses the last, with a `chard_schema` other than the binary's,
-/// before this runs (`crate::dataset::refuse_unread`); it is refused here too, since this
-/// prints the digest and has nothing else to print.
+/// its own fields give, and one with no digest. The read refuses the last before this runs
+/// (`crate::dataset::refuse_unread`); it is refused here too, since this prints the digest
+/// and has nothing else to print.
 ///
 /// # Errors
 ///
@@ -749,8 +656,6 @@ pub fn of_read(read: &(String, serde_json::Value)) -> anyhow::Result<&serde_json
 mod tests {
     use super::*;
 
-    /// `gating.premise` as the digest reads it: absent is no class, a spelling is its
-    /// class, and `null` or a word outside the vocabulary does not read.
     #[test]
     fn the_digest_reads_a_premise_strictly() {
         let read = |gating: serde_json::Value| GatingSource::deserialize(gating).map(|g| g.premise);
@@ -769,10 +674,6 @@ mod tests {
         }
     }
 
-    /// Every source chard writes has its own sentence, placing the column against what a
-    /// build injects, with a clause for a driver configuration file (one of its own for
-    /// `driver-config-file`) and one for `--env` pairs; a source outside the vocabulary is
-    /// refused rather than given one.
     #[test]
     fn every_flags_source_has_a_meaning_and_no_other_does() {
         let mut sentences = std::collections::BTreeSet::new();
@@ -798,11 +699,6 @@ mod tests {
         assert!(meaning("hardened", false, false).is_err());
     }
 
-    /// No sentence says what a package or distribution build gets: chard ran none, so every
-    /// clause naming one is a denial, opening on "not". The `user` sentence said what "a
-    /// package build that injects exactly these lists gets", a claim about a build
-    /// chard never ran; it says what chard built, and is pinned whole, since a word list
-    /// cannot catch every rewording.
     #[test]
     fn no_meaning_claims_a_package_build_chard_did_not_run() {
         let (mut fed, mut denials) = (0, 0);
@@ -891,13 +787,10 @@ mod tests {
         !out.older.is_empty() && out.unreadable.is_empty()
     }
 
-    /// A `user` report another revision wrote carries that revision's sentence: the read names
-    /// it as that, not as a contradiction, with both ways on, and still holds the rest of its
-    /// digest. Those words with clauses its fields do not give stay contradictions.
     #[test]
     fn a_retired_user_sentence_is_named_as_older_on_read() {
         use serde_json::json;
-        // As a fleet sweep's OpenBSD `explicit` reports store it, copied from one.
+        // As a sweep's OpenBSD `explicit` reports store it, copied from one.
         assert_eq!(
             USER_MEANING_RETIRED,
             "the flags given to `measure` (`profile.cflags`, `cxxflags`, `ldflags`), passed to \
@@ -951,15 +844,17 @@ mod tests {
         assert_eq!(crossed, 16);
     }
 
-    /// Only that sentence whole is older: one with anything before or after it, one cut short,
-    /// another sentence, or those words under another source stay contradictions.
     #[test]
     fn a_near_retired_user_sentence_stays_a_contradiction() {
         use serde_json::json;
         let today = user_report(false, false);
         for stored in [
             format!("{USER_MEANING_RETIRED}."),
-            USER_MEANING_RETIRED[..USER_MEANING_RETIRED.len() - 1].to_owned(),
+            {
+                let mut cut = USER_MEANING_RETIRED.chars();
+                cut.next_back().expect("the retired sentence is not empty");
+                cut.as_str().to_owned()
+            },
             format!("x{USER_MEANING_RETIRED}"),
             "hardened".to_owned(),
         ] {
@@ -980,8 +875,6 @@ mod tests {
         assert!(!named_older(&out) && out.contradictions.len() == 1);
     }
 
-    /// The derivation hands `meaning` what the report says of the profile: `--env` pairs by
-    /// `profile.id`'s `+env:` suffix, a configuration file by `toolchain.config_files`.
     #[test]
     fn the_meaning_follows_the_reports_env_pairs_and_configuration_file() {
         use serde_json::json;
@@ -1011,10 +904,8 @@ mod tests {
         assert!(config.contains("configuration file"), "{config}");
     }
 
-    /// A reason is the gating rule's sentence, else the withholding triple's, else the
-    /// detector's reading, folded onto one line; a triple that discriminated lends none.
     #[test]
-    fn the_reason_is_the_rules_then_the_triples_then_the_detectors() {
+    fn a_reason_names_the_rule_and_the_cause_and_copies_no_sentence() {
         use serde_json::json;
         let withheld = json!({"discriminating": false, "withheld_because": "positive-absent",
                               "failure_reason": "the triple's\nsentence"});
@@ -1056,34 +947,35 @@ mod tests {
             ],
         });
         let digest = derive(&report, "consistent").expect("derives");
-        let reasons: Vec<(&str, Option<&str>, &str)> = digest
+        let reasons: Vec<(&str, Option<&str>, Option<&str>, &str)> = digest
             .reasons
             .iter()
-            .map(|r| (r.check.as_str(), r.reason.as_deref(), r.standing))
+            .map(|r| {
+                (
+                    r.check.as_str(),
+                    r.rule.as_deref(),
+                    r.cause.as_deref(),
+                    r.standing,
+                )
+            })
             .collect();
+        let cause = Some("positive-absent");
         assert_eq!(
             reasons,
             [
-                ("rule", Some("the rule's"), "earned-limitation"),
-                (
-                    "triple",
-                    Some("the triple's sentence"),
-                    "instrument-withholding"
-                ),
-                ("detector", Some("the detector's"), "instrument-withholding"),
-                (
-                    "rejected",
-                    Some("gcc: unrecognized -fwhatever"),
-                    "instrument-withholding"
-                ),
-                (
-                    "blank",
-                    Some("the triple's sentence"),
-                    "instrument-withholding"
-                ),
+                ("rule", Some("arch-gated"), cause, "earned-limitation"),
+                ("triple", None, cause, "instrument-withholding"),
+                ("detector", None, None, "instrument-withholding"),
+                ("rejected", Some("x"), None, "instrument-withholding"),
+                ("blank", Some("x"), cause, "instrument-withholding"),
             ]
         );
-        assert_eq!(digest.reasons[0].cause.as_deref(), Some("positive-absent"));
-        assert_eq!(digest.reasons[2].cause, None);
+        let written = serde_json::to_string(&digest).expect("serializes");
+        for sentence in ["the rule's", "the triple's", "the detector's", "-fwhatever"] {
+            assert!(
+                !written.contains(sentence),
+                "the digest copies {sentence:?}"
+            );
+        }
     }
 }

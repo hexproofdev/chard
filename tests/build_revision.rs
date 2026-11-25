@@ -5,8 +5,23 @@
 //! writes. Each reader names a commit only where the file holds one as its writer writes
 //! it, and refuses everything else with a reason rather than reading it as a revision.
 
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
+
 #[path = "../build/revision.rs"]
 mod revision;
+
+mod common;
 
 use revision::{ARCHIVE_FILE, ARCHIVE_PLACEHOLDER, Revision, SHORT, Source};
 
@@ -54,9 +69,6 @@ fn a_filled_archive_file_names_its_commit_shortened() {
     );
 }
 
-/// A file a person or a tool wrote is not a revision unless it is the whole hash git prints:
-/// a short hash, uppercase, a ref name, the placeholder half-filled, a second line, or no
-/// line at all are each refused, and none is read as a commit.
 #[test]
 fn an_archive_file_holding_anything_else_is_refused() {
     let shapes = [
@@ -80,9 +92,6 @@ fn an_archive_file_holding_anything_else_is_refused() {
     }
 }
 
-/// The tracked file reads as the placeholder in a clone and as a commit in an archive git
-/// made, and never as a refusal: the build would otherwise warn on every archive.
-/// `.gitattributes` marks it for `git archive` to fill in, or no archive ever names a commit.
 #[test]
 fn the_tracked_archive_file_is_one_git_archive_fills_in() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -103,7 +112,6 @@ fn the_tracked_archive_file_is_one_git_archive_fills_in() {
     );
 }
 
-/// The file as `cargo package` writes it, clean and dirty.
 #[test]
 fn cargo_vcs_info_names_its_commit_and_whether_the_tree_was_dirty() {
     let written =
@@ -130,11 +138,6 @@ fn cargo_vcs_info_names_its_commit_and_whether_the_tree_was_dirty() {
     );
 }
 
-/// `CHARD_REVISION` is a label of ASCII's graphic characters other than the separators: a
-/// value that names nothing (an empty one was published as `run.harness_revision` `""` beside
-/// `--version` `0.1.0 ()`), would start a second build-script directive, or could be misread
-/// (a space, a character that prints as nothing, a separator the version or the join key uses)
-/// is refused.
 #[test]
 fn an_asserted_revision_that_names_nothing_or_could_be_misread_is_refused() {
     for value in [
@@ -163,9 +166,6 @@ fn an_asserted_revision_that_names_nothing_or_could_be_misread_is_refused() {
     }
 }
 
-/// The environment's `CHARD_REVISION`: unset asserts nothing, a label is taken, and a value
-/// that is not UTF-8 is refused like any other refusal, which `build.rs` turns into a failed
-/// build rather than a fall-through to the tree's sources.
 #[test]
 fn the_environments_chard_revision_is_unset_a_label_or_refused() {
     use std::ffi::OsStr;
@@ -185,8 +185,6 @@ fn the_environments_chard_revision_is_unset_a_label_or_refused() {
     }
 }
 
-/// `--version` names an asserted revision as asserted and a build under rustflags by the
-/// start of their digest; a revision read from the tree prints alone.
 #[test]
 fn the_version_words_name_an_asserted_revision_and_a_build_under_rustflags() {
     let digest = "c442c3e616f5".to_owned() + &"0".repeat(52);
@@ -208,9 +206,6 @@ fn the_version_words_name_an_asserted_revision_and_a_build_under_rustflags() {
     );
 }
 
-/// The source's spellings are the schema's enumeration, and the three read from the tree are
-/// the ones `dataset::revision_key` joins as one. The match is exhaustive, so a new source
-/// fails to compile here until it is placed.
 #[test]
 fn the_source_spellings_are_the_schemas_and_the_join_keys() {
     let every = [
@@ -244,9 +239,6 @@ fn the_source_spellings_are_the_schemas_and_the_join_keys() {
     assert_eq!(spelled, every.map(Source::as_str));
 }
 
-/// This binary's own stamp: a source exactly where a revision, one of the four spellings, a
-/// rustflags digest of sixty-four hex digits where any, and `--version` printing what the
-/// constants hold, in [`revision::version_words`]'s words.
 #[test]
 fn this_build_publishes_its_source_beside_its_revision_and_says_it_in_its_version() {
     use chard::report::{HARNESS_REVISION, HARNESS_REVISION_SOURCE, HARNESS_RUSTFLAGS_SHA256};
@@ -275,7 +267,7 @@ fn this_build_publishes_its_source_beside_its_revision_and_says_it_in_its_versio
             "{digest}"
         );
     }
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_chard"))
+    let out = std::process::Command::new(common::chard_binary())
         .arg("--version")
         .output()
         .expect("chard runs");

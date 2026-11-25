@@ -1,163 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! `chard detect`: one check's decoder, run alone over evidence a reader supplies.
-//!
-//! A report states each predicate reading as a value (`report::Decoded`) beside the
-//! predicate that produced it (`decoders`) and the facts it read (`facts`), and
-//! `decoded-reading-disagrees-with-facts` replays every one before the report is
-//! published. That rule runs inside the chard that measured. This module is the same replay
-//! run from outside: it reads a report as JSON, through `serde_json::Value` and the types
-//! that deserialize (`predicate::Predicate`, `elf::ElfFacts`, the fixture records), never
-//! through the in-memory `report::Report` a measurement builds, so a report copied off the
-//! machine that produced it can be checked with nothing but this binary.
-//!
-//! # Inputs
-//!
-//! `--evidence FILE` is sniffed, in this order:
-//!
-//! - **report**, an object that is not `chard elf` output (below) with a `chard_schema` and
-//!   an `observations` list: every
-//!   reading of the check, on the measured build and on each control arm, is re-evaluated
-//!   with the report's own `decoders` predicate over the report's `facts` through the
-//!   Published view
-//!   (`predicate::Published`), and compared with its `decoded`. See [`replay_report`].
-//!   The environment is not read: `kernel.ownership` and `is_host_kernel` are held by
-//!   `table` and `matrix` (`report::reread_contradictions`), and a report without the first,
-//!   or with either edited, replays as it would otherwise. An object with a `chard_schema`
-//!   string and no `observations` list has the shape of chard's other documents (a matrix, a
-//!   probe listing, `detect`'s own output, whose `observations` is a count, or an error
-//!   envelope, each versioned under the same key), and is refused as not a
-//!   report rather than replayed as a report missing its readings. Either shape, and an
-//!   `observations` list with no `chard_schema` or a `chard_schema` of any type, is first
-//!   held to the version this chard reads (`dataset::refuse_other_schema`, the comparison
-//!   `table` makes): a report of another version is refused, not replayed, and one whose
-//!   version was removed or retyped is not read as a record. A report without a `digest` is replayed, as
-//!   a quarantined one is: the replay re-derives readings from the report's facts rather
-//!   than rendering its verdicts.
-//! - **`chard elf` output**, an object whose every value is an object with `elf_class`
-//!   and `machine`: one path and its `ElfFacts`. Tested before every other shape, the
-//!   report's included, because its keys are the paths a caller typed, and a path named
-//!   `chard_schema`, `kind`, `run` or `elf` would otherwise read as one of them. A record whose only member is `elf` has
-//!   this shape too, and is read as an object named `elf` with its self-report as the
-//!   macro source; a record that names its `check` is not.
-//! - **store entry**, an object with `kind`: one `facts` entry, evaluated alone.
-//! - **record**, an object with any of `macros`, `elf`, `build` or `run`, the shape of a
-//!   fixture in `tests/fixtures/detectors.json`: run through `probe::Check::decode`, the
-//!   entry point a measurement reads through, for a code decoder as well as a predicate.
-//!
-//! `--artifact FILE` reads an ELF object with `elf::facts_for` and evaluates the check's
-//! predicate over it, with the artifact's `.chard.report` as the macro source by the rule
-//! `measure` applies: present when the section parses to at least one macro, and otherwise
-//! absent, which the predicate reads as `@no-source:macros` where it needs macros.
-//!
-//! Everything but a report prints a **detection**: one decoder over one set of facts, with
-//! no control triple behind it, so never a verdict. A standalone `elf` entry, `chard elf`
-//! output and an artifact are read with the Live view, whose watch list is this binary's
-//! `elf::WATCHED_SYMBOLS`; a report is read with the watch list it publishes. A standalone
-//! `macro-dump` entry is read with this binary's macro filter when the entry names that
-//! filter's digest, and otherwise with the entry's own names as the filter, so a name the
-//! entry does not hold is `Incomplete` rather than undefined.
-//!
-//! # Counting
-//!
-//! A report replay counts the readings it was owed against what it did with them:
-//! `expected == replayed + not_replayable.len()`, published in the output and held by
-//! [`Replay::closes`]. A reading is owed at the measured build of an observation that
-//! reached its decoder (built its control triple, or published `on`, `off`, `partial` or
-//! `probe-invalid`, the rule (a) `report::decoded_readings_agree` holds a report to) and
-//! at every control arm with an `outcome`, and at any site that publishes a `decoded`
-//! whatever else it carries. A check whose every observation was withheld before its
-//! decoder ran owes none: `expected: 0` is its complete account, and exits 0.
-//!
-//! The work is counted from the report, so the report's count is published beside it:
-//! `observations` is the number of observations of the check, and a report with none is
-//! refused (exit 2) rather than closed at `expected: 0`. Closed there, the two cases would
-//! print the same output, and a report stripped of a check's observations would replay as
-//! a clean zero.
-//!
-//! # Restatement
-//!
-//! A reading re-derived from its facts says nothing about the verdict published beside it
-//! unless the verdict is held to the reading too. `restated` holds, at every site that
-//! publishes a reading, what the report's consistency rules (c) and (d) hold
-//! (`report::decoded_readings_agree`): a control arm's `outcome` is its reading's outcome,
-//! and a measured `on`, `off` or `partial` with its `level` is what
-//! [`crate::report::restated_verdict`] gives the measured reading on this binary's scale
-//! for the check. Each reading's `facts` and `macros` keys are held to the digests its own
-//! site's record publishes (`report::unbound_reading_keys`, the first half of the report's
-//! rule (b)), so a reading moved to another build's facts disagrees even where it replays;
-//! and a measured `on`, `off` or `partial` is held to the control triple published beside
-//! it, as the report's rule `verdict-unearned-by-controls` holds it: a positive arm
-//! `present`, a negative arm `absent`, any regime arm `absent`, and `discriminating`.
-//! Without either, a `probe-invalid` edited to the `off` its measured reading licenses, or
-//! an `off` with its `controls` deleted, would replay as agreeing. The triple needs no
-//! reading, so it is restated on every check, a code decoder's included, with each arm's
-//! `outcome` read as published where no reading restates it. Restated on a predicate check
-//! only, an `off` with its `controls` deleted from a `runtime` or `compiler-diag` check
-//! would exit 0.
-//! Whether a regime arm is owed is derived, not read off the triple: this binary's
-//! declaration of the check and the report's `profile`
-//! ([`Check::owes_regime_control`]), and an owed arm that is unpublished or states no
-//! `outcome` withholds. A `probe-invalid` beside a triple is held to it too, and
-//! disagrees where the triple discriminated, as in the report's rule. Owing an arm only
-//! where one is published would let an `on` with its regime arm deleted from a report
-//! measured under a profile exit 0, and would leave a measured verdict relabelled
-//! `probe-invalid` unrestated. `indeterminate`,
-//! `unsupported` and `not-applicable` beside a discriminating triple are not restated:
-//! they are what a gating rule or the fortify ratchet leaves, a replay re-derives
-//! neither, and so a measurement relabelled as one of them replays as agreeing. That is
-//! the limit of this command; `THREAT_MODEL.md` names what holds those three instead.
-//! A measured verdict is restated whether or not the observation carries a
-//! `gating`: the report's rule (d) skips a gated observation because
-//! `gating_verdict_agrees` pins its verdict to the rule's premise, and no premise publishes
-//! a measurement. A replay does not re-derive that rule, so a measured verdict beside a
-//! `gating` is held to its reading here, and a verdict moved to `off` with a `gating`
-//! added exits 1. A replay that skipped such a verdict would read that edit as agreeing.
-//!
-//! A reading not replayed is named with its reason:
-//!
-//! - `code-decoder`: an arm of a code-decoded check whose decoder reads an artifact the
-//!   store does not keep ([`READS_UNSTORED_ARTIFACT`]). A record that does not read as the
-//!   decoder's input, or an artifact key the store does not resolve, is a report that
-//!   cannot be used, and is refused;
-//! - `record-cut`: a code decoder's site whose build or run record carries the excerpt
-//!   budget's cut marker (`probe::CUT_MARKER`), so no replay could be exact;
-//! - `unkept-c-int-follow`: a `c-int` term followed a value to a macro name outside the
-//!   published filter (`report::NotReplayable`). A value stated beside such a reading (a
-//!   measured verdict, an arm's `outcome`) is restated to nothing and disagrees, since
-//!   no replay verified the reading it would be held to; held to the published reading, it
-//!   would agree;
-//! - `reading-absent`: a site that owes a reading publishes none. This one is a
-//!   disagreement, and exits 1.
-//!
-//! A code decoder, which a report cannot carry, is replayed through this binary's own
-//! decoder over the records its site publishes (`replay_code`): the build and run as
-//! published, the ELF facts the store holds under the build's artifact, and the macros that
-//! artifact's `.chard.report` carries, with the two gates `measure` applies after a code
-//! decoder. The replay trusts this binary's decoder source, which `run.decoders_sha256`
-//! fingerprints; a report from another revision replays against today's decoder. Its
-//! reading is restated against what the site states, an arm's `outcome` or the measured
-//! verdict. Counting every such reading `code-decoder` would let a measured `on` swapped for
-//! `off` beside an intact triple exit 0.
-//!
-//! # Exit codes
-//!
-//! The statuses are the CLI's contract (`DESIGN.md`, "The command-line contract").
-//! For `detect`: `0` when every replayed reading agrees and nothing owed is absent, or a
-//! detection was made; `1` (`error::EXIT_GATE`) on any disagreement, a tripped gate with the
-//! document written, as `measure --fail-on-missing` trips one, including a stated
-//! outcome or verdict its reading does not license, a stated outcome or verdict beside a
-//! reading the replay could not re-derive, a measured verdict its triple did not
-//! earn, a reading key its site's record does not publish, a published
-//! predicate whose digest is not its canonical form's, a record whose `expected` or
-//! `expected_level` the decoder does not reproduce, and a reading whose facts cannot answer
-//! its own predicate; `2` for an input that cannot be used, through the error envelope. A
-//! required input that is missing is named and refused, never read as absent: a report with
-//! a reading of the check and no `decoders` entry for it, a report with no observation of
-//! the check, a key naming no store entry, a store entry of a kind this binary does not
-//! know. A disagreement is a finding about the input, so it is never `3`, which is chard's
-//! own contradiction alone (`error::EXIT_CONTRADICTION`): a caller routing `3` to a chard bug
-//! report would otherwise file one for every report that fails here.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -323,11 +166,10 @@ pub struct Replayed {
 }
 
 /// A value a report states beside a reading, held to what the reading licenses: an arm's
-/// `outcome` against its `decoded.outcome` (rule (c) of the report's own consistency
-/// check), a measured `verdict` and `level` against the verdict the measured
-/// reading licenses on the check's scale (rule (d), [`crate::report::restated_verdict`]),
-/// a measured `verdict` against the triple beside it (`earned`), and a reading's keys
-/// against its site's record (`keys_restated`).
+/// `outcome` against its `decoded.outcome` (the report's rule (c)), a measured `verdict` and
+/// `level` against the verdict the measured reading licenses on the check's scale (rule (d),
+/// [`crate::report::restated_verdict`]), a measured `verdict` against the triple beside it
+/// (`earned`), and a reading's keys against its site's record (`keys_restated`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Restated {
     pub probe: String,
@@ -354,6 +196,51 @@ pub struct Restated {
 /// `schema/chard-detect.schema.json`, under the rule the CLI's contract states.
 pub const SCHEMA_VERSION: &str = "1";
 
+/// What a replay of one observation's gating found: [`crate::listings::GateReplay`], and
+/// `listings-unpublished` for a report that publishes no `listings` and was not measured by
+/// this binary's code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateOutcome {
+    Agrees,
+    Disagrees,
+    NotReached,
+    Overwritten,
+    ListingsUnpublished,
+}
+
+impl From<crate::listings::GateReplay> for GateOutcome {
+    fn from(replay: crate::listings::GateReplay) -> Self {
+        match replay {
+            crate::listings::GateReplay::Agrees => Self::Agrees,
+            crate::listings::GateReplay::Disagrees => Self::Disagrees,
+            crate::listings::GateReplay::NotReached => Self::NotReached,
+            crate::listings::GateReplay::Overwritten => Self::Overwritten,
+        }
+    }
+}
+
+/// One observation's gating, held to the listing rules re-derived from the driver's answers
+/// the report publishes for its probe ([`crate::listings`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct GateReplayed {
+    pub probe: String,
+    /// The published verdict.
+    pub verdict: String,
+    /// The published `gating.rule`; `None` where the observation carries no gating.
+    pub rule: Option<String>,
+    pub outcome: GateOutcome,
+    /// The rule the listing rules give over the published listings, `None` where none
+    /// fires: one entry for the published verdict, or one per verdict the rules tell apart
+    /// where the published rule is one of theirs ([`crate::listings::replay_gate`]). Empty
+    /// where no replay ran.
+    pub rederived: Vec<Option<&'static str>>,
+    /// Why the replay disagrees without a rederived rule to show it, or what it could not
+    /// read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// A report's readings of one check, replayed.
 #[derive(Debug, Clone, Serialize)]
 pub struct Replay {
@@ -379,14 +266,23 @@ pub struct Replay {
     /// Every arm outcome and measured verdict stated beside a published reading,
     /// against the reading.
     pub restated: Vec<Restated>,
+    /// Every observation's gating against the listing rules, one per observation where the
+    /// replay covers the measured build (no `--arm`, or `--arm measured`).
+    pub gates: Vec<GateReplayed>,
 }
 
 impl Replay {
     /// `expected == replayed + not_replayable.len()`, and `replayed` is the replays listed.
     #[must_use]
     pub fn closes(&self) -> bool {
+        let gates_owed = if self.arm.is_none_or(|a| a == ArmSel::Measured.as_str()) {
+            self.observations
+        } else {
+            0
+        };
         self.replayed == self.replays.len()
             && self.expected == self.replayed.saturating_add(self.not_replayable.len())
+            && self.gates.len() == gates_owed
     }
 
     /// Whether the report agrees with itself on this check: the counts close, the
@@ -400,6 +296,10 @@ impl Replay {
             && self.replays.iter().all(|r| r.agrees)
             && self.restated.iter().all(|r| r.agrees)
             && self
+                .gates
+                .iter()
+                .all(|g| g.outcome != GateOutcome::Disagrees)
+            && self
                 .not_replayable
                 .iter()
                 .all(|n| n.reason != REASON_READING_ABSENT)
@@ -409,16 +309,6 @@ impl Replay {
 const REASON_CODE: &str = "code-decoder";
 
 /// The code-decoded checks whose decoder reads the artifact without declaring a table.
-///
-/// The store keeps an arm's artifact only for a check that reads one
-/// (`report::stores_arm_artifacts`: the macro and `elf-static` channels, and any check
-/// declaring the tables it reads), so an arm of any other code-decoded check is replayed
-/// over its build and run records alone. That is exact for a decoder that reads nothing
-/// else, and these are the ones that do: `cxx-stdlib-assertions` reads which C++ standard
-/// library the artifact's `.chard.report` names. Their arms stay `code-decoder` where the
-/// store holds no artifact. `tests/detector_replay.rs` holds the list to the recorded
-/// evidence in both directions: every other such decoder reads the same with the artifact
-/// taken away, and every one listed here does not.
 pub const READS_UNSTORED_ARTIFACT: &[&str] = &["cxx-stdlib-assertions"];
 const REASON_CUT: &str = "record-cut";
 const REASON_FOLLOW: &str = "unkept-c-int-follow";
@@ -437,8 +327,7 @@ fn required<'a>(doc: &'a Value, path: &[&str]) -> Result<&'a Value, UserError> {
 fn missing(what: &str) -> UserError {
     UserError::with_hint(
         format!("the report has no `{what}`, which the replay needs"),
-        "a report chard writes carries it; pass one, or the file the \
-         reading's facts are in with --evidence",
+        "a report chard writes carries it; pass one, or the file the reading's facts are in with --evidence",
     )
 }
 
@@ -466,9 +355,8 @@ struct Site<'a> {
     arm: ArmSel,
     /// The site's `decoded`, when it publishes one.
     decoded: Option<&'a Value>,
-    /// The value stated beside the reading that restates it, with a level: an arm's
-    /// `outcome`, or a measured `verdict` of `on`, `off` or `partial` and its
-    /// `level`. `None` where no rule holds the site to its reading.
+    /// An arm's `outcome`, or a measured `on`, `off` or `partial` and its `level`: what
+    /// [`restate`] holds to the reading. `None` where no rule holds the site to its reading.
     stated: Option<(Option<&'a str>, Option<&'a str>)>,
     /// Whether the site owes a reading.
     owed: bool,
@@ -476,11 +364,11 @@ struct Site<'a> {
     run: Option<&'a Value>,
     /// The digests the site's record publishes, which its reading's keys are held to.
     keys: crate::report::SiteKeys<'a>,
-    /// The observation's `controls`, on the measured site: the triple a measured verdict
-    /// is held to. `None` on an arm, and where the observation publishes none.
+    /// The observation's `controls`, on the measured site; `None` on an arm, and where the
+    /// observation publishes none.
     controls: Option<&'a Value>,
-    /// The observation's `verdict`, whatever it is, on the measured site: the value
-    /// [`earned`] holds to the triple. `None` on an arm.
+    /// The observation's `verdict`, whatever it is, on the measured site, which [`earned`]
+    /// holds to the triple; `None` on an arm.
     verdict: Option<&'a str>,
 }
 
@@ -507,8 +395,7 @@ fn sites_of(o: &Value) -> Vec<Site<'_>> {
         controls.is_some() || matches!(verdict, Some("on" | "off" | "partial" | "probe-invalid"));
     let measured_decoded = o.get("evidence").and_then(|e| e.get("decoded"));
     // Every measured verdict is restated, whatever `gating` says: no gating premise
-    // publishes `on`, `off` or `partial` (`gating_rule::Premise::verdict`), and a replay
-    // does not re-derive the gating rule the report's rule (d) leans on to skip one.
+    // publishes `on`, `off` or `partial` (`gating_rule::Premise::verdict`).
     let measurement = matches!(verdict, Some("on" | "off" | "partial"));
     let mut out = vec![Site {
         arm: ArmSel::Measured,
@@ -697,9 +584,8 @@ fn restate(check: &Check, probe_id: &str, site: &Site<'_>, decoded: &Value) -> O
     })
 }
 
-/// `stated` beside a reading the replay could not re-derive: the reading licenses
-/// nothing a reader can check, so the value stated beside it restates to nothing and
-/// disagrees. Held as agreeing, a verdict edited to the one a forged reading licenses
+/// `stated` beside a reading the replay could not re-derive, restated to nothing and
+/// disagreeing. Held as agreeing, a verdict edited to the one a forged reading licenses
 /// would be certified by a reading no replay verified.
 fn unverified(stated: Restated) -> Restated {
     Restated {
@@ -722,25 +608,31 @@ fn outcome_of(arm: &Value) -> Option<&str> {
 
 /// A measured verdict held to the control triple published beside it: the report's rule
 /// `verdict-unearned-by-controls`, restated from the JSON.
-///
-/// The triple earns a measurement when its positive arm's `outcome` is `present`, its
-/// negative arm's `absent`, any regime arm's `absent`, and `discriminating` is `true`; each
-/// arm's `outcome` is itself restated against its reading. A regime arm is owed where
-/// `regime_owed` says so ([`Check::owes_regime_control`] over the report's `profile`),
-/// and an owed arm that is unpublished or states no `outcome` withholds, as the required
-/// arm that could not be evaluated does in `decide`.
-///
-/// Two verdicts are held to it. A measured `on`, `off` or `partial` restates to itself
-/// where the triple earned it, and to `probe-invalid` where a triple is published and did
-/// not. A `probe-invalid` beside a triple restates to `probe-invalid` where the triple
-/// withheld and to nothing where it discriminated, since a discriminating triple reaches
-/// `decide`'s verdict arm and nothing later writes `probe-invalid`. `None` on an arm, on a
-/// `probe-invalid` with no triple, and on every other verdict: `indeterminate`,
-/// `unsupported` and `not-applicable` beside a discriminating triple are what a gating
-/// rule or the fortify ratchet leaves, and a replay re-derives neither.
-fn earned(probe_id: &str, site: &Site<'_>, regime_owed: bool) -> Option<Restated> {
+fn earned(
+    probe_id: &str,
+    site: &Site<'_>,
+    regime_owed: bool,
+    regime_flags: &RegimeFlags,
+) -> Option<Restated> {
     if site.arm != ArmSel::Measured {
         return None;
+    }
+    let entry = |restated: Option<String>| Restated {
+        probe: probe_id.to_owned(),
+        arm: site.arm.as_str(),
+        field: "controls",
+        stated: site.verdict.map(ToOwned::to_owned),
+        stated_level: None,
+        agrees: restated.is_some() && restated.as_deref() == site.verdict,
+        restated,
+        restated_level: None,
+    };
+    let unbuilt_regime = site
+        .controls
+        .and_then(|c| published_arm(c, "regime_negative"))
+        .is_some_and(|a| !regime_flags.hold(a));
+    if unbuilt_regime {
+        return Some(entry(None));
     }
     let verdict = site.verdict?;
     let measurement = matches!(verdict, "on" | "off" | "partial");
@@ -763,23 +655,13 @@ fn earned(probe_id: &str, site: &Site<'_>, regime_owed: bool) -> Option<Restated
         (true, false) => None,
         (false, _) => site.controls.map(|_| "probe-invalid".to_owned()),
     };
-    Some(Restated {
-        probe: probe_id.to_owned(),
-        arm: site.arm.as_str(),
-        field: "controls",
-        stated: Some(verdict.to_owned()),
-        stated_level: None,
-        agrees: restated.as_deref() == Some(verdict),
-        restated,
-        restated_level: None,
-    })
+    Some(entry(restated))
 }
 
-/// Whether the report's observations of `check` owe a regime-matched negative arm: the
-/// check's declaration in this binary's corpus and the report's `profile`, read as
-/// `measure::Conditions::profile_is_clean` reads it, a flag list the report omits being
-/// an empty one. The `profile` is read only for a check that can owe the arm, and is
-/// refused as missing where it is absent or a flag list is not a list of strings.
+/// Whether the report's observations of `check` owe a regime-matched negative arm, from the
+/// check's declaration in this binary's corpus and whether the report's `profile` is clean
+/// (a flag list it omits is empty). The `profile` is read only for a check that can owe the
+/// arm, and is refused as missing where it is absent or a flag list is not a list of strings.
 fn regime_owed(report: &Value, check: &Check) -> Result<bool, UserError> {
     if !check.owes_regime_control(false) {
         return Ok(false);
@@ -797,6 +679,61 @@ fn regime_owed(report: &Value, check: &Check) -> Result<bool, UserError> {
         clean &= flags.is_empty();
     }
     Ok(check.owes_regime_control(clean))
+}
+
+/// What a published regime arm's `flags` are held to, for [`earned`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegimeFlags {
+    /// A report of another corpus, whose checks may declare other arms: the flags are read
+    /// as written.
+    Unheld,
+    /// The list `measure` builds the arm with ([`crate::measure::regime_arm_flags`]) under
+    /// the report's `profile`.
+    Owed(Vec<String>),
+    /// The check declares no regime arm, so in a report of this corpus a published one was
+    /// built by no chard.
+    Undeclared,
+}
+
+impl RegimeFlags {
+    /// Whether `arm`'s published `flags` are the ones held: a list of strings equal to the
+    /// owed list, word for word and in order.
+    fn hold(&self, arm: &Value) -> bool {
+        match self {
+            Self::Unheld => true,
+            Self::Undeclared => false,
+            Self::Owed(owed) => arm
+                .get("flags")
+                .and_then(Value::as_array)
+                .is_some_and(|flags| {
+                    flags.len() == owed.len()
+                        && flags
+                            .iter()
+                            .zip(owed)
+                            .all(|(f, o)| f.as_str() == Some(o.as_str()))
+                }),
+        }
+    }
+}
+
+/// What the report's regime arms of `check` are held to, as the report's rule
+/// `verdict-unearned-by-controls` holds them at publication. The declared arm is this
+/// binary's corpus's, so the list is held only in a report whose `run.probe_corpus_sha256`
+/// is this binary's. The `profile` is read only for a check that declares an arm, and is
+/// refused as missing where it is absent or a flag list is not a list of strings.
+fn regime_flags(report: &Value, check: &Check) -> Result<RegimeFlags, UserError> {
+    if !crate::report::of_this_corpus(report) {
+        return Ok(RegimeFlags::Unheld);
+    }
+    // `check` is this corpus's, so its probe is found.
+    let (Some(probe), Some(_)) = (probe::probe_of_check(check.id), check.regime_arm()) else {
+        return Ok(RegimeFlags::Undeclared);
+    };
+    let (c, cxx, ld) = profile_lists(report)?;
+    Ok(
+        crate::measure::regime_arm_flags((&c, &cxx, &ld), probe.lang, check)
+            .map_or(RegimeFlags::Undeclared, RegimeFlags::Owed),
+    )
 }
 
 /// A reading's `facts` and `macros` keys held to the digests its site's record publishes
@@ -881,8 +818,7 @@ fn replay_one(
                     .as_deref()
                     .map_or_else(String::new, |k| format!(" and facts[{k}]"))
             ),
-            "the store is incomplete or holds a kind this binary does not know; a reading is \
-             never replayed over facts it does not name",
+            "the store is incomplete or holds a kind this binary does not know",
         )
     })?;
     let view = predicate::Published::new(
@@ -935,11 +871,9 @@ fn replay_one(
     }
 }
 
-/// The report's observations of `check`, at least one.
-///
-/// Counting from the input being audited would close a report that never measured the
-/// check at `expected: 0`, the same output as a check withheld before its decoder ran: a
-/// loop over nothing that exits 0. So none is a refusal.
+/// The report's observations of `check`, at least one: closed at `expected: 0`, a report
+/// that never measured the check would print what a check withheld before its decoder ran
+/// prints, a loop over nothing that exits 0, so none is a refusal.
 fn observations_of<'a>(report: &'a Value, check: &Check) -> Result<Vec<&'a Value>, UserError> {
     let mine: Vec<&Value> = required(report, &["observations"])?
         .as_array()
@@ -950,11 +884,295 @@ fn observations_of<'a>(report: &'a Value, check: &Check) -> Result<Vec<&'a Value
     if mine.is_empty() {
         return Err(UserError::with_hint(
             format!("the report has no observation of {}", check.id),
-            "a report observes every check of the corpus it was measured with; this one \
-             was measured with another corpus, or was cut",
+            "a report observes every check of the corpus it was measured with",
         ));
     }
     Ok(mine)
+}
+
+/// A profile's three flag lists: `cflags`, `cxxflags` and `ldflags`.
+type ProfileLists = (Vec<String>, Vec<String>, Vec<String>);
+
+/// The report's `profile` as its three lists, a list the report omits read as empty.
+fn profile_lists(report: &Value) -> Result<ProfileLists, UserError> {
+    let profile = required(report, &["profile"])?;
+    let list = |member: &str| -> Result<Vec<String>, UserError> {
+        let Some(flags) = profile.get(member) else {
+            return Ok(Vec::new());
+        };
+        flags
+            .as_array()
+            .and_then(|f| {
+                f.iter()
+                    .map(|w| w.as_str().map(ToOwned::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| missing(&format!("profile.{member}")))
+    };
+    Ok((list("cflags")?, list("cxxflags")?, list("ldflags")?))
+}
+
+/// The flags the report's `profile` hands a `lang` build ([`crate::measure::profile_flags_for`]),
+/// a list the report omits read as empty, and whether the profile adds none.
+fn published_profile(report: &Value) -> Result<(Vec<String>, Vec<String>, bool), UserError> {
+    let (c, cxx, ld) = profile_lists(report)?;
+    let clean = c.is_empty() && cxx.is_empty() && ld.is_empty();
+    let lists = (c.as_slice(), cxx.as_slice(), ld.as_slice());
+    Ok((
+        crate::measure::profile_flags_for(lists, probe::Lang::C),
+        crate::measure::profile_flags_for(lists, probe::Lang::Cxx),
+        clean,
+    ))
+}
+
+/// Every observation of `check` held to the listing rules re-derived from the report's
+/// `listings` ([`crate::listings::replay_gate`]): the published rule, or its absence, must be
+/// what the rules give over the driver's answers published for the observation's probe.
+fn replay_gates(
+    report: &Value,
+    check: &Check,
+    observations: &[&Value],
+) -> Result<Vec<GateReplayed>, UserError> {
+    let (c_flags, cxx_flags, clean) = published_profile(report)?;
+    let published = PublishedListings {
+        member: report.get("listings"),
+        ours: report
+            .get("run")
+            .and_then(|r| r.get("decoders_sha256"))
+            .and_then(Value::as_str)
+            == Some(probe::decoders_sha256().as_str()),
+        c_flags,
+        cxx_flags,
+        clean,
+    };
+    observations
+        .iter()
+        .enumerate()
+        .map(|(index, o)| gate_of(&published, check, index, o))
+        .collect()
+}
+
+/// What [`replay_gates`] reads of a report beside each observation: its `listings` member, whether
+/// its `run.decoders_sha256` is this binary's, and its profile's flags for each language.
+struct PublishedListings<'a> {
+    member: Option<&'a Value>,
+    ours: bool,
+    c_flags: Vec<String>,
+    cxx_flags: Vec<String>,
+    clean: bool,
+}
+
+/// One observation's gate ([`replay_gates`]).
+fn gate_of(
+    published: &PublishedListings<'_>,
+    check: &Check,
+    index: usize,
+    o: &Value,
+) -> Result<GateReplayed, UserError> {
+    let at = |what: &str| format!("observations[{}#{index}].{what}", check.id);
+    let probe_id = o
+        .get("probe")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing(&at("probe")))?;
+    let verdict_text = o
+        .get("verdict")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing(&at("verdict")))?;
+    let verdict: crate::report::Verdict = serde_json::from_value(Value::from(verdict_text))
+        .map_err(|_unknown| missing(&at("verdict")))?;
+    let gated = o.get("gating").is_some_and(|g| !g.is_null());
+    let rule = o
+        .get("gating")
+        .and_then(|g| g.get("rule"))
+        .and_then(Value::as_str);
+    let mut gate = GateReplayed {
+        probe: probe_id.to_owned(),
+        verdict: verdict_text.to_owned(),
+        rule: rule.map(ToOwned::to_owned),
+        outcome: GateOutcome::Disagrees,
+        rederived: Vec::new(),
+        detail: None,
+    };
+    if gated && rule.is_none() {
+        gate.detail = Some(format!(
+            "{} carries no rule, so its place on the ladder cannot be shown",
+            at("gating")
+        ));
+        return Ok(gate);
+    }
+    // The triple's state is the published `controls.discriminating`, not re-derived from its
+    // arms as `earned` reads them: a declared rule's gating beside a triple edited from
+    // discriminating to withheld agrees, a relabel that withholds a cell and publishes no
+    // `on` or `off`.
+    let triple = match o.get("controls").filter(|c| c.is_object()) {
+        None => crate::listings::TripleSeen::Absent,
+        Some(c) if c.get("discriminating").and_then(Value::as_bool) == Some(true) => {
+            crate::listings::TripleSeen::Discriminating
+        }
+        Some(_) => crate::listings::TripleSeen::Withheld,
+    };
+    match crate::listings::before_listings(verdict, rule, triple) {
+        Ok(Some(placed)) => {
+            gate.outcome = placed.into();
+            if placed == crate::listings::GateReplay::Disagrees {
+                gate.detail = Some(
+                    "the gating is not one the ladder publishes beside this verdict and control triple"
+                        .to_owned(),
+                );
+            }
+            return Ok(gate);
+        }
+        Ok(None) => {}
+        Err(id) => {
+            gate.detail = Some(format!("the rule {id} is not one this binary knows"));
+            return Ok(gate);
+        }
+    }
+    match against_listings(published, check, probe_id, verdict, rule)? {
+        Ok((outcome, rederived)) => {
+            gate.outcome = outcome;
+            gate.rederived = rederived;
+        }
+        Err(Unreplayed::Unpublished) => gate.outcome = GateOutcome::ListingsUnpublished,
+        Err(Unreplayed::Disagrees(why)) => gate.detail = Some(why),
+    }
+    Ok(gate)
+}
+
+/// A gate's outcome and its rederived rules, or why no rule was replayed.
+type ListingReplay = Result<(GateOutcome, Vec<Option<&'static str>>), Unreplayed>;
+
+/// Why [`against_listings`] replayed no rule: a report with no record whose
+/// `run.decoders_sha256` is not this binary's, or one whose record cannot be the one `measure`
+/// writes.
+enum Unreplayed {
+    Unpublished,
+    Disagrees(String),
+}
+
+/// One observation reached by the listing rules, held to them over its probe's published
+/// record ([`crate::listings::replay_gate`]).
+fn against_listings(
+    published: &PublishedListings<'_>,
+    check: &Check,
+    probe_id: &str,
+    verdict: crate::report::Verdict,
+    rule: Option<&str>,
+) -> Result<ListingReplay, UserError> {
+    let Some(member) = published.member else {
+        return Ok(Err(if published.ours {
+            Unreplayed::Disagrees(
+                "the report names this binary's decoders_sha256 and publishes no listings"
+                    .to_owned(),
+            )
+        } else {
+            Unreplayed::Unpublished
+        }));
+    };
+    let Some(probe) = probe::CORPUS
+        .iter()
+        .find(|p| p.id == probe_id && p.checks.iter().any(|c| c.id == check.id))
+    else {
+        return Ok(Err(Unreplayed::Disagrees(format!(
+            "the probe {probe_id} is not one of this binary's corpus that holds {}",
+            check.id
+        ))));
+    };
+    let record: crate::listings::Listings = match member.get(probe_id) {
+        None => crate::listings::Listings::default(),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
+            UserError::with_hint(
+                format!("listings[{probe_id}] does not read as the driver's answers: {e}"),
+                "a record this binary cannot read is refused rather than replayed as empty",
+            )
+        })?,
+    };
+    let findings = match held_listings(published, probe, &record) {
+        Ok(findings) => findings,
+        Err(why) => return Ok(Err(Unreplayed::Disagrees(why))),
+    };
+    let measured = match probe.lang {
+        probe::Lang::C => &published.c_flags,
+        probe::Lang::Cxx => &published.cxx_flags,
+    };
+    let classes = crate::listings::arm_optimization_classes(check, measured, published.clean);
+    let held = findings.for_check(check, &classes);
+    let branches = crate::measure::branches_on_macros(probe.id);
+    Ok(
+        match crate::listings::replay_gate(check, verdict, rule, branches, &held) {
+            Ok((replay, rederived)) => Ok((replay.into(), rederived)),
+            Err(id) => Err(Unreplayed::Disagrees(format!(
+                "the rule {id} is not one this binary knows"
+            ))),
+        },
+    )
+}
+
+/// The findings `record` gives `probe`, or why it is not the record `measure` writes for the
+/// probe under the published profile: comparisons other than the ones the probe owes
+/// ([`crate::listings::Owed`]), an answer out of the comparisons' order, a path its
+/// comparisons read that it does not answer, or arm class listings other than the ones the
+/// compile comparison owes ([`class_shortfall`]).
+fn held_listings(
+    published: &PublishedListings<'_>,
+    probe: &probe::Probe,
+    record: &crate::listings::Listings,
+) -> Result<crate::listings::Findings, String> {
+    let unmet = crate::listings::Owed::of(probe, published.clean).unmet_by(record);
+    if !unmet.is_empty() {
+        return Err(format!(
+            "listings[{}] does not hold the comparisons the probe owes under this profile: {}",
+            probe.id,
+            unmet.join(", ")
+        ));
+    }
+    let paths = crate::listings::Recorded::new(&record.paths);
+    let findings = crate::listings::findings(record, &paths)
+        .map_err(|crate::listings::Malformed(why)| format!("listings[{}]: {why}", probe.id))?;
+    let unanswered = paths.unanswered();
+    if !unanswered.is_empty() {
+        let named: Vec<&str> = unanswered.iter().map(String::as_str).collect();
+        return Err(format!(
+            "listings[{}].paths answers none of {}",
+            probe.id,
+            named.join(", ")
+        ));
+    }
+    let measured = match probe.lang {
+        probe::Lang::C => &published.c_flags,
+        probe::Lang::Cxx => &published.cxx_flags,
+    };
+    match class_shortfall(probe, record, &findings, measured, published.clean) {
+        Some(why) => Err(why),
+        None => Ok(findings),
+    }
+}
+
+/// Where `record`'s arm class listings are not the ones the compile comparison owes
+/// ([`crate::listings::owed_classes`]): it asks for them, in that order, exactly where the
+/// measured listing and the stand-in were read and agree, which is where `findings` names no
+/// whole-probe difference. `None` where they are.
+fn class_shortfall(
+    probe: &probe::Probe,
+    record: &crate::listings::Listings,
+    findings: &crate::listings::Findings,
+    measured: &[String],
+    clean: bool,
+) -> Option<String> {
+    let compile = record.compile.as_ref()?;
+    let words: Vec<&Vec<String>> = compile.classes.iter().map(|c| &c.words).collect();
+    let owed = if findings.compile.whole.is_none() {
+        crate::listings::owed_classes(probe, measured, clean)
+    } else {
+        Vec::new()
+    };
+    let same = words.len() == owed.len() && words.iter().zip(&owed).all(|(w, o)| *w == o);
+    (!same).then(|| {
+        format!(
+            "listings[{}].compile.classes are not the arm classes the probe's checks owe",
+            probe.id
+        )
+    })
 }
 
 /// Every site of `observations` that owes a reading, restricted to `arm` where one is
@@ -977,14 +1195,9 @@ fn owed_sites<'a>(
 
 /// A site of a code-decoded check, replayed through this binary's decoder over the records
 /// the site publishes: the build and run as published, the ELF facts stored under the
-/// build's artifact, and the macros that artifact's `.chard.report` carries, which is the
-/// map `measure` hands a probe with no macro-channel check. The reading passes the two
-/// gates `measure` applies after a code decoder (`report::truncated_reading`, then
-/// `report::cut_stream_reading`), so a replay withholds where the measurement did.
-///
-/// `Err` where the site cannot be replayed exactly: a record cut by an excerpt budget
-/// (`record-cut`), or a record that does not read as the type the decoder takes, or an
-/// artifact the store cannot resolve (`code-decoder`).
+/// build's artifact, and the macros that artifact's `.chard.report` carries. The reading
+/// passes the two gates `measure` applies after a code decoder (`report::truncated_reading`,
+/// then `report::cut_stream_reading`), so a replay withholds where the measurement did.
 fn replay_code(
     store: &crate::report::FactStore,
     check: &Check,
@@ -1021,8 +1234,7 @@ fn replay_code(
         .map_err(|e| unusable("run record", e.to_string()))?;
     let artifact = site.keys.artifact;
     // An `unreadable` entry is an artifact the reader refused, which `measure` handed the
-    // decoder as no facts. No entry is an arm of a check whose artifact the store does not
-    // keep, replayed over its records where the decoder reads nothing else.
+    // decoder as no facts.
     let elf = match artifact.map(|key| (key, store.get(key))) {
         None | Some((_, Some(crate::report::FactEntry::Unreadable { .. }))) => None,
         Some((key, Some(_))) => Some(store.elf_facts(key).ok_or_else(|| {
@@ -1134,24 +1346,27 @@ pub fn replay_report(
         not_replayable: Vec::new(),
         replays: Vec::new(),
         restated: Vec::new(),
+        gates: Vec::new(),
     };
+    if arm.is_none_or(|a| a == ArmSel::Measured) {
+        out.gates = replay_gates(report, check, &mine)?;
+    }
     let sites = owed_sites(&mine, arm)?;
     out.expected = sites.len();
-    // The triple needs no reading, so every measured verdict is held to it, a code
-    // decoder's included.
+    // The triple needs no reading, so a code decoder's measured verdict is held to it too.
     let owed = regime_owed(report, check)?;
+    let flags = regime_flags(report, check)?;
     for (probe_id, _, site) in &sites {
-        out.restated.extend(earned(probe_id, site, owed));
+        out.restated.extend(earned(probe_id, site, owed, &flags));
     }
     if check.predicate().is_none() {
         replay_code_sites(store, check, &sites, &mut out)?;
         return Ok(out);
     }
     if sites.iter().all(|(_, _, s)| s.decoded.is_none()) {
-        // No reading of the check is published, so the report owes no `decoders` entry
-        // for it: a check withheld before its decoder ran
-        // owes no reading either, and closes at `expected: 0`. A site that did owe one is
-        // named as absent.
+        // No reading is published, so the report owes no `decoders` entry: a check withheld
+        // before its decoder ran closes at `expected: 0`, and a site that owed one is named
+        // as absent.
         for (probe_id, _, site) in &sites {
             out.not_replayable.push(NotReplayed {
                 probe: probe_id.clone(),
@@ -1228,8 +1443,8 @@ pub struct Detected {
     pub check: String,
     /// `artifact`, `elf-facts`, `store-entry` or `record`.
     pub input: &'static str,
-    /// The store key the facts would have in a report: the artifact's SHA-256, for
-    /// `--artifact`.
+    /// The store key the facts would have in a report. Always present for `--artifact`: the
+    /// SHA-256 of the bytes the reader parsed, from the one read the facts came from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facts_key: Option<String>,
     pub decoder: DecoderId,
@@ -1319,12 +1534,10 @@ fn predicate_for(check: &Check, input: &str) -> Result<&'static Predicate, UserE
 }
 
 /// The macro map an artifact testifies to, by `measure`'s rule (`report::self_report_entries`,
-/// the reading `Gatherer::gather` takes the artifact's macros through): its `.chard.report`
-/// where that holds a report, a report whose fields all read undefined included, which is the
-/// artifact's account that nothing is defined and reads as an empty map rather than as no
-/// account. Reading `parse_self_report` directly and taking a non-empty map as the account
-/// would replay an all-`?` report that `measure` published `off` over with no macros, and
-/// the replay would disagree.
+/// which `Gatherer::gather` reads too): its `.chard.report` where that holds a report, one
+/// whose fields all read undefined included, which is an empty map and not no account.
+/// Taking only a non-empty map as the account would replay with no macros an all-`?` report
+/// that `measure` published `off` over, and disagree.
 fn self_reported(elf: &ElfFacts) -> Option<BTreeMap<String, String>> {
     crate::report::self_report_entries(elf).ok()
 }
@@ -1349,9 +1562,11 @@ fn over_elf(check: &Check, input: &'static str, elf: &ElfFacts) -> Result<Detect
 /// check decoded by code.
 pub fn decode_artifact(path: &Path, check: &Check) -> anyhow::Result<Detected> {
     predicate_for(check, "an artifact")?;
-    let elf = crate::elf::facts_for(path)?;
+    // One read serves the facts and the key, because a FIFO yields its bytes once.
+    let bytes = crate::elf::read_object(path)?;
+    let elf = crate::elf::facts_from(path, &bytes)?;
     let mut detected = over_elf(check, "artifact", &elf)?;
-    detected.facts_key = crate::digest::sha256_file(path);
+    detected.facts_key = Some(crate::digest::sha256_hex(&bytes));
     Ok(detected)
 }
 
@@ -1459,7 +1674,7 @@ fn decode_store_entry(entry: &Value, check: &Check) -> Result<Detected, UserErro
         )),
         other => Err(UserError::with_hint(
             format!("a store entry of kind `{other}` is not understood by this binary"),
-            "an unknown kind is not read as absent facts; use a chard that writes it",
+            "an unknown kind is not read as absent facts",
         )),
     }
 }
@@ -1512,12 +1727,7 @@ pub fn decode_evidence(
         return Err(unrecognised());
     };
     // `chard elf` output first, by its every value: its keys are the paths a caller typed,
-    // so one named `chard_schema` or `observations` is a path and not a version. Any other
-    // object carrying `chard_schema`, of whatever type, or an `observations` list (which only
-    // a report carries; `detect`'s own replay carries `observations` as a count) is held to
-    // the version this chard reads before anything else, as `table` holds it
-    // (`dataset::refuse_other_schema`), so a report with its version removed or retyped is
-    // not read as a record by its `run`.
+    // so one named `chard_schema` or `observations` is a path and not a version.
     let elf_output = !map.is_empty()
         && map
             .values()
@@ -1531,15 +1741,13 @@ pub fn decode_evidence(
             return replay_report(value, check, arm).map(Output::Replay);
         }
         return Err(UserError::with_hint(
-            "the evidence carries a `chard_schema` version and no `observations` list, so it \
-             is not a report: chard's matrix, probe listing, `detect` output and error envelope \
-             have that shape",
+            "the evidence carries a `chard_schema` version and no `observations` list",
             "pass the report itself",
         ));
     }
     if arm.is_some() {
         return Err(UserError::with_hint(
-            "--arm selects among a report's readings, and the evidence is not a report",
+            "--arm selects among a report's readings",
             "drop --arm, or pass a report",
         ));
     }
@@ -1561,8 +1769,7 @@ pub fn decode_evidence(
 fn unrecognised() -> UserError {
     UserError::with_hint(
         "the evidence is not a report, a store entry, a record or `chard elf` output",
-        "pass a chard report, one entry of its `facts`, a fixture record, or `chard elf` \
-         output over one object",
+        "pass a chard report, one entry of its `facts`, a fixture record",
     )
 }
 
@@ -1575,15 +1782,8 @@ fn unrecognised() -> UserError {
 pub fn decode_file(path: &Path, check: &Check, arm: Option<ArmSel>) -> anyhow::Result<Output> {
     use std::os::unix::fs::FileTypeExt as _;
     // Bytes, not a `String`, as `dataset::read_reports` reads them: a file that is not UTF-8
-    // is then the parser's refusal and the caller's input, where `read_to_string` failed
-    // with `InvalidData`, which the envelope classes as chard's own (`INTERNAL`) while
-    // `table` and `matrix` called the same file `USER_INPUT`.
-    // Refused from the metadata for a shape no read could turn into evidence, as
-    // `dataset::read_report_bytes` refuses it for `table`: a character device such as
-    // `/dev/zero` would be read without bound. The name refusals that function also makes
-    // (a quarantined, set-aside or partial report) are not made here on purpose: `detect`
-    // replays a report's readings, and a quarantined report is one a reader has reason to
-    // replay.
+    // is then the parser's refusal and the caller's input (`USER_INPUT`), as `table` and
+    // `matrix` class it, not an io error the envelope classes as chard's own (`INTERNAL`).
     let reading = || format!("reading {}", path.display());
     let kind = std::fs::metadata(path).with_context(reading)?.file_type();
     if !(kind.is_file() || kind.is_fifo()) {
@@ -1611,8 +1811,63 @@ pub fn decode_file(path: &Path, check: &Check, arm: Option<ArmSel>) -> anyhow::R
 mod tests {
     use super::*;
 
-    /// A value stated beside a reading no replay verified restates to nothing and
-    /// disagrees, whatever it restated to before.
+    #[test]
+    fn a_regime_arm_is_held_to_its_probe_s_language() {
+        let profile = serde_json::json!({
+            "cflags": ["-O2"],
+            "cxxflags": ["-O1"],
+            "ldflags": ["-Wl,-z,now"],
+        });
+        let report = |corpus: String| {
+            serde_json::json!({
+                "run": {"probe_corpus_sha256": corpus},
+                "profile": profile,
+            })
+        };
+        let this = report(probe::corpus_sha256());
+        for (probe, lead) in [(probe::Lang::C, "-O2"), (probe::Lang::Cxx, "-O1")] {
+            let check = probe::CORPUS
+                .iter()
+                .filter(|p| p.lang == probe)
+                .find_map(|p| p.checks.iter().find(|c| c.regime_arm().is_some()))
+                .expect("a check of the language that declares a regime arm");
+            let mut owed = vec![lead.to_owned(), "-Wl,-z,now".to_owned()];
+            owed.extend(
+                check
+                    .regime_arm()
+                    .into_iter()
+                    .flatten()
+                    .map(|f| (*f).to_owned()),
+            );
+            assert_eq!(
+                regime_flags(&this, check).expect("the profile reads"),
+                RegimeFlags::Owed(owed),
+                "{}",
+                check.id
+            );
+            assert_eq!(
+                regime_flags(&report("another".to_owned()), check).expect("reads"),
+                RegimeFlags::Unheld,
+                "{}",
+                check.id
+            );
+        }
+        let undeclared = probe::CORPUS
+            .iter()
+            .flat_map(|p| p.checks)
+            .find(|c| c.regime_arm().is_none())
+            .expect("a check that declares no regime arm");
+        assert_eq!(
+            regime_flags(&this, undeclared).expect("reads"),
+            RegimeFlags::Undeclared
+        );
+        assert_eq!(
+            regime_flags(&report("another".to_owned()), undeclared).expect("reads"),
+            RegimeFlags::Unheld,
+            "a report of another corpus is read as written, whatever this corpus declares"
+        );
+    }
+
     #[test]
     fn a_value_beside_an_unverified_reading_restates_to_nothing() {
         let stated = Restated {
@@ -1634,5 +1889,179 @@ mod tests {
                 ..stated
             }
         );
+    }
+
+    /// The class listings of `record`'s compile comparison.
+    fn classes_of(record: &mut crate::listings::Listings) -> &mut Vec<crate::listings::ClassAsked> {
+        &mut record.compile.as_mut().expect("a compile record").classes
+    }
+
+    /// The compile comparison's answer to `flags`, as the record of the tests below holds it.
+    fn asked(flags: &[String]) -> crate::listings::Asked<crate::compile_inputs::CompileInputs> {
+        crate::listings::Asked {
+            flags: flags.to_vec(),
+            answer: crate::listings::Answer::Answer(crate::compile_inputs::CompileInputs {
+                programs: vec!["/".to_owned()],
+                headers: vec![("-isystem".to_owned(), "/".to_owned())],
+                macros: Vec::new(),
+                removals: Vec::new(),
+                targets: Vec::new(),
+                sanitizers: Vec::new(),
+                lto: Vec::new(),
+                relocation: Vec::new(),
+                exception_models: Vec::new(),
+            }),
+        }
+    }
+
+    /// A probe that owes class listings under its own language's flags and not the other's;
+    /// the profile it is published under; the record `measure` writes for it, its paths
+    /// unanswered; and its language's flags.
+    fn owing_record() -> (
+        &'static probe::Probe,
+        PublishedListings<'static>,
+        crate::listings::Listings,
+        Vec<String>,
+    ) {
+        use crate::listings::{ClassAsked, CompileAsked, Listings, Owed};
+        let probe = probe::CORPUS
+            .iter()
+            .find(|p| p.checks.iter().any(|c| c.id == "optimization-enabled"))
+            .expect("a probe holds optimization-enabled");
+        let flags = vec!["-isystem".to_owned(), "/".to_owned()];
+        let other = vec!["-O3".to_owned(), "-isystem".to_owned(), "/".to_owned()];
+        let (c_flags, cxx_flags) = match probe.lang {
+            probe::Lang::C => (flags.clone(), other.clone()),
+            probe::Lang::Cxx => (other.clone(), flags.clone()),
+        };
+        let published = PublishedListings {
+            member: None,
+            ours: true,
+            c_flags,
+            cxx_flags,
+            clean: false,
+        };
+        assert_ne!(
+            crate::listings::owed_classes(probe, &flags, false),
+            crate::listings::owed_classes(probe, &other, false),
+            "the two languages' flags owe different classes"
+        );
+        assert!(Owed::of(probe, false).compile);
+        let owed_classes = crate::listings::owed_classes(probe, &flags, false);
+        assert!(!owed_classes.is_empty(), "the probe owes class listings");
+        let record = Listings {
+            compile: Some(CompileAsked {
+                measured: asked(&flags),
+                stand_in: Some(asked(&flags)),
+                classes: owed_classes
+                    .iter()
+                    .map(|words| ClassAsked {
+                        words: words.clone(),
+                        listing: asked(words),
+                    })
+                    .collect(),
+            }),
+            ..Listings::default()
+        };
+        (probe, published, record, flags)
+    }
+
+    #[test]
+    fn a_record_short_of_the_one_measure_writes_is_named() {
+        use crate::listings::ClassAsked;
+        let (probe, published, mut record, flags) = owing_record();
+        let mut named = 0;
+        let unanswered = held_listings(&published, probe, &record).expect_err("paths unanswered");
+        assert!(unanswered.contains("paths answers none of"), "{unanswered}");
+        named += 1;
+        let host = crate::link_inputs::Host::default();
+        crate::listings::findings(&record, &host).expect("a well-formed record");
+        record.paths = host.answers();
+        assert!(held_listings(&published, probe, &record).is_ok());
+        let mut extra_class = record.clone();
+        classes_of(&mut extra_class).push(ClassAsked {
+            words: vec!["-O3".to_owned()],
+            listing: asked(&flags),
+        });
+        let mut dropped = record.clone();
+        classes_of(&mut dropped).pop();
+        let mut reworded = record.clone();
+        classes_of(&mut reworded)[0]
+            .words
+            .push("-fno-inline".to_owned());
+        for (edited, what) in [
+            (&extra_class, "a class unowed"),
+            (&dropped, "a class dropped"),
+            (&reworded, "a class reworded"),
+        ] {
+            let why = held_listings(&published, probe, edited).expect_err(what);
+            assert!(why.contains("compile.classes"), "{what}: {why}");
+            named += 1;
+        }
+        let mut unowed = record.clone();
+        unowed.measured_compile = Some(asked(&flags));
+        let owes = held_listings(&published, probe, &unowed).expect_err("an unowed comparison");
+        assert!(owes.contains("measured_compile"), "{owes}");
+        named += 1;
+        assert_eq!(named, 5);
+    }
+
+    #[test]
+    fn a_gating_is_placed_by_the_triple_its_observation_publishes() {
+        use crate::report::gating_rule::{self, Rule, Stage};
+        let published = PublishedListings {
+            member: None,
+            ours: false,
+            c_flags: Vec::new(),
+            cxx_flags: Vec::new(),
+            clean: true,
+        };
+        let probe = probe::CORPUS
+            .iter()
+            .find(|p| p.checks.iter().any(|c| c.id == "cet-marked"))
+            .expect("a probe holds cet-marked");
+        let check = probe
+            .checks
+            .iter()
+            .find(|c| c.id == "cet-marked")
+            .expect("cet-marked");
+        let declared = &gating_rule::COMPILER_DECLARED;
+        let early = gating_rule::ALL
+            .iter()
+            .find(|r| r.stage == Stage::Applicability)
+            .expect("an applicability-stage rule");
+        let observation = |rule: &Rule, controls: Option<Value>| {
+            let mut o = serde_json::json!({
+                "probe": probe.id,
+                "verdict": rule.verdict(),
+                "gating": { "rule": rule.id },
+            });
+            if let Some(c) = controls {
+                o["controls"] = c;
+            }
+            o
+        };
+        let said =
+            |discriminating: bool| Some(serde_json::json!({ "discriminating": discriminating }));
+        let rows = [
+            (declared, said(true), GateOutcome::Disagrees),
+            (declared, said(false), GateOutcome::ListingsUnpublished),
+            (
+                declared,
+                Some(serde_json::json!({})),
+                GateOutcome::ListingsUnpublished,
+            ),
+            (early, None, GateOutcome::NotReached),
+            (early, Some(Value::Null), GateOutcome::NotReached),
+            (early, said(false), GateOutcome::Disagrees),
+        ];
+        let mut placed = 0;
+        for (rule, controls, expected) in rows {
+            let o = observation(rule, controls.clone());
+            let gate = gate_of(&published, check, 0, &o).expect("a readable observation");
+            assert_eq!(gate.outcome, expected, "{} beside {controls:?}", rule.id);
+            placed += 1;
+        }
+        assert_eq!(placed, 6);
     }
 }

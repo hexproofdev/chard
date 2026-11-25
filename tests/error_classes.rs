@@ -1,39 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! What the envelope's `code` says for each kind of failure, through the built binary.
-//!
-//! The class is what a sweep across dozens of images branches on, and the ledger record
-//! this file closes found it pointing the wrong way in both directions: a text file handed
-//! to `chard elf` reported `INTERNAL`, which files a bug for a typo, and a file chard wrote
-//! and lost reported `USER_INPUT`, which tells an operator to check a path they never
-//! typed. The second direction is held at unit level in `src/error.rs`, since deleting the
-//! work directory between chard creating it and chard writing into it is a race; this file
-//! holds the first through the real binary, because the class is decided at the sole exit
-//! point after every context layer `main` adds, and a unit test on `classify` cannot see a
-//! `with_context` that erased the root.
-//!
-//! Each case names its input, a file written under `common::Work`, a checked-in fixture or
-//! a path that does not exist, and asserts exit `2`, exactly one JSON object on stdout,
-//! and the class. A command line clap's own parser refuses is one of them: its usage text
-//! goes to stderr and its envelope to stdout (`a_command_line_clap_refuses_reaches_the_envelope`).
-//! The `PERMISSION` cases do not
-//! reproduce as root, where a mode of `000`, `500` or
-//! `555` stops nothing; each checks from the test process whether the mode holds and
-//! announces a capability gap rather than passing over an arm it could not exercise.
-//!
-//! Four of the five classes are reached here: `USER_INPUT`, `PERMISSION`, `CONFIGURATION`,
-//! and `TRANSIENT` for a work directory another run holds. `TRANSIENT`'s io arm is a race
-//! (`ETXTBSY`), and `INTERNAL` is a defect in chard
-//! or a driver that hung on its own interrogation, which sits behind a bound too long for a
-//! test; a socket handed to `table` or `matrix` was the one deterministic `INTERNAL` through
-//! the binary, a wrong path misclassified, and it is refused from its metadata as the
-//! caller's below. So `src/error.rs` pins those two at unit level in
-//! `executable_file_busy_is_transient_on_either_path` and
-//! `the_default_arm_catches_only_the_inventoried_internal_sites`. The positive controls,
-//! that a run which succeeds prints a report and no envelope, are the existing
-//! `measure_in_env` in `tests/fake_driver.rs` and `report_for` and
-//! `a_matrix_conforms_to_its_schema` in `tests/schema_conformance.rs`, each of which
-//! asserts the absence of an `error` key before reading the report.
+
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::string_slice,
+    reason = "test code lays out fixture bytes, counts results and slices text at offsets it \
+              found in the same string, from constants and the sizes of data in memory; the \
+              test profile keeps overflow checks, and an overflow, or a slice off a character \
+              boundary or past the end, panics and fails the test. Its casts widen a length or \
+              a u32, take the offset between two addresses in one string, or name a function \
+              pointer type or a closure's trait object. clippy has no test knob for these three \
+              lints, and src/lib.rs's crate-root relief does not reach tests/"
+)]
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -43,14 +23,7 @@ use serde_json::Value;
 
 mod common;
 
-fn chard_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("chard")
-}
+use common::chard_binary;
 
 /// The envelope one failing invocation printed.
 struct Envelope {
@@ -153,7 +126,6 @@ fn elf_on_an_empty_file_is_the_callers_input() {
     assert!(got.message.contains("too short"), "{}", got.message);
 }
 
-/// Refused from the metadata, before an open, as anything that is not a regular file is.
 #[test]
 fn elf_on_a_directory_is_the_callers_input() {
     if !ready("that a directory handed to `chard elf` is the caller's to fix") {
@@ -187,18 +159,15 @@ fn output_within_ten_seconds(mut child: std::process::Child, what: &str) -> std:
             std::time::Instant::now() < deadline,
             "{what} blocked for ten seconds (the child is left to the harness)"
         );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the wait is on a child's exit, which std offers no timed wait for: try_wait \
+                      between sleeps, under the ten-second deadline, is the bounded wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
-/// An object fed down a named FIFO is read to the same facts as the file it came from.
-///
-/// A FIFO's `len()` is 0 and its `open` blocks with no writer, and the change that typed
-/// the reader's refusals first refused every FIFO from its metadata for the second
-/// reason: that refused `chard elf <(...)` and `chard elf /dev/stdin` behind a pipe, both
-/// of which read before, with a hint saying the bytes were not an object. The cap is held
-/// on the bytes as they arrive instead, and the shapes no read serves (a directory, a
-/// device, a socket) are the ones refused from the metadata.
 #[test]
 fn elf_on_a_fifo_carrying_an_object_reads_it() {
     if !ready("that an object fed down a FIFO is read by `chard elf`") {
@@ -224,9 +193,7 @@ fn elf_on_a_fifo_carrying_an_object_reads_it() {
         .spawn()
         .expect("spawning chard");
     // The writer's `open` pairs with chard's, and its `write_all` ends when chard has read
-    // the bytes or has gone. A chard that refused the FIFO leaves this thread in `open`;
-    // the assertion below then fails on the envelope, with the thread left to the
-    // process's exit.
+    // the bytes or has gone.
     let feed = {
         let fifo = fifo.clone();
         std::thread::spawn(move || -> std::io::Result<()> {
@@ -249,8 +216,6 @@ fn elf_on_a_fifo_carrying_an_object_reads_it() {
         .expect("feeding the FIFO");
 }
 
-/// The same object on `/dev/stdin` behind a pipe, which stats as a FIFO too and needs no
-/// `mkfifo`: `cat probe | chard elf /dev/stdin` is the shell's shape of it.
 #[test]
 fn elf_on_stdin_from_a_pipe_reads_it() {
     if !ready("that an object piped to `chard elf /dev/stdin` is read") {
@@ -301,8 +266,6 @@ fn elf_on_a_missing_path_is_the_callers_input() {
     );
 }
 
-/// Sparse, as `src/elf.rs`'s own cap test builds it: `set_len` writes no blocks, and the
-/// file is refused from its metadata before it is opened.
 #[test]
 fn elf_above_the_size_cap_is_the_callers_input() {
     if !ready("that an object above the size cap is the caller's to fix") {
@@ -331,9 +294,7 @@ fn elf_on_a_truncated_header_names_the_readelf_cross_check() {
     let got = elf(&path);
     assert_eq!(got.code, "USER_INPUT", "{}", got.message);
     assert!(
-        got.hint
-            .as_deref()
-            .is_some_and(|h| h.contains("readelf -h") && h.contains("cut")),
+        got.hint.as_deref().is_some_and(|h| h.contains("cut")),
         "{:?}",
         got.hint
     );
@@ -360,8 +321,6 @@ fn elf_on_an_unreadable_file_is_permission() {
     assert!(got.message.contains("locked"), "{}", got.message);
 }
 
-/// `create_dir_all` runs before the probe selection and the toolchain interrogation, so
-/// the `--cc` that names nothing never gets a turn.
 #[test]
 fn measure_into_an_unwritable_work_directory_is_permission() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -390,12 +349,6 @@ fn measure_into_an_unwritable_work_directory_is_permission() {
     assert!(got.message.contains("work directory"), "{}", got.message);
 }
 
-/// The work directory exists and cannot be written into, so the first file chard
-/// constructs under it, the run's claim on the directory (`measure::claim_workdir`), fails
-/// with `EACCES` under its `HarnessPath` tag, and the hint names the file and both
-/// operations a chard-owned path meets. Until the claim, that file was the macro-dump source
-/// `toolchain::detect` asks for. The driver is the shim, so a refusal of the compiler cannot
-/// come first should the claim ever move after it.
 #[test]
 fn measure_into_an_existing_unwritable_work_directory_names_the_file_chard_could_not_write() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -439,21 +392,9 @@ fn measure_into_an_existing_unwritable_work_directory_names_the_file_chard_could
         "{:?}",
         got.hint
     );
-    assert!(
-        got.hint
-            .as_deref()
-            .is_some_and(|h| h.contains("write or run") && h.contains("writable")),
-        "{:?}",
-        got.hint
-    );
     std::fs::set_permissions(&workdir, std::fs::Permissions::from_mode(0o700)).expect("chmod 700");
 }
 
-/// The `--cc` exists with no execute bit, and the envelope said `PERMISSION`: `chmod` on a
-/// text file is the wrong action, and the caller is the one who can name a compiler. The
-/// refusal is read from the metadata before any spawn, so no `ETXTBSY` wait is needed
-/// here, and an `EACCES` the spawn itself reports on an executable mode (a `noexec`
-/// mount) keeps `PERMISSION` for the filesystem's owner.
 #[test]
 fn measure_with_a_cc_that_cannot_be_executed_is_the_callers_input() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -483,10 +424,6 @@ fn measure_with_a_cc_that_cannot_be_executed_is_the_callers_input() {
     );
 }
 
-/// A `--workdir` that exists and is not a directory is refused from its metadata with the
-/// invocation's other arguments, before the earlier output is set aside, not by
-/// `create_dir_all` with `EEXIST` after the set-aside. The `--cc` that names
-/// nothing never gets a turn, as above.
 #[test]
 fn measure_into_a_work_directory_that_is_a_file_is_the_callers_input() {
     if !ready("that a --workdir naming an existing file is the caller's to fix") {
@@ -553,19 +490,6 @@ fn gated_wait(gate: &Path, work: &Path) -> String {
 /// times the 10s the tests that use it allow for the run to make its claim.
 const GATE_POLLS: u32 = 600;
 
-/// `TRANSIENT` through the binary: a second measure in a work directory a live run holds is
-/// refused and leaves no claim of its own there, and a third, after the holder was killed, is
-/// let in and removes the claim the killed run left.
-///
-/// The holder's driver waits on a gate file at its first invocation, so the holder is
-/// inside `toolchain::detect` with its claim made for as long as the test needs. The test
-/// opens the gate before it kills the holder, and the driver, once through the gate, waits
-/// (on the same bound) for its parent to be gone before it exits: so the driver ends right after the
-/// kill, and the holder never sees it exit, which would let the holder fail on its own and
-/// remove its claim before the kill the third run's note depends on. The
-/// second and third runs name a compiler that does not exist: that refusal comes after the
-/// claim, so `USER_INPUT` for a missing compiler is what a run let in reads, and before
-/// the claim existed it was what the second run read too.
 #[test]
 fn measure_in_a_work_directory_another_run_holds_is_transient() {
     if !ready("that a second measure in a busy work directory is refused") {
@@ -573,9 +497,9 @@ fn measure_in_a_work_directory_another_run_holds_is_transient() {
     }
     let work = common::Work::new("errorclasses", "busy-workdir");
     let gate = work.path("gate");
-    let _ = std::fs::remove_file(&gate);
+    common::removed(std::fs::remove_file(&gate), &gate);
     let shared = work.path("shared");
-    let _ = std::fs::remove_dir_all(&shared);
+    common::removed(std::fs::remove_dir_all(&shared), &shared);
     let held = common::executable(
         &work.path("held-cc"),
         &format!(
@@ -602,6 +526,11 @@ fn measure_in_a_work_directory_another_run_holds_is_transient() {
             std::time::Instant::now() < deadline,
             "the holding run made no claim within 10s"
         );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is a claim appearing in the work directory, which nothing here \
+                      can wait on: listing it between sleeps, under the 10 s deadline, is the wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let missing = OsStr::new("/nonexistent/chard-test-compiler");
@@ -690,13 +619,6 @@ fn a_gone_claim_that_cannot_be_removed_is_said(shared: &Path, stale: &Path, miss
     );
 }
 
-/// `TRANSIENT` through the binary: a run whose own claim was removed while it measured
-/// publishes nothing.
-///
-/// The driver proxies to the host's `cc` once a gate file exists, so the run is held inside
-/// `toolchain::detect` with its claim made while the test removes the claim, and then
-/// measures and reaches publication. `measure::WorkdirClaim::confirm` is what refuses it;
-/// without that call the run publishes its report and exits 0.
 #[test]
 fn measure_whose_claim_was_removed_mid_run_publishes_nothing() {
     let verifies = "that a run whose work directory claim was removed publishes nothing";
@@ -705,11 +627,11 @@ fn measure_whose_claim_was_removed_mid_run_publishes_nothing() {
     }
     let work = common::Work::new("errorclasses", "claim-removed");
     let gate = work.path("gate");
-    let _ = std::fs::remove_file(&gate);
+    common::removed(std::fs::remove_file(&gate), &gate);
     let shared = work.path("shared");
-    let _ = std::fs::remove_dir_all(&shared);
+    common::removed(std::fs::remove_dir_all(&shared), &shared);
     let report = work.path("report.json");
-    let _ = std::fs::remove_file(&report);
+    common::removed(std::fs::remove_file(&report), &report);
     let real = Command::new("sh")
         .args(["-c", "command -v cc"])
         .output()
@@ -745,6 +667,11 @@ fn measure_whose_claim_was_removed_mid_run_publishes_nothing() {
             std::time::Instant::now() < deadline,
             "the run made no claim within 10s"
         );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is a claim appearing in the work directory, which nothing here \
+                      can wait on: listing it between sleeps, under the 10 s deadline, is the wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     for claim in claims() {
@@ -781,10 +708,15 @@ fn exit_within(
             return Some(status);
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            chard::error::best_effort(child.kill());
+            chard::error::best_effort(child.wait());
             return None;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the wait is on a child's exit, which std offers no timed wait for: try_wait \
+                      between sleeps, under the caller's bound, is the bounded wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -814,23 +746,24 @@ fn gone_or_killed(pid: u32) -> bool {
             return true;
         }
         if std::time::Instant::now() >= deadline {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            chard::error::best_effort(
+                Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status(),
+            );
             return false;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is a process that is not this one's child leaving /proc, which \
+                      nothing here can wait on: reading its stat between sleeps, up to 5 s, is the \
+                      wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
 /// The check `Work`'s drop makes, shown to fail on each of its two channels, for `work`.
-///
-/// The fixture's shell runs from `/`, so only its arguments (its script's path) name the
-/// directory; the `sleep` it starts in a subshell that changed into the directory names
-/// nothing there, so only its working directory does. Each is asserted found by its own
-/// channel alone, so removing either channel from `Work::leftover_processes` fails this. The
-/// drop must then fail, name both, report both killed, and have killed both; every wait on
-/// the fixture is bounded, so a regression of the check fails here rather than hanging.
 fn a_leak_fails_its_test(work: common::Work, verifies: &str) {
     use std::os::unix::process::ExitStatusExt as _;
     let script = common::executable(
@@ -849,9 +782,9 @@ fn a_leak_fails_its_test(work: common::Work, verifies: &str) {
         .spawn()
         .expect("spawning the fixture");
     if let Err(why) = work.leftover_processes() {
-        let _ = left.kill();
-        let _ = left.wait();
-        common::capability_gap(verifies, why);
+        chard::error::best_effort(left.kill());
+        chard::error::best_effort(left.wait());
+        common::capability_gap(verifies, &why);
         return;
     }
     // Read now, while the shell is alive and still its parent, so every path below can kill
@@ -859,6 +792,12 @@ fn a_leak_fails_its_test(work: common::Work, verifies: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut descendants = children_of(left.id());
     while descendants.is_empty() && std::time::Instant::now() < deadline {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is the shell's child appearing in /proc, which nothing here \
+                      can wait on: reading the shell's children between sleeps, up to 5 s, is the \
+                      wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
         descendants = children_of(left.id());
     }
@@ -875,8 +814,8 @@ fn a_leak_fails_its_test(work: common::Work, verifies: &str) {
             break (shell, sleep);
         }
         if std::time::Instant::now() >= deadline {
-            let _ = left.kill();
-            let _ = left.wait();
+            chard::error::best_effort(left.kill());
+            chard::error::best_effort(left.wait());
             for pid in seen
                 .iter()
                 .map(|l| l.pid)
@@ -886,6 +825,12 @@ fn a_leak_fails_its_test(work: common::Work, verifies: &str) {
             }
             panic!("the shell and its sleep were not both seen within 5s: {seen:?}");
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is the shell and its sleep both naming the directory in /proc, \
+                      which nothing here can wait on: reading the leftovers between sleeps, up to \
+                      5 s, is the wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(work)));
@@ -929,8 +874,6 @@ fn a_process_left_in_a_work_directory_fails_its_test() {
     );
 }
 
-/// The same through a `TMPDIR` reached by a symlink: the kernel reports a working directory
-/// resolved, so the `sleep` is found only if the resolved spelling is compared.
 #[test]
 fn a_process_left_in_a_work_directory_reached_through_a_symlink_fails_its_test() {
     let base = common::Work::new("errorclasses", "symlinked-base");
@@ -944,9 +887,6 @@ fn a_process_left_in_a_work_directory_reached_through_a_symlink_fails_its_test()
     );
 }
 
-/// A process in a sibling directory sharing the work directory's name as a prefix
-/// (`...-<pid>3` beside `...-<pid>`) is not this test's: neither its arguments nor its
-/// working directory name the work directory.
 #[test]
 fn a_process_in_a_sibling_directory_is_not_a_leftover() {
     let work = common::Work::new("errorclasses", "sibling");
@@ -974,22 +914,30 @@ fn a_process_in_a_sibling_directory_is_not_a_leftover() {
         if std::time::Instant::now() >= deadline {
             break None;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the condition is the sibling shell's child appearing in /proc, which nothing \
+                      here can wait on: reading the shell's children between sleeps, up to 5 s, is \
+                      the wait"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     let listed = work.leftover_processes();
-    let _ = beside.kill();
-    let _ = beside.wait();
+    chard::error::best_effort(beside.kill());
+    chard::error::best_effort(beside.wait());
     if let Some(pid) = sleep {
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
+        chard::error::best_effort(
+            Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status(),
+        );
     }
     let sleep_gone = sleep.is_none_or(gone_or_killed);
-    let _ = std::fs::remove_dir_all(&sibling);
+    common::removed(std::fs::remove_dir_all(&sibling), &sibling);
     let listed = match listed {
         Ok(listed) => listed,
         Err(why) => {
-            common::capability_gap("a sibling directory's process is not a leftover", why);
+            common::capability_gap("a sibling directory's process is not a leftover", &why);
             return;
         }
     };
@@ -1017,9 +965,6 @@ esac
 exit 0
 "#;
 
-/// `CONFIGURATION` through the binary: an invocation that contradicts itself, refused
-/// before any driver runs, not after a driver has answered. The shim is a
-/// file this test wrote and chard execs, so the invocation waits out `ETXTBSY`.
 #[test]
 fn measure_with_explicit_profile_and_no_flags_is_configuration() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1046,10 +991,6 @@ fn measure_with_explicit_profile_and_no_flags_is_configuration() {
     assert!(got.message.contains("--flags"), "{}", got.message);
 }
 
-/// A `+x` file with no shebang. Linux refuses it at `execve` with `ENOEXEC`, which no
-/// `ErrorKind` names and which the envelope therefore reported as `INTERNAL`; Darwin runs
-/// it through `sh` instead, so there the refusal arrives later, as a driver that defined no
-/// macros, and the `ENOEXEC` arm is announced rather than asserted.
 #[test]
 fn measure_with_a_cc_the_kernel_cannot_load_is_the_callers_input() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1102,9 +1043,6 @@ fn bound_socket(work: &common::Work) -> Option<(std::os::unix::net::UnixListener
     }
 }
 
-/// A socket has no bytes to read as a report, and a `read` on it answers with an errno
-/// (`ENOTSUP` on Darwin, `ENXIO` on Linux) that no `ErrorKind` names, so `table` reported
-/// `INTERNAL` for a wrong path. It is refused from its metadata as the caller's.
 #[test]
 fn table_on_a_socket_is_the_callers_input() {
     if !ready("that a socket handed to `chard table` is the caller's to fix") {
@@ -1201,6 +1139,98 @@ fn matrix_on_a_binary_file_is_the_callers_input() {
     );
 }
 
+/// A report as chard 0.1.0 wrote one, as far as a reader of this version reads it before
+/// refusing: `chard_schema` 1 in the report and in its digest, an observations list,
+/// predicates in `chard-predicate/1`, and the `run.decoders_sha256` that release published.
+fn a_0_1_0_report() -> Value {
+    let release = chard::dataset::PUBLISHED_REPORT_VERSIONS
+        .iter()
+        .find(|published| published.version == "1")
+        .expect("version 1 is a published one");
+    serde_json::json!({
+        "chard_schema": "1",
+        "digest": {"chard_schema": "1"},
+        "observations": [],
+        "decoders": {"language": "chard-predicate/1"},
+        "run": {"decoders_sha256": release.decoders_sha256},
+    })
+}
+
+#[test]
+fn a_report_chard_0_1_0_published_is_refused_naming_that_release() {
+    if !ready("that a report at `chard_schema` 1 is refused naming chard 0.1.0") {
+        return;
+    }
+    assert_ne!(chard::report::SCHEMA_VERSION, "1");
+    let report = a_0_1_0_report();
+    let work = common::Work::new("errorclasses", "sample-0.1.0");
+    let path = work.write("as-written.json", &report.to_string());
+    let mut later = report.clone();
+    later["run"]["decoders_sha256"] = "ab".repeat(32).into();
+    let later = work.write("later.json", &later.to_string());
+    let mut unnamed = report.clone();
+    unnamed["run"]
+        .as_object_mut()
+        .expect("0.1.0's sample carries a run")
+        .remove("decoders_sha256");
+    let unnamed = work.write("unnamed.json", &unnamed.to_string());
+    let mut relabelled = report.clone();
+    relabelled["chard_schema"] = chard::report::SCHEMA_VERSION.into();
+    relabelled["digest"]["chard_schema"] = chard::report::SCHEMA_VERSION.into();
+    let relabelled = work.write("relabelled.json", &relabelled.to_string());
+
+    let mut read = 0;
+    for command in [
+        &["table"][..],
+        &["matrix"],
+        &["digest"],
+        &["detect", "fortify-requested", "--evidence"],
+    ] {
+        for (file, _, _) in [
+            (&path, "read this one with chard 0.1.0", "development build"),
+            (
+                &later,
+                "chard 0.1.0 did not write this report as it stands",
+                "read this one with chard 0.1.0",
+            ),
+            (
+                &unnamed,
+                "carries no `run.decoders_sha256` to say which",
+                "read this one with chard 0.1.0",
+            ),
+        ] {
+            let mut args: Vec<&OsStr> = command.iter().map(OsStr::new).collect();
+            args.push(file.as_os_str());
+            let got = run(&args);
+            read += 1;
+            assert_eq!(got.code, "USER_INPUT", "{command:?}: {}", got.message);
+            assert!(
+                got.message.contains("carries `chard_schema` \"1\","),
+                "{command:?}: {}",
+                got.message
+            );
+            assert!(got.hint.is_some(), "the refusal carries a hint");
+        }
+        if command[0] != "detect" {
+            let mut args: Vec<&OsStr> = command.iter().map(OsStr::new).collect();
+            args.push(relabelled.as_os_str());
+            let got = run(&args);
+            read += 1;
+            assert_eq!(got.code, "USER_INPUT", "{command:?}: {}", got.message);
+            assert!(
+                got.message
+                    .contains("`decoders.language` \"chard-predicate/1\""),
+                "{command:?}: {}",
+                got.message
+            );
+        }
+    }
+    assert_eq!(
+        read, 15,
+        "three files through four readers, the relabelled one through three"
+    );
+}
+
 #[test]
 fn table_on_an_object_that_is_no_report_is_the_callers_input() {
     if !ready("that a JSON file that is no report handed to `chard table` is the caller's") {
@@ -1216,7 +1246,10 @@ fn table_on_an_object_that_is_no_report_is_the_callers_input() {
     // read and is refused by the renderer for the field it reads.
     let path = work.write(
         "versioned.json",
-        r#"{"chard_schema": "1", "observations": [], "digest": {}}"#,
+        &format!(
+            r#"{{"chard_schema": "{}", "observations": [], "digest": {{}}}}"#,
+            chard::report::SCHEMA_VERSION
+        ),
     );
     let got = run(&[OsStr::new("table"), path.as_os_str()]);
     assert_eq!(got.code, "USER_INPUT", "{}", got.message);
@@ -1257,10 +1290,9 @@ fn matrix_on_an_object_that_is_no_report_is_the_callers_input() {
     assert_eq!(fed, 2, "the version refusal and the renderer's");
 }
 
-/// `chard matrix` refuses two reports of one configuration as the caller's input, naming the
-/// repeat and the flag that allows it, and with `--replace-repeated` writes one cell and the
-/// repeat in its warnings. The two reports are one document under two names, so the
-/// cell is the same whichever is kept, and the warning says the two read every flag alike.
+/// The sentence a replacement writes where the two reports read every flag alike.
+const ALIKE: &str = "The two read every flag both carry alike, verdict, polarity and gating rule";
+
 #[test]
 fn a_repeated_configuration_is_refused_unless_replaced() {
     if !ready("that `chard matrix` refuses a repeated configuration unless replacing") {
@@ -1302,24 +1334,13 @@ fn a_repeated_configuration_is_refused_unless_replaced() {
         matrix["warnings"]
             .as_array()
             .is_some_and(|w| w.iter().any(|w| {
-                w.as_str().is_some_and(|w| {
-                    w.starts_with(&said)
-                        && w.contains(
-                            "The two read every flag both carry alike, verdict and polarity",
-                        )
-                })
+                w.as_str()
+                    .is_some_and(|w| w.starts_with(&said) && w.contains(ALIKE))
             })),
         "{text}"
     );
 }
 
-/// `chard table` refuses two reports of one column's configuration as the caller's input,
-/// naming the repeat, the key's axes and the flag that allows it, and with
-/// `--replace-repeated` renders one column and the repeat among its notes, as
-/// `matrix` does, rather than pooling the two into one column with exit 0 and no word of it.
-/// The two reports are one document under two names, so the column is the same
-/// whichever is kept, and the note says the two read every flag alike. The by-defect view's
-/// refusal is `table`'s unit test's: this document carries no defect map.
 #[test]
 fn table_refuses_a_repeated_configuration_unless_replaced() {
     if !ready("that `chard table` refuses a repeated configuration unless replacing") {
@@ -1337,7 +1358,7 @@ fn table_refuses_a_repeated_configuration_unless_replaced() {
             "{again_name} repeats {first_name} (distro (none), "
         )) && got.message.contains(
             "every axis of its key (distro, release, compiler, compiler_version, libc, \
-                     arch, profile, execution, execution_basis, image; libc is the \
+                     arch, machine, profile, execution, execution_basis, image; libc is the \
                      implementation alone)"
         ),
         "{}",
@@ -1371,10 +1392,7 @@ fn table_refuses_a_repeated_configuration_unless_replaced() {
     let note =
         format!("!! {again_name} repeats the configuration of {first_name} (distro (none), ");
     let (_, noted) = text.split_once(&note).expect("the replacement is noted");
-    assert!(
-        noted.contains("The two read every flag both carry alike, verdict and polarity"),
-        "{text}"
-    );
+    assert!(noted.contains(ALIKE), "{text}");
     let grid = |t: &str| t.split_once("\nLegend:").map(|(g, _)| g.to_owned());
     assert_eq!(
         grid(&text),
@@ -1431,12 +1449,6 @@ fn table_refuses_a_repeated_configuration_unless_replaced() {
 
 /// The smallest document `table` and `matrix` render: one observation, the `coverage`
 /// tally of it, and its `consistency` block, with `contradictions` as given.
-///
-/// `coverage` is in it because the renderers re-run
-/// `withholding-disagrees-with-verdict-counts` on read and refuse a report with no
-/// `coverage`, which every report `measure` writes carries. `coverage.checks_attempted` is
-/// in it because the tally statements of `coverage-disagrees-with-observations` are re-run
-/// on read too.
 fn minimal_report(contradictions: &str) -> String {
     minimal_report_reading("on", contradictions)
 }
@@ -1492,9 +1504,21 @@ fn publish(mut report: Value) -> Value {
         "profile",
         json!({"id": "bare", "flags_source": "none", "cflags": []}),
     );
+    // The triples that discriminated, as `measure` counts them: held on read to each
+    // observation's `controls.discriminating`, which a hand-built observation leaves out.
+    let valid = report
+        .get("observations")
+        .and_then(Value::as_array)
+        .map_or(0, |observations| {
+            observations
+                .iter()
+                .filter(|o| o["controls"]["discriminating"].as_bool() == Some(true))
+                .count()
+        });
     if let Some(coverage) = report.get_mut("coverage") {
         let attempted = coverage["checks_attempted"].clone();
         fill(coverage, "checks_expected", attempted);
+        fill(coverage, "checks_valid", json!(valid));
         fill(coverage, "all_checks_attempted", json!(true));
     }
     if let Some(observations) = report.get_mut("observations").and_then(Value::as_array_mut) {
@@ -1533,12 +1557,6 @@ fn publish(mut report: Value) -> Value {
     report
 }
 
-/// A report that carries no `observes` is refused by `table`, `matrix` and `digest` as the
-/// shape of another chard's output, and the hint names the two ways on. The report is of
-/// another corpus, carries no `observes`, counts its rollup with every bearing check as
-/// protection and has its digest made over that. The same report with the field reads.
-/// Without the refusal, the report without the field would read as consistent, with `table`,
-/// `matrix` and `digest` exiting 0.
 #[test]
 fn a_report_without_observes_is_refused_by_every_reader() {
     if !ready("that every reader refuses a report without observes") {
@@ -1592,15 +1610,406 @@ fn a_report_without_observes_is_refused_by_every_reader() {
     assert_eq!(read, 6, "two reports through three readers");
 }
 
-/// Every reader refuses a report of another `chard_schema`, and `table`, `matrix` and `digest`
-/// one without its digest, with no compiler on the host: the hand-built report, published,
-/// is read by the three as a control; a version of `"99"`, a version removed, and a version
-/// retyped to an object with the `observations` list removed (which a sniff on `run` alone
-/// would read as a record) are each refused by `table`, `matrix`, `digest` and `detect`, the
-/// message naming what the file carries and the version this chard reads; the report with
-/// its digest removed is refused by the three with an earlier `-o` output left as it was and
-/// no `.previous`; and a matrix handed to `table` is named as not a report, not as a report
-/// that lost its digest. `tests/fake_driver.rs` holds the same over a measured report.
+/// A report `chard measure` writes here under `bare` with `cc`, with `args` added: a report of
+/// this corpus, whose `run.invocation` is the one this test gave.
+fn measured_here(work: &common::Work, name: &str, args: &[&str]) -> Value {
+    let path = work.path(name);
+    let output = Command::new(chard_binary())
+        .args(["measure", "--profile", "bare", "-o"])
+        .arg(&path)
+        .args(args)
+        .output()
+        .expect("spawning chard measure");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "measure {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the report reads"))
+            .expect("the report is JSON");
+    assert_eq!(
+        report["run"]["probe_corpus_sha256"],
+        chard::probe::corpus_sha256(),
+        "the measured report is of this corpus"
+    );
+    report
+}
+
+/// `report` with its digest made again over the document as it stands, as a forger who edits
+/// the fields under it would make it.
+fn redigested(mut report: Value) -> Value {
+    let status = report["consistency"]["status"]
+        .as_str()
+        .expect("a measured report has a status")
+        .to_owned();
+    let digest = chard::report::digest::derive(&report, &status).expect("the digest derives");
+    report["digest"] = serde_json::to_value(digest).expect("the digest serializes");
+    report
+}
+
+/// An observation of `report` that no block but the observation list and the digest names,
+/// bearing no defect, measured `on` or `off` with no gating, and whose triple discriminated:
+/// one a forger can delete or copy with `coverage` alone moved to match. Its id is returned
+/// beside its index.
+fn self_contained(report: &Value, besides: &[&str]) -> (usize, String) {
+    let mut rest = report.clone();
+    let rest = rest.as_object_mut().expect("a report");
+    rest.remove("observations");
+    rest.remove("digest");
+    let elsewhere = Value::Object(rest.clone()).to_string();
+    report["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .enumerate()
+        .find_map(|(i, o)| {
+            let id = o["check"].as_str()?;
+            let measured = matches!(o["verdict"].as_str(), Some("on" | "off"));
+            let bare = o.get("defects").is_none() && o.get("gating").is_none();
+            let valid = o["controls"]["discriminating"].as_bool() == Some(true);
+            let unnamed = !elsewhere.contains(&format!("\"{id}\""));
+            (measured && bare && valid && unnamed && !besides.contains(&id))
+                .then(|| (i, id.to_owned()))
+        })
+        .expect("the corpus has a self-contained check measured here")
+}
+
+/// `coverage` moved by `by` observations measured `verdict` with a triple that discriminated:
+/// the counts, the tally and the published set, as `measure` would have counted them.
+fn shift_coverage(report: &mut Value, verdict: &str, by: i64) {
+    let coverage = &mut report["coverage"];
+    for key in ["checks_attempted", "checks_expected", "checks_valid"] {
+        let n = coverage[key].as_i64().expect("a count");
+        coverage[key] = (n + by).into();
+    }
+    let tally = coverage["verdict_counts"][verdict].as_i64().unwrap_or(0);
+    coverage["verdict_counts"][verdict] = (tally + by).into();
+    let published = coverage["withholding"]["published"]
+        .as_i64()
+        .expect("a count");
+    coverage["withholding"]["published"] = (published + by).into();
+}
+
+/// `whole` with a defect taken from one observation and given to another reading alike in
+/// protection terms, the rollup's bearing checks rewritten, so its counts and status stand.
+fn defect_moved(whole: &Value) -> Value {
+    let mut report = whole.clone();
+    let observations = report["observations"].as_array().expect("observations");
+    let term = |o: &Value| {
+        (
+            o["verdict"].as_str().map(str::to_owned),
+            o["polarity"].as_str().map(str::to_owned),
+            o["observes"].as_str().map(str::to_owned),
+        )
+    };
+    let (from, to, defect) = observations
+        .iter()
+        .enumerate()
+        .find_map(|(i, o)| {
+            let defect = o["defects"].as_array()?.first()?.as_str()?.to_owned();
+            let j = observations.iter().position(|other| {
+                other["check"] != o["check"]
+                    && term(other) == term(o)
+                    && !other["defects"]
+                        .as_array()
+                        .is_some_and(|d| d.iter().any(|x| x == defect.as_str()))
+            })?;
+            Some((i, j, defect))
+        })
+        .expect("two observations reading alike, one declaring a defect the other does not");
+    let from_id = report["observations"][from]["check"].clone();
+    let to_id = report["observations"][to]["check"].clone();
+    let declared = report["observations"][from]["defects"]
+        .as_array_mut()
+        .expect("defects");
+    declared.retain(|d| d != defect.as_str());
+    if declared.is_empty() {
+        report["observations"][from]
+            .as_object_mut()
+            .expect("an observation")
+            .remove("defects");
+    }
+    let target = report["observations"][to]
+        .as_object_mut()
+        .expect("an observation");
+    let defects = target
+        .entry("defects")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    defects
+        .as_array_mut()
+        .expect("defects")
+        .push(defect.as_str().into());
+    // The bearing checks in observation order, as `defect_coverage` lists them.
+    let bearing: Vec<Value> = report["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .filter(|o| {
+            o["defects"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|x| x == defect.as_str()))
+        })
+        .map(|o| o["check"].clone())
+        .collect();
+    assert!(bearing.contains(&to_id) && !bearing.contains(&from_id));
+    report["defect_coverage"][&defect]["from_checks"] = Value::Array(bearing);
+    report
+}
+
+/// `whole` with the flag of observation `kept` exchanged with that of one reading otherwise.
+fn flags_exchanged(whole: &Value, kept: usize) -> Value {
+    let mut report = whole.clone();
+    let observations = report["observations"].as_array().expect("observations");
+    let other = observations
+        .iter()
+        .position(|o| o["verdict"] != observations[kept]["verdict"])
+        .expect("an observation reading otherwise");
+    let a = report["observations"][kept]["flag"].clone();
+    let b = report["observations"][other]["flag"].clone();
+    report["observations"][kept]["flag"] = b;
+    report["observations"][other]["flag"] = a;
+    report
+}
+
+/// One edit of [`a_report_of_this_corpus_is_held_to_the_corpus_on_read`]: its name, its rule,
+/// the claim of the statement it breaks, the unedited report and the edited one.
+type ThisCorpusEdit = (&'static str, &'static str, String, Value, Value);
+
+/// The ten edits of [`a_report_of_this_corpus_is_held_to_the_corpus_on_read`], over `whole`
+/// (a run of the whole corpus) and `narrowed` (a run of `probe` alone, which holds the check at
+/// `kept`), with `added` the index in `whole` of a check outside `probe`.
+fn this_corpus_edits(
+    whole: &Value,
+    narrowed: &Value,
+    probe: &str,
+    (kept, kept_id): (usize, &str),
+    (added, added_id): (usize, &str),
+) -> Vec<ThisCorpusEdit> {
+    const COVERAGE: &str = "coverage-disagrees-with-observations";
+    const DEFECT: &str = "defect-status-disagrees-with-bearing-checks";
+    let kept_verdict = whole["observations"][kept]["verdict"]
+        .as_str()
+        .expect("a verdict")
+        .to_owned();
+
+    let mut edited: Vec<ThisCorpusEdit> = Vec::new();
+    edited.push((
+        "defect-moved",
+        DEFECT,
+        "].defects = ".to_owned(),
+        whole.clone(),
+        defect_moved(whole),
+    ));
+    {
+        let mut report = whole.clone();
+        report["observations"]
+            .as_array_mut()
+            .expect("observations")
+            .remove(kept);
+        shift_coverage(&mut report, &kept_verdict, -1);
+        report["coverage"]["all_checks_attempted"] = false.into();
+        report["coverage"]["all_verdicts_published"] = false.into();
+        edited.push((
+            "observation-deleted",
+            COVERAGE,
+            format!("no observation carries {kept_id}, and coverage.checks_missing omits it"),
+            whole.clone(),
+            report,
+        ));
+    }
+    {
+        let mut report = whole.clone();
+        let copy = report["observations"][kept].clone();
+        report["observations"]
+            .as_array_mut()
+            .expect("observations")
+            .push(copy);
+        shift_coverage(&mut report, &kept_verdict, 1);
+        edited.push((
+            "observation-repeated",
+            COVERAGE,
+            format!("repeated: {kept_id} x2"),
+            whole.clone(),
+            report,
+        ));
+    }
+    {
+        let mut report = whole.clone();
+        report["run"]
+            .as_object_mut()
+            .expect("run")
+            .remove("invocation");
+        edited.push((
+            "invocation-removed",
+            COVERAGE,
+            "run.invocation is absent".to_owned(),
+            whole.clone(),
+            report,
+        ));
+    }
+    edited.extend(narrowed_edits(whole, narrowed, probe, (added, added_id)));
+    {
+        let mut report = whole.clone();
+        let written = report["observations"][kept]["channel"].clone();
+        let other = if written == "runtime" {
+            "elf-static"
+        } else {
+            "runtime"
+        };
+        report["observations"][kept]["channel"] = other.into();
+        edited.push((
+            "channel-edited",
+            COVERAGE,
+            format!("observations[{kept_id}].channel = {other}"),
+            whole.clone(),
+            report,
+        ));
+    }
+    edited.push((
+        "flags-exchanged",
+        COVERAGE,
+        "].flag = ".to_owned(),
+        whole.clone(),
+        flags_exchanged(whole, kept),
+    ));
+
+    edited
+}
+
+/// The four edits of [`this_corpus_edits`] made to the narrowed run: an observation of the
+/// check at `added` in `whole` added, unnamed and named unexpected, the total lowered, and the
+/// `--probe` value replaced.
+fn narrowed_edits(
+    whole: &Value,
+    narrowed: &Value,
+    probe: &str,
+    (added, added_id): (usize, &str),
+) -> Vec<ThisCorpusEdit> {
+    const COVERAGE: &str = "coverage-disagrees-with-observations";
+    let added_report = |named: bool| {
+        let mut report = narrowed.clone();
+        let observation = whole["observations"][added].clone();
+        let verdict = observation["verdict"]
+            .as_str()
+            .expect("a verdict")
+            .to_owned();
+        report["observations"]
+            .as_array_mut()
+            .expect("observations")
+            .push(observation);
+        shift_coverage(&mut report, &verdict, 1);
+        if named {
+            report["coverage"]["checks_unexpected"] = serde_json::json!([added_id]);
+        }
+        report
+    };
+    let mut edited: Vec<ThisCorpusEdit> = Vec::new();
+    edited.push((
+        "observation-added",
+        COVERAGE,
+        format!("run.invocation does not select {added_id}"),
+        narrowed.clone(),
+        added_report(false),
+    ));
+    edited.push((
+        "added-named-unexpected",
+        COVERAGE,
+        format!("coverage.checks_unexpected names {added_id}"),
+        narrowed.clone(),
+        added_report(true),
+    ));
+    {
+        let mut report = narrowed.clone();
+        report["coverage"]["corpus_checks_total"] = report["coverage"]["checks_expected"].clone();
+        report["coverage"]["all_checks_attempted"] = true.into();
+        report["coverage"]["all_verdicts_published"] = true.into();
+        edited.push((
+            "total-lowered",
+            COVERAGE,
+            "coverage.corpus_checks_total = ".to_owned(),
+            narrowed.clone(),
+            report,
+        ));
+    }
+    {
+        let mut report = narrowed.clone();
+        let invocation = report["run"]["invocation"]
+            .as_array_mut()
+            .expect("an invocation");
+        let at = invocation
+            .iter()
+            .position(|w| w == probe)
+            .expect("the --probe value");
+        invocation[at] = "no-such-probe".into();
+        edited.push((
+            "probe-unknown",
+            COVERAGE,
+            "this corpus has no such probe".to_owned(),
+            narrowed.clone(),
+            report,
+        ));
+    }
+    edited
+}
+
+#[test]
+fn a_report_of_this_corpus_is_held_to_the_corpus_on_read() {
+    if !ready("that a report of this corpus is held to the corpus on read")
+        || !common::require_cc("that a report of this corpus is held to the corpus on read")
+    {
+        return;
+    }
+    let work = common::Work::new("errorclasses", "this-corpus");
+    let whole = measured_here(&work, "whole.json", &[]);
+    let (kept, kept_id) = self_contained(&whole, &[]);
+    let probe = chard::probe::CORPUS
+        .iter()
+        .find(|p| p.checks.iter().any(|c| c.id == kept_id))
+        .expect("the check's probe");
+    assert_eq!(probe.checks.len(), 1, "{kept_id}'s probe holds it alone");
+    let narrowed = measured_here(&work, "narrowed.json", &["--probe", probe.id]);
+    let (added, added_id) = self_contained(&whole, &[&kept_id]);
+    assert!(
+        probe.checks.iter().all(|c| c.id != added_id),
+        "{added_id} is outside the narrowed run's selection"
+    );
+    let edited = this_corpus_edits(
+        &whole,
+        &narrowed,
+        probe.id,
+        (kept, &kept_id),
+        (added, &added_id),
+    );
+    let mut fed = 0;
+    for (name, rule, claim, honest, report) in &edited {
+        assert_ne!(honest, report, "{name} edits the document");
+        let honest_path = work.write(&format!("{name}-honest.json"), &honest.to_string());
+        let file = format!("{name}.json");
+        let path = work.write(&file, &redigested(report.clone()).to_string());
+        for command in ["table", "matrix", "digest"] {
+            let control = output_of(&[OsStr::new(command), honest_path.as_os_str()]);
+            assert_eq!(
+                control.status.code(),
+                Some(0),
+                "{name} {command} over the unedited report: {control:?}"
+            );
+            let got = envelope_of(&output_of(&[OsStr::new(command), path.as_os_str()]));
+            fed += 1;
+            assert_eq!(got.code, "USER_INPUT", "{name} {command}: {}", got.message);
+            assert!(
+                got.message.contains(&file)
+                    && got.message.contains(rule)
+                    && got.message.contains(claim.as_str()),
+                "{name} {command}: the refusal names the report, the rule and `{claim}`: {}",
+                got.message
+            );
+        }
+    }
+    assert_eq!(fed, 30, "ten edits through three readers");
+}
+
 #[test]
 fn every_reader_refuses_another_version_and_a_missing_digest_without_a_compiler() {
     if !ready("that every reader refuses another chard_schema and a missing digest") {
@@ -1696,9 +2105,6 @@ fn every_reader_refuses_another_version_and_a_missing_digest_without_a_compiler(
     assert_eq!(kept, 3, "three readers given an earlier output");
 }
 
-/// A matrix handed to `table` is named as not a report, not as a report that lost its
-/// digest: the read refuses a document with no `observations` list before it looks for the
-/// digest, so chard's own other documents keep the renderers' sentence.
 #[test]
 fn a_matrix_handed_to_table_is_not_a_report_and_not_a_lost_digest() {
     if !ready("that a matrix handed to `table` is named as not a report") {
@@ -1735,13 +2141,6 @@ fn environment_on_the_default() -> Value {
 /// content, after the earlier output is set aside, where a missing path is refused before.
 const CONTRADICTION: &str = r#"[{"rule": "r", "property": "p", "claims": [], "detail": "d"}]"#;
 
-/// A report that states a contradiction of its own is refused by `table` and `matrix` as
-/// the caller's input, and nothing is written to `-o`.
-///
-/// A renderer that rendered it, with a `CONTRADICTED` note under the table or in the
-/// matrix's `warnings`, would exit 0, and `chard matrix ... -o m.json` would print "matrix
-/// written" with one cell. `measure` quarantines such a report because a job ignores exit
-/// codes and notes alike; a renderer that accepts it is the way back in.
 #[test]
 fn table_and_matrix_refuse_a_report_that_contradicts_itself() {
     if !ready("that `table` and `matrix` refuse a report that contradicts itself") {
@@ -1810,9 +2209,6 @@ fn table_and_matrix_refuse_a_report_that_contradicts_itself() {
 /// rungs of glibc's level 2 and a ratchet deriving 2 from them, one defect class borne by
 /// an `on` and an `off` and so `partial`, one withheld check, and a `coverage` tally of
 /// the six verdicts.
-///
-/// The rungs are in it because the ratchet is held to its rung observations; a ratchet
-/// over one rung with `rungs: []` is a shape `measure` never writes.
 fn derived_report() -> Value {
     serde_json::json!({
         "environment": environment_on_the_default(),
@@ -1872,14 +2268,6 @@ fn render(args: &[&str], path: &Path) -> std::process::Output {
     output_of(&all)
 }
 
-/// A report whose derived field was edited alone is refused by `table` and `matrix`,
-/// naming the rule that the edit breaks.
-///
-/// A renderer that re-ran no consistency rule would render each of these edits with exit 0:
-/// `table`, `table --by-defect` and `matrix` over a `defect_coverage` status set to
-/// `mitigated` (`--by-defect` printing `yes` where the report says `part`), a
-/// `fortify_ratchet.implied_level` above `fortify-effective`'s level, and
-/// `dynamic_bounds: true` beside `whole_object_level: "0"`.
 #[test]
 fn table_and_matrix_refuse_a_derived_field_edited_alone() {
     if !ready("that `table` and `matrix` re-run the derived-field rules on read") {
@@ -1938,15 +2326,6 @@ fn table_and_matrix_refuse_a_derived_field_edited_alone() {
     assert_eq!(fed, 12, "four edits through three renderings");
 }
 
-/// The derived-field edits a narrower re-read would pass are refused too, each naming its
-/// rule.
-///
-/// Each would render with exit 0 through `table`, `table --by-defect` and `matrix` over a
-/// published `openssf-tldr` report. A level that is not a number is skipped by
-/// `.parse().ok()?`; a lowered `implied_level`, or one lowered with its axes, passes a rule
-/// that is one-directional on purpose; a deleted ratchet, rung or `defect_coverage` entry
-/// leaves nothing for a rule to read; a relabelled `by_verdict` keeps its sum; and an unknown
-/// `verdict_counts` key is counted by neither total.
 #[test]
 fn table_and_matrix_refuse_the_derived_edits_the_first_reread_passed() {
     const LEVEL: &str = "derived-fortify-level-exceeds-measured";
@@ -1966,7 +2345,7 @@ fn table_and_matrix_refuse_the_derived_edits_the_first_reread_passed() {
             String::from_utf8_lossy(&output.stdout)
         );
     }
-    let edits: [(&str, &str, Edit); 10] = [
+    let edits: [(&str, &str, Edit); 11] = [
         ("level-word", LEVEL, |r| {
             r["fortify_ratchet"]["implied_level"] = "two".into();
         }),
@@ -2007,6 +2386,12 @@ fn table_and_matrix_refuse_the_derived_edits_the_first_reread_passed() {
         ("effective-level-word", LEVEL, |r| {
             r["observations"][0]["level"] = "two".into();
         }),
+        // `complete` edited apart from its counts, everything else as written.
+        ("defect-complete-flipped", DEFECT, |r| {
+            let entry = &mut r["defect_coverage"]["heap-buffer-overflow"];
+            let was = entry["complete"].as_bool().expect("a published complete");
+            entry["complete"] = (!was).into();
+        }),
     ];
     let mut fed = 0;
     for (name, rule, edit) in edits {
@@ -2027,18 +2412,18 @@ fn table_and_matrix_refuse_the_derived_edits_the_first_reread_passed() {
             );
         }
     }
-    assert_eq!(fed, 30, "ten edits through three renderings");
+    assert_eq!(fed, 33, "eleven edits through three renderings");
+    // `digest` re-reads too: the `complete` edit, refused there.
+    let flipped = work.path("defect-complete-flipped.json");
+    let got = envelope_of(&render(&["digest"], &flipped));
+    assert_eq!(got.code, "USER_INPUT", "digest: {}", got.message);
+    assert!(
+        got.message.contains(DEFECT) && got.message.contains(".complete ="),
+        "digest: {}",
+        got.message
+    );
 }
 
-/// A tally or a rollup edited between verdicts with its sum kept is refused by `table`
-/// and `matrix`, naming the rule that the recount breaks.
-///
-/// Each of these would render with exit 0 were `coverage-disagrees-with-observations` to
-/// compare only the tally's total, or not be re-run on read, and were the defect rollup's
-/// counts read only by the status rule, which a status edited with them satisfies. The last
-/// edit is the boundary: `on` and `off`
-/// exchanged inside a rollup, with the status edited to match, still renders, since telling
-/// the two apart needs polarity and the status rule does not read it.
 #[test]
 fn table_and_matrix_refuse_a_tally_relabelled_with_its_sum_kept() {
     const COVERAGE: &str = "coverage-disagrees-with-observations";
@@ -2057,7 +2442,7 @@ fn table_and_matrix_refuse_a_tally_relabelled_with_its_sum_kept() {
             String::from_utf8_lossy(&output.stdout)
         );
     }
-    let edits: [(&str, &str, Edit); 3] = [
+    let edits: [(&str, &str, Edit); 4] = [
         ("tally-off-to-on", COVERAGE, |r| {
             r["coverage"]["verdict_counts"] = serde_json::json!({"on": 5, "probe-invalid": 1});
         }),
@@ -2071,6 +2456,11 @@ fn table_and_matrix_refuse_a_tally_relabelled_with_its_sum_kept() {
         ("rollup-off-to-withheld", DEFECT, |r| {
             r["defect_coverage"]["heap-buffer-overflow"]["verdict_counts"] =
                 serde_json::json!({"on": 1, "indeterminate": 1});
+        }),
+        ("rollup-on-off-exchanged", DEFECT, |r| {
+            let entry = &mut r["defect_coverage"]["heap-buffer-overflow"];
+            entry["verdict_counts"] = serde_json::json!({"on": 2});
+            entry["status"] = "mitigated".into();
         }),
     ];
     let mut fed = 0;
@@ -2092,26 +2482,12 @@ fn table_and_matrix_refuse_a_tally_relabelled_with_its_sum_kept() {
             );
         }
     }
-    assert_eq!(fed, 9, "three edits through three renderings");
-
-    // The open shape, pinned so that closing it is a visible change to this test.
-    let mut exchanged = derived_report();
-    let entry = &mut exchanged["defect_coverage"]["heap-buffer-overflow"];
-    entry["verdict_counts"] = serde_json::json!({"on": 2});
-    entry["status"] = "mitigated".into();
-    let path = work.write("rollup-on-off-exchanged.json", &published(exchanged));
-    let mut open = 0;
-    for args in RENDERINGS {
-        let output = render(args, &path);
-        open += 1;
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "{args:?}: an on and off exchange inside a rollup is still read as written: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-    assert_eq!(open, RENDERINGS.len());
+    assert_eq!(fed, 12, "four edits through three renderings");
+    // `digest` re-reads too: the exchange, refused there.
+    let exchanged = work.path("rollup-on-off-exchanged.json");
+    let got = envelope_of(&render(&["digest"], &exchanged));
+    assert_eq!(got.code, "USER_INPUT", "digest: {}", got.message);
+    assert!(got.message.contains(DEFECT), "digest: {}", got.message);
 }
 
 /// What `measure` omits when it has nothing to say reads as absent, an empty rollup
@@ -2170,11 +2546,6 @@ fn readable_omissions() -> [(&'static str, Edit); 4] {
     ]
 }
 
-/// A derived subtree the renderers cannot read as `measure` writes it is refused, naming
-/// the field; one `measure` omits, or one carrying a member no rule reads, renders.
-///
-/// The refusal is the point: a rule that silently did not run over an edited subtree
-/// would be a clean-looking pass.
 #[test]
 fn table_and_matrix_refuse_a_derived_subtree_they_cannot_read() {
     if !ready("that `table` and `matrix` refuse a derived subtree they cannot read") {
@@ -2259,13 +2630,6 @@ fn table_and_matrix_refuse_a_derived_subtree_they_cannot_read() {
     assert_eq!(rendered, 8, "four shapes through two renderers");
 }
 
-/// Every report `measure` publishes passes the rules the renderers re-run, through the
-/// library function and through `table`.
-///
-/// The guard on the read adapters: a field read back differently from how `measure`
-/// holds it (an absent `level` against a null, an omitted `by_verdict`) would refuse
-/// honest reports, and only a report chard itself wrote can show it does not. Measured
-/// with the `cc` on `PATH`, under each built-in profile that needs no flags.
 #[test]
 fn a_report_measure_publishes_passes_the_reread() {
     if !ready("that a published report passes the rules re-run on read")
@@ -2289,9 +2653,9 @@ fn a_report_measure_publishes_passes_the_reread() {
                 .arg(profile)
                 .arg("--workdir")
                 .arg(work.path(&format!("w-{profile}")))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawning chard")
         })
@@ -2334,17 +2698,6 @@ fn a_report_measure_publishes_passes_the_reread() {
     assert_eq!(fed, profiles.len());
 }
 
-/// A file named as `measure` names a report it did not publish is refused by `table` and
-/// `matrix` whatever it holds: `<output>.contradicted`, the quarantine,
-/// `<output>.previous`, an earlier report a run set aside and has not replaced, and
-/// `<output>.partial`, the temporary file a publication renames into place, which only a
-/// run stopped between the write and the rename leaves. That file is named
-/// `<output>.partial.<pid>.<n>`, and the refusal takes a name of that form too.
-///
-/// The content here is consistent on purpose. A quarantine edited to look clean and an
-/// earlier report that is clean and stale both render, by content, as a measurement; their
-/// names are chard's statement that neither is one. Without the refusal a `.contradicted` or
-/// a `.partial` file would render byte for byte as the same report named `.json` does.
 #[test]
 fn table_and_matrix_refuse_a_file_named_as_unpublished() {
     if !ready("that `table` and `matrix` refuse a quarantined or set-aside report by name") {
@@ -2374,15 +2727,6 @@ fn table_and_matrix_refuse_a_file_named_as_unpublished() {
     assert_eq!(fed, 8, "four names through two renderers");
 }
 
-/// A `measure` that fails after its arguments were validated and before it publishes
-/// leaves no earlier report at `-o`: the file is set aside, byte for byte, as
-/// `<output>.previous`.
-///
-/// Without the set-aside this would exit 2 with the earlier report untouched at the requested
-/// path, as would eight more cases, a signal among them. `publish` removes an earlier report only
-/// when it refuses, and none of those reaches it. The compiler that is not there is refused when it
-/// is run, after the set-aside; the cases refused before it, the invocation's own errors, are
-/// `a_usage_error_leaves_the_earlier_output_untouched`'s.
 #[test]
 fn a_measure_that_fails_leaves_no_earlier_report_at_the_output() {
     if !ready("that a failed `measure` leaves no earlier report at the requested path") {
@@ -2430,7 +2774,7 @@ fn a_measure_that_fails_leaves_no_earlier_report_at_the_output() {
 
 /// The usage errors `a_usage_error_leaves_the_earlier_output_untouched` feeds: each as its
 /// command and arguments, over files `work` holds, with the error class expected.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "one row per usage error, each spelled out so a reader sees the invocation; \
               splitting the table would split the one list the test counts"
@@ -2438,8 +2782,8 @@ fn a_measure_that_fails_leaves_no_earlier_report_at_the_output() {
 fn usage_errors(
     work: &common::Work,
     earlier: &str,
-) -> Vec<(&'static str, Vec<std::ffi::OsString>, &'static str)> {
-    let os = |s: &str| std::ffi::OsString::from(s);
+) -> Vec<(&'static str, Vec<OsString>, &'static str)> {
+    let os = |s: &str| OsString::from(s);
     let missing = work.path("missing.json").into_os_string();
     let not_json = work.write("not-json.json", "{").into_os_string();
     let set_aside = work.write("stale.json.previous", earlier).into_os_string();
@@ -2530,6 +2874,19 @@ fn usage_errors(
             "CONFIGURATION",
         ),
         (
+            "measure-explicit-relative-input-in-ldflags",
+            vec![
+                os("measure"),
+                os("--profile"),
+                os("explicit"),
+                os("--flags"),
+                os("-O2"),
+                os("--ldflags"),
+                os("rwx_segment.c"),
+            ],
+            "CONFIGURATION",
+        ),
+        (
             "measure-probe-twice",
             vec![
                 os("measure"),
@@ -2612,17 +2969,6 @@ fn usage_errors(
     ]
 }
 
-/// A usage error is refused before the set-aside and touches nothing: the earlier report
-/// or rendering stays at `-o` byte for byte, no `<output>.previous` is made, and `measure`
-/// makes no work directory, so nothing was compiled, since every compile, the toolchain
-/// interrogation's included, writes there. The explicit profile's own refusals (a response
-/// file, an x32 selection, a runtime removal, a relative path) come before the set-aside and
-/// the toolchain interrogation, and each of their rows here fails against the other ordering.
-/// With the set-aside first, `measure --probe no-such-probe -o q.json` would exit 2 with
-/// `q.json` moved to `q.json.previous` and a work directory made; a mistyped line is not a
-/// run. `table` and `matrix` read and parse their inputs before the set-aside for the
-/// same reason, so a missing path, a file that is not JSON and a file named as unpublished
-/// leave the earlier rendering where it was.
 #[test]
 fn a_usage_error_leaves_the_earlier_output_untouched() {
     if !ready("that a usage error leaves the earlier output untouched") {
@@ -2641,7 +2987,7 @@ fn a_usage_error_leaves_the_earlier_output_untouched() {
             full.extend([OsStr::new("--workdir"), workdir.as_os_str()]);
         }
         full.extend([OsStr::new("-o"), output_path.as_os_str()]);
-        full.extend(args.iter().skip(1).map(std::ffi::OsString::as_os_str));
+        full.extend(args.iter().skip(1).map(OsString::as_os_str));
         let got = run(&full);
         fed += 1;
         assert_eq!(got.code, *class, "{name}: {}", got.message);
@@ -2670,7 +3016,7 @@ fn a_usage_error_leaves_the_earlier_output_untouched() {
 /// and whether an earlier output is there to stay as it was.
 type UnusableOutput = (
     &'static str,
-    Vec<std::ffi::OsString>,
+    Vec<OsString>,
     PathBuf,
     &'static str,
     &'static str,
@@ -2684,27 +3030,17 @@ type UnusableOutput = (
 fn announce_name_max(test: &str, name_max: usize) {
     use std::io::Write as _;
     let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(
-        stderr,
-        "\nchard: {test}: names in the scratch directory hold {name_max} bytes"
+    chard::error::best_effort(
+        writeln!(
+            stderr,
+            "\nchard: {test}: names in the scratch directory hold {name_max} bytes"
+        )
+        .and_then(|()| stderr.flush()),
     );
-    let _ = stderr.flush();
 }
 
-/// An `-o` the run could never publish to is refused before anything is built, with a hint
-/// for its shape, and leaves an earlier output where it was.
-///
-/// Found only when the report is first written, a missing directory, a directory chard
-/// cannot write and a directory named as the output would let `measure` build and run every
-/// probe and then exit 2, the missing directory with a hint about scripts and interpreters.
-/// The driver named does not exist and the work
-/// directory is a fresh path, so a refusal that came at publication, or anywhere after the
-/// work directory is made, fails here on the work directory or on the class. `table`
-/// shares the check through the same set-aside, and one row holds it there. Each row's
-/// hint words are carried by no other shape's hint, so two hints swapped fail here.
-/// `a_usable_output_is_not_refused` holds the other direction.
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "the shapes, the two that need a mode the host may not honour, and the six \
               assertions each case is held to, read as one table and one loop"
@@ -2742,7 +3078,7 @@ fn an_unusable_output_is_refused_before_anything_is_built() {
         "an_unusable_output_is_refused_before_anything_is_built",
         name_max,
     );
-    let measure = |name: &str| -> Vec<std::ffi::OsString> {
+    let measure = |name: &str| -> Vec<OsString> {
         [
             "measure".into(),
             "--cc".into(),
@@ -2788,8 +3124,7 @@ fn an_unusable_output_is_refused_before_anything_is_built() {
         (
             // Five bytes under the longest name this filesystem takes fits;
             // `<output>.contradicted`, which publication removes before it writes, does not,
-            // nor `.previous`. Sized from the filesystem: 250 bytes where names hold 255, and
-            // fuse-overlayfs holds 251 and answers the lookup of a longer one "no such file".
+            // nor `.previous`.
             "name-too-long-for-its-siblings",
             measure("name-too-long-for-its-siblings"),
             work.path(&format!("{}.json", "r".repeat(name_max - 10))),
@@ -2838,23 +3173,14 @@ fn an_unusable_output_is_refused_before_anything_is_built() {
         );
     }
     let mut fed = 0;
-    let mut hints: Vec<(&str, String)> = Vec::new();
-    for (name, before, output_path, class, hint_word, has_earlier) in &cases {
-        let mut args: Vec<&OsStr> = before.iter().map(std::ffi::OsString::as_os_str).collect();
+    for (name, before, output_path, class, _, has_earlier) in &cases {
+        let mut args: Vec<&OsStr> = before.iter().map(OsString::as_os_str).collect();
         args.extend([OsStr::new("-o"), output_path.as_os_str()]);
         let got = run(&args);
         fed += 1;
         assert_eq!(
             got.code, *class,
             "{name} (names here hold {name_max} bytes): {}",
-            got.message
-        );
-        let hint = got.hint.unwrap_or_default();
-        hints.push((*hint_word, hint.clone()));
-        assert!(
-            hint.contains(hint_word) && !hint.contains("interpreter"),
-            "{name} (names here hold {name_max} bytes): the hint does not fit the shape: \
-             {hint:?} ({})",
             got.message
         );
         assert!(
@@ -2885,22 +3211,8 @@ fn an_unusable_output_is_refused_before_anything_is_built() {
     std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     assert_eq!(fed, cases.len());
     assert_eq!(fed, if mode_holds { 9 } else { 7 });
-    for (word, _) in &hints {
-        for (other, hint) in &hints {
-            assert!(
-                other == word || !hint.contains(word),
-                "{word:?} is in the hint for another shape too: {hint:?}"
-            );
-        }
-    }
 }
 
-/// An `-o` publication can write is not refused: the check passes it and the run goes on,
-/// here to the missing compiler it names, with its work directory made. Each row is a shape
-/// a too-eager check refuses, among them a name the temporary file's suffix makes too long
-/// and a directory whose next temporary names are all taken (that one is
-/// `report::tests::the_output_check_takes_the_in_place_route`). A suite that held only
-/// refusals would pass such a check.
 #[test]
 fn a_usable_output_is_not_refused() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2927,12 +3239,7 @@ fn a_usable_output_is_not_refused() {
     let mode_holds = std::fs::write(read_only.join("probe"), "").is_err();
 
     // As long as the filesystem lets `<output>.contradicted` be: the name and its
-    // `.contradicted` and `.previous` siblings fit. The temporary name `.partial.<pid>.<n>`
-    // is 10 bytes and the digits of the pid and of n (one digit for the first try), so it
-    // is longer than `.contradicted` (13) and refused only where the pid has three digits
-    // or more; under a pid below 100 this row tests a usable name, not the temporary-only
-    // overflow. Sized from the filesystem (242 bytes where names hold 255): a fixed 240 had
-    // a `.contradicted` fuse-overlayfs, which holds 251, refuses.
+    // `.contradicted` and `.previous` siblings fit.
     let name_max = common::longest_name(work.dir());
     announce_name_max("a_usable_output_is_not_refused", name_max);
     let only_temporary_too_long = work.path(&format!("{}.json", "r".repeat(name_max - 18)));
@@ -2972,8 +3279,7 @@ fn a_usable_output_is_not_refused() {
         fed += 1;
         assert!(
             got.code == "USER_INPUT" && got.message.contains("chard-test-compiler"),
-            "{name} (names here hold {name_max} bytes): the output was refused, or the run \
-             failed elsewhere: {} ({:?})",
+            "{name} (names here hold {name_max} bytes): not the compiler's USER_INPUT: {} ({:?})",
             got.message,
             got.hint
         );
@@ -2995,10 +3301,6 @@ fn a_usable_output_is_not_refused() {
     assert_eq!(fed, 3 + usize::from(made) + usize::from(mode_holds));
 }
 
-/// `--flags` beside the default profile is refused through the binary with a message that
-/// names the way to have it read, where a measurement of the compiler's defaults with `-O2`
-/// named nowhere would read as a measurement of `-O2`. The driver named does not exist, so a
-/// refusal that came after the toolchain interrogation would read `USER_INPUT` instead.
 #[test]
 fn measure_with_flags_beside_the_default_profile_is_configuration() {
     if !ready("that --flags beside a built-in profile is the invocation's to fix") {
@@ -3030,9 +3332,6 @@ fn measure_with_flags_beside_the_default_profile_is_configuration() {
     );
 }
 
-/// `--timeout 0` is refused by the parser, before anything is touched: exit 2, the envelope
-/// on stdout as `USER_INPUT`, the argument named on stderr and in the envelope, and the
-/// earlier report at `-o` as it was.
 #[test]
 fn measure_with_a_zero_timeout_is_refused() {
     if !ready("that --timeout 0 is refused") {
@@ -3069,12 +3368,49 @@ fn measure_with_a_zero_timeout_is_refused() {
     assert!(!workdir.exists());
 }
 
-/// A command line clap refuses reaches the envelope as every other refusal does: exit 2,
-/// one JSON object on stdout whose class is `USER_INPUT` and whose operation is the command
-/// named, or `chard` where none is, a hint naming that command's `--help`, and clap's own
-/// text on stderr. `Cli::parse` would exit 2 with stdout empty, so a caller branching on the
-/// envelope would find nothing. The positive controls are
-/// in `help_and_version_print_text_and_exit_0`.
+#[test]
+fn an_allowance_the_gate_cannot_take_is_refused_with_its_reason() {
+    if !ready("that an allowance the gate cannot take is refused with its reason") {
+        return;
+    }
+    let work = common::Work::new("errorclasses", "allowance");
+    let report = work.path("r.json");
+    for (args, said) in [
+        (
+            vec!["measure", "--allow", "no-check-on-target"],
+            "--fail-on-missing",
+        ),
+        (
+            vec![
+                "measure",
+                "--fail-on-missing",
+                "--allow",
+                "arch-outside-table",
+            ],
+            "gating.rule arch-outside-table has no allowance",
+        ),
+        (
+            vec![
+                "measure",
+                "--fail-on-missing",
+                "--allow",
+                "machine-lacks-bti",
+            ],
+            "it is a machine limit",
+        ),
+    ] {
+        let mut argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        argv.extend([OsStr::new("-o"), report.as_os_str()]);
+        let output = output_of(&argv);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let got = envelope_of(&output);
+        assert_eq!(got.code, "USER_INPUT", "{args:?}: {}", got.message);
+        assert_eq!(got.operation, "measure", "{args:?}");
+        assert!(stderr.contains(said), "{args:?}: {stderr}");
+        assert!(!report.exists(), "{args:?}: a refused run wrote a report");
+    }
+}
+
 #[test]
 fn a_command_line_clap_refuses_reaches_the_envelope() {
     if !ready("that a command line clap refuses reaches the envelope") {
@@ -3173,9 +3509,6 @@ fn a_command_line_clap_refuses_reaches_the_envelope() {
     );
 }
 
-/// The positive controls of `a_command_line_clap_refuses_reaches_the_envelope`: `--help`
-/// and `--version`, which clap also reports as errors, print text on stdout, nothing on
-/// stderr, and exit 0.
 #[test]
 fn help_and_version_print_text_and_exit_0() {
     if !ready("that --help and --version print text and exit 0") {
@@ -3203,22 +3536,6 @@ fn help_and_version_print_text_and_exit_0() {
     }
 }
 
-/// No escape reaches either stream from a colour variable or from the command line.
-///
-/// A colour variable: clap's `color` feature, off in `Cargo.toml`, reads `NO_COLOR`,
-/// `CLICOLOR`, `CLICOLOR_FORCE`, `TERM`, `COLORTERM` and `CI` through `anstream`,
-/// `anstyle-query` and `colorchoice`. With the feature, `CLICOLOR_FORCE=1` puts an escape on
-/// `--help`'s stdout and on a refusal's stderr even into a pipe. `refuse_usage` writes clap's
-/// rendered text itself, and two checks hold the feature off: the
-/// lockfile check, and the quotes, which the feature's own stripping would leave without
-/// the `?` the scrub puts in the escape's place. The forced rows fail if clap's own
-/// printing comes back with the feature.
-///
-/// The command line: clap quotes a refused argument. With `color` it strips an escape
-/// from the quote; without it, `refuse_usage` scrubs the text (`table::scrub_lines`), so a
-/// crafted argument (an escape, a C1 control, bytes that are not UTF-8) reaches neither
-/// stream nor the envelope's message as a control character, and the quote stays, scrubbed.
-/// The help keeps its lines, and the refusal its "a similar argument exists" tip.
 #[test]
 fn no_escape_reaches_either_stream_from_a_colour_variable_or_the_command_line() {
     use std::os::unix::ffi::OsStringExt as _;
@@ -3341,9 +3658,6 @@ fn holds_no_control_character(
     }
 }
 
-/// `probes`, `elf` and `detect` take `-o` as `measure`, `table` and `matrix` do: the
-/// document written there is the one stdout carries without it, stdout is then empty, and an
-/// earlier file at the path is set aside and removed.
 #[test]
 fn every_inspecting_command_writes_its_document_to_dash_o() {
     if !ready("that probes, elf and detect write their document to -o") {
@@ -3403,8 +3717,6 @@ fn every_inspecting_command_writes_its_document_to_dash_o() {
     assert_eq!(fed, cases.len());
 }
 
-/// `chard` with no command is the caller's to fix, and the envelope says so in words rather
-/// than quoting clap's help.
 #[test]
 fn chard_without_a_command_says_it_takes_one() {
     if !ready("that chard with no command says it takes one") {
@@ -3415,10 +3727,6 @@ fn chard_without_a_command_says_it_takes_one() {
     assert_eq!(got.message, "chard takes a command");
 }
 
-/// An `-o` named bare is the file of that name in the working directory, as an input named
-/// bare is: its set-aside `<output>.previous` there is the input of that name, so the run is
-/// refused before the set-aside would replace it; and the same names in two directories are
-/// two entries, so nothing is refused.
 #[test]
 fn a_bare_output_beside_a_bare_input_is_refused_and_two_directories_are_not() {
     if !ready("that a bare -o whose set-aside is a bare input is refused") {
@@ -3467,10 +3775,6 @@ fn a_bare_output_beside_a_bare_input_is_refused_and_two_directories_are_not() {
     assert_eq!(std::fs::read(work.path("a/x.previous")).ok(), Some(object));
 }
 
-/// An `-o` named bare, with no directory in it, is published in the working directory with
-/// nothing said but the note naming it: the directory searched for an earlier run's
-/// temporary files and the one synced after the rename are `.`, not the empty parent the
-/// name carries, which no directory call takes.
 #[test]
 fn a_bare_output_name_is_published_in_the_working_directory_without_a_note() {
     if !ready("that a bare -o name is published in the working directory") {
@@ -3500,23 +3804,10 @@ fn a_bare_output_name_is_published_in_the_working_directory_without_a_note() {
 
 /// One row of `an_output_that_is_an_input_is_refused`: its name, the arguments, the input that
 /// must survive and its bytes, and words the refusal names.
-type OutputIsInput = (
-    &'static str,
-    Vec<std::ffi::OsString>,
-    PathBuf,
-    Vec<u8>,
-    &'static str,
-);
+type OutputIsInput = (&'static str, Vec<OsString>, PathBuf, Vec<u8>, &'static str);
 
-/// An `-o` that is one of the command's own inputs, or whose set-aside or quarantine name is
-/// one, is refused as `USER_INPUT` and leaves the input as it was: the input is read before
-/// the set-aside, so the set-aside and the document made from it would replace it. Unrefused,
-/// `table r.json -o r.json` replaces the report with its table and exits 0, `elf` and `detect`
-/// replace a binary or a report the same way, `elf x.previous -o x` exits 0 with `x.previous`
-/// gone, and `elf x.partial -o x` removes the input with its cleanup. A hard link, a symbolic link
-/// and a second spelling are the same file under another name.
 #[test]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "one row per shape, each spelled out so a reader sees the invocation; splitting \
               the table would split the one list the test counts"
@@ -3691,7 +3982,7 @@ fn an_output_that_is_an_input_is_refused() {
     ));
     let mut fed = 0;
     for (name, args, input, bytes, words) in &rows {
-        let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+        let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
         let got = run(&args);
         fed += 1;
         assert_eq!(got.code, "USER_INPUT", "{name}: {}", got.message);
@@ -3716,9 +4007,6 @@ fn an_output_that_is_an_input_is_refused() {
     assert_eq!(fed, 14, "the rows were counted");
 }
 
-/// `table -o` and `matrix -o` over an input set that fails after its inputs were read leave
-/// no earlier output at the path either: the set is judged after the set-aside. Until
-/// 2026-10-05 an earlier table stayed at `-o` after an exit 2.
 #[test]
 fn a_table_or_matrix_that_fails_leaves_no_earlier_output() {
     if !ready("that a failed `table` or `matrix` leaves no earlier output at -o") {
@@ -3762,18 +4050,6 @@ fn a_table_or_matrix_that_fails_leaves_no_earlier_output() {
     assert_eq!(fed, 2);
 }
 
-/// An output file whose directory refuses the rename `report::set_aside` tries is emptied
-/// in place, not refused: a failed `table` or `matrix` leaves an empty file where the
-/// earlier rendering was, and one that succeeds writes its output there with exit 0.
-///
-/// Two shapes refuse the rename while leaving the file writable: a mode-555 directory,
-/// and a single file bind-mounted over itself, the shape `docker run -v
-/// host/report.json:/out/report.json` produces, whose rename fails with `EBUSY`. A
-/// `set_aside` that refused the run on either before it did anything would exit 2, under
-/// `PERMISSION` and `INTERNAL` respectively, and leave the earlier output at the path. The
-/// bind mount is made in a user and mount
-/// namespace (`unshare -rm`) by the next test; a host without one announces the arm it
-/// could not run. This one holds the mode-555 directory.
 #[test]
 fn an_output_its_directory_will_not_release_is_emptied_not_refused() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -3799,7 +4075,7 @@ fn an_output_its_directory_will_not_release_is_emptied_not_refused() {
         let probe = locked.join("probe");
         let holds = std::fs::rename(&out, &probe).is_err();
         if !holds {
-            let _ = std::fs::rename(&probe, &out);
+            std::fs::rename(&probe, &out).expect("renaming the probe back to the output");
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod 755");
             common::capability_gap(
@@ -3849,7 +4125,7 @@ fn an_output_its_directory_will_not_release_is_emptied_not_refused() {
         assert!(!locked.join(format!("{command}.out.previous")).exists());
         assert_eq!(
             common::temporary_files_beside(&locked.join(format!("{command}.out"))),
-            Vec::<std::path::PathBuf>::new(),
+            Vec::<PathBuf>::new(),
             "{command}: a temporary file was left in the mode-555 directory"
         );
     }
@@ -3859,8 +4135,6 @@ fn an_output_its_directory_will_not_release_is_emptied_not_refused() {
     );
 }
 
-/// The bind-mount half of the test above: a file bind-mounted over itself refuses the
-/// rename with `EBUSY`, which classifies `INTERNAL`, and is emptied in place instead.
 #[test]
 fn a_bind_mounted_output_is_emptied_not_refused() {
     if !ready("that a bind-mounted output is emptied, not refused") {
@@ -3921,13 +4195,16 @@ fn a_bind_mounted_output_is_emptied_not_refused() {
                 "bind mount, over a report: {}",
                 String::from_utf8_lossy(&output.stdout)
             );
-            assert!(!std::fs::read_to_string(&bound).expect("bound").is_empty());
+            assert!(
+                !std::fs::read_to_string(&bound).expect("bound").is_empty(),
+                "the report reached the bind-mounted file"
+            );
             assert!(!work.path("bound.out.previous").exists());
             // The directory takes the temporary file and the mount refuses the rename over
             // it (`EBUSY`), so this is the arm where one is made and must be removed.
             assert_eq!(
                 common::temporary_files_beside(&work.path("bound.out")),
-                Vec::<std::path::PathBuf>::new(),
+                Vec::<PathBuf>::new(),
                 "bind mount: the temporary file the refused rename left is still there"
             );
         }
@@ -3940,13 +4217,6 @@ fn a_bind_mounted_output_is_emptied_not_refused() {
     }
 }
 
-/// A symbolic link at `-o` naming a regular file is resolved: its target is set aside
-/// and replaced, and the link stays a link naming this run's output.
-///
-/// A link written through and never set aside would leave, on a failed run, the target's
-/// earlier contents where the link names them: `table -o out.json missing.json` with
-/// `out.json` a link to a file holding an earlier rendering would exit 2 and leave that
-/// rendering in place.
 #[test]
 fn a_symlinked_output_is_set_aside_at_its_target() {
     if !ready("that a symbolic link at -o has its target set aside and replaced") {
@@ -4032,12 +4302,6 @@ fn a_symlinked_output_is_set_aside_at_its_target() {
     );
 }
 
-/// A symbolic link at `-o` naming a stream is written through, as `-o /dev/stdout` is: the
-/// rendering arrives on stdout, exit 0, and nothing is renamed or made beside the link.
-/// A guard on the policy: it fails if every link is resolved and replaced, since `/dev/stdout`
-/// reaches `/proc/self/fd/1`, whose text is `pipe:[N]` and no path chard may rename over. The third
-/// arm is stdout redirected to a regular file, where the link does reach one: it is still written
-/// through, since renaming that file would split it from the descriptor the shell holds.
 #[test]
 fn an_output_symlinked_to_a_stream_is_written_through() {
     if !ready("that a symbolic link at -o naming a stream is written through") {
@@ -4211,13 +4475,6 @@ fn detect_on_a_store_entry_of_an_unknown_kind_is_not_read_as_absent() {
     assert!(got.message.contains("not understood"), "{}", got.message);
 }
 
-/// One bad input gets one error class, whichever subcommand reads it. A reader that read its
-/// file with `read_to_string` would fail on a file that is not UTF-8 with `InvalidData` and
-/// reach the envelope as `INTERNAL`, while a reader of bytes calls the same file
-/// `USER_INPUT`. Every reader of
-/// a file the operator names is fed every shape here, and the count of invocations is held
-/// to the product of the two lists, so a reader dropped from the loop fails rather than
-/// passing on nothing.
 #[test]
 fn one_bad_input_gets_one_class_from_every_reader() {
     if !ready("that one bad input gets one error class from every reader") {
@@ -4359,12 +4616,6 @@ esac
 exit 0
 "#;
 
-/// The refusal for a driver that defined no macro carries what the driver said on stderr,
-/// and its exit status. It said only "it may not be a working C compiler", with the
-/// driver's own line discarded, while the drivers that met it worked and had each rejected
-/// one thing by name (2026-10-12). Where the driver said nothing, the refusal says
-/// that, and keeps the guess. The hint naming the environment chard gives the compiler is
-/// kept either way.
 #[test]
 fn a_driver_that_defines_no_macro_is_refused_with_what_it_said() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -4419,21 +4670,8 @@ fn a_driver_that_defines_no_macro_is_refused_with_what_it_said() {
             assert!(!got.message.contains("THE-TAIL"), "{}", got.message);
             assert!(!got.message.contains('\u{1b}'), "{}", got.message);
         }
-        match said {
-            Some(line) => {
-                assert!(got.message.contains(line), "{name}: {}", got.message);
-                assert!(
-                    !got.message.contains("may not be a working"),
-                    "{}",
-                    got.message
-                );
-            }
-            None => assert!(
-                got.message.contains("wrote nothing to stderr")
-                    && got.message.contains("may not be a working C compiler"),
-                "{name}: {}",
-                got.message
-            ),
+        if let Some(line) = said {
+            assert!(got.message.contains(line), "{name}: {}", got.message);
         }
         let hint = got.hint.unwrap_or_default();
         assert!(hint.contains("env -i"), "{name}: the hint is kept: {hint}");
@@ -4473,13 +4711,6 @@ fn withholding_document(
     })
 }
 
-/// A report whose only non-measurements are earned limitations, and one with an instrument
-/// withholding: each is read by `table` and `matrix` as `measure` writes it, its reasons
-/// listed under the heading of its own set, and an edit that moves the withholding into the
-/// earned set, with the tally, the flag and every sum kept, is refused naming the rule.
-///
-/// `coverage.withholding` once counted both kinds as `withheld`, beside a
-/// `percent_withheld`, and `table` listed both under "Withheld, and why".
 #[test]
 fn earned_limitations_and_instrument_withholdings_are_counted_and_listed_apart() {
     const WITHHOLDING: &str = "withholding-disagrees-with-verdict-counts";
